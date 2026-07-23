@@ -88,9 +88,10 @@ queue, and trust handling never change.
   (a dissimilar transport: child-process JSON-RPC, not HTTP SSE) and emits a
   trusted `new message` event per incoming message; the `signal-responder` skill
   does the receive/reply.
-- **`slack` (next)** — Slack Socket Mode websocket (`apps.connections.open` → ws)
-  is the natural next `ChannelSource`; the `slack-responder` skill handles the
-  data.
+- **`slack`** (`extensions/sources/slack.ts`) — Slack Socket Mode websocket
+  (`apps.connections.open` → ws; a third transport shape alongside SSE and the
+  child process). ACKs every envelope and emits a trusted `new message` event per
+  message in a watched channel; the `slack-responder` skill handles the data.
 
 ## Composition — publish channels as outfitter profiles
 

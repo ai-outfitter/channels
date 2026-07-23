@@ -128,9 +128,25 @@ act on them.
   | `assigned_pr` | a PR assigned to you |
   | `mention` | you were @-mentioned |
 
-### Slack — `slack` *(planned)*
+### Slack — `slack`
 
-Slack Socket Mode is the next source.
+Opens a Slack **Socket Mode** websocket and wakes on each message in a watched
+channel. The `slack-responder` skill does the read/reply.
+
+- **Prerequisites:** a Slack app with **Socket Mode** enabled — an app-level token
+  (`xapp-…`, scope `connections:write`) for the socket, plus the bot token
+  (`xoxb-…`, scopes `channels:history`, `chat:write`, `reactions:write`) the
+  `slack-responder` skill uses. Invite the bot to the channels it should watch.
+- **Configure:**
+
+  ```bash
+  export SLACK_APP_TOKEN="xapp-…"                  # Socket Mode (this extension)
+  export SLACK_CHANNEL_IDS="C0123ABCD C0456EFGH"   # optional; empty = every channel the bot is in
+  export SLACK_BOT_TOKEN="xoxb-…"                  # used by the slack-responder skill
+  ```
+
+  This extension only needs `SLACK_APP_TOKEN` (the wake signal); it reads no
+  message text. `SLACK_BOT_TOKEN` is consumed by the skill.
 
 ### Minimal end-to-end
 

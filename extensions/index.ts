@@ -24,6 +24,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createGithubSource, githubConfigFromEnv } from "./sources/github.ts";
 import { createJmapSource, jmapConfigFromEnv } from "./sources/jmap.ts";
 import { createSignalSource, signalConfigFromEnv } from "./sources/signal.ts";
+import { createSlackSource, slackConfigFromEnv } from "./sources/slack.ts";
 import type { ChannelEvent, ChannelSource } from "./sources/types.ts";
 import { parseList, scopedLog } from "./sources/util.ts";
 
@@ -46,7 +47,10 @@ const SOURCES: Record<string, () => ChannelSource | undefined> = {
 		const cfg = githubConfigFromEnv();
 		return cfg ? createGithubSource(cfg) : undefined;
 	},
-	// slack: () => { const cfg = slackConfigFromEnv(); return cfg ? createSlackSource(cfg) : undefined; },
+	slack: () => {
+		const cfg = slackConfigFromEnv();
+		return cfg ? createSlackSource(cfg) : undefined;
+	},
 };
 
 export default function channelEventsExtension(pi: ExtensionAPI): void {
