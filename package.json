@@ -25,15 +25,13 @@
 		]
 	},
 	"publishConfig": {
-		"access": "public",
-		"provenance": true
+		"access": "public"
 	},
 	"scripts": {
 		"lint": "biome check extensions/",
 		"format": "biome check --write extensions/",
 		"typecheck": "tsc --noEmit",
-		"check": "biome check extensions/ && tsc --noEmit",
-		"prepublishOnly": "npm run check"
+		"check": "biome check extensions/ && tsc --noEmit"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
