@@ -1,0 +1,30 @@
+{
+	"name": "@ai-outfitter/channels",
+	"version": "0.1.0",
+	"description": "Pi extension that pushes channel events (email/Slack/Signal/…) into an agent session, waking it only when real work arrives.",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"ai-outfitter",
+		"channels"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		]
+	},
+	"scripts": {
+		"lint": "biome check extensions/",
+		"format": "biome check --write extensions/",
+		"typecheck": "tsc --noEmit",
+		"check": "biome check extensions/ && tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.5",
+		"@types/node": "^22.20.1",
+		"typescript": "^5.9.3"
+	}
+}
