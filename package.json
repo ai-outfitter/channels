@@ -3,21 +3,37 @@
 	"version": "0.1.0",
 	"description": "Pi extension that pushes channel events (email/Slack/Signal/…) into an agent session, waking it only when real work arrives.",
 	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ai-outfitter/channels.git"
+	},
+	"homepage": "https://github.com/ai-outfitter/channels#readme",
+	"bugs": "https://github.com/ai-outfitter/channels/issues",
 	"keywords": [
 		"pi-package",
 		"ai-outfitter",
 		"channels"
+	],
+	"files": [
+		"extensions",
+		"docs"
 	],
 	"pi": {
 		"extensions": [
 			"./extensions/index.ts"
 		]
 	},
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
 	"scripts": {
 		"lint": "biome check extensions/",
 		"format": "biome check --write extensions/",
 		"typecheck": "tsc --noEmit",
-		"check": "biome check extensions/ && tsc --noEmit"
+		"check": "biome check extensions/ && tsc --noEmit",
+		"prepublishOnly": "npm run check"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
