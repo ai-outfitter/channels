@@ -1,13 +1,14 @@
 # channels
 
-A [Pi](https://github.com/earendil-works/pi) extension that pushes **channel
-events into your running pi session** — email, Signal, GitHub notifications — so
-the agent wakes and runs a turn **only when a channel has real work**, instead of
-polling on a timer. Multiple channels run at once and feed one notification queue.
+A [Pi](https://github.com/earendil-works/pi) extension that watches email,
+Signal, GitHub notifications, and Slack mentions, then wakes the running session
+only when a source detects matching work. Sources may use push connections,
+local daemons, or lightweight polling. Multiple channels share one notification
+queue.
 
-The wake is a trusted, body-free ping ("there's new activity on `github`"); your
-agent then reads and replies using that channel's skill, so message contents never
-enter the session as instructions.
+The wake is a trusted, body-free ping ("there's new activity on `github`"). For
+exact items, the agent reads and replies through channel-neutral tools, so
+message contents never enter the session as instructions.
 
 ## Install
 
@@ -35,8 +36,8 @@ Confirm with `pi list`; update later with `pi update --extensions`.
 
 ## Run it resident
 
-A channel watcher opens push connections when a session starts and closes them
-when it ends, so it needs a **long-running session**:
+A channel watcher starts its connection, daemon, or polling loop with the session
+and stops it when the session ends, so it needs a **long-running session**:
 
 - **Interactive:** just run `pi` — the connections stay open until you quit.
 - **Headless:** `pi --mode rpc` for an unattended, programmatically-driven session.
@@ -47,12 +48,14 @@ new session — that's expected.
 
 ## Pair each channel with a skill
 
-This extension only **wakes** the agent. To actually read and reply on a channel,
-your agent also needs that channel's **skill** (or equivalent tools). The
+The extension provides wake transport plus `channel_read` and
+`channel_respond`. Skills teach the agent when to use them. The
 [`ai-outfitter/community-profiles`](https://github.com/ai-outfitter/community-profiles)
 catalog publishes matching skills — `mail`, `signal-responder`, `slack-responder`
 — and ready-made agent profiles. Enable the channel's skill alongside this
-extension.
+extension. Slack uses the common tools today; the existing JMAP, Signal, and
+GitHub skills retain their current workflows until their exact-item adapters are
+implemented.
 
 ## Choose which channels run
 
@@ -64,20 +67,21 @@ Set `OUTFITTER_CHANNELS` in your shell before launching pi:
 | `jmap,signal` | Start exactly those channels (comma/space list). |
 | `off` / `none` | Disabled. |
 
-Auto-detect means a channel turns on simply because you exported its credentials —
-adding a channel is adding its env, nothing else.
+Auto-detect enables a channel when its required environment variables are
+present.
 
 ## Set up each channel
 
 pi has no per-extension config file, so each channel is configured with **shell
 environment variables** you export before running `pi` (put them in your shell
-profile, an `.envrc`, or a systemd unit for a persistent watcher). Each channel
-reuses the same variables as its skill.
+profile, an `.envrc`, or a systemd unit for a persistent watcher). Credentials
+belong to the extension adapter; existing non-tool skills may reuse them.
 
 ### Email — `jmap`
 
-Watches a JMAP mailbox's `Email` state over an EventSource (SSE) and wakes on new
-mail. It reads no message bodies — the `mail` skill (via `xin`) does the reading.
+Watches a JMAP mailbox's `Email` state over an EventSource (SSE) and wakes
+whenever that state changes. It reads no message bodies; the `mail` skill (via
+`xin`) determines whether actionable new mail exists.
 
 - **Prerequisites:** a JMAP mailbox (e.g. [Stalwart](https://stalw.art/),
   Fastmail) and the `mail` skill enabled. *(JMAP servers only — Gmail is not JMAP;
@@ -130,23 +134,40 @@ act on them.
 
 ### Slack — `slack`
 
-Opens a Slack **Socket Mode** websocket and wakes on each message in a watched
-channel. The `slack-responder` skill does the read/reply.
+Uses Slack's official `@slack/socket-mode` client to open a **Socket Mode**
+websocket and wakes on each `app_mention` in a watched channel. The event wake
+carries only an opaque, validated locator. The `slack-responder` skill passes it
+to `channel_read` and `channel_respond`; the extension owns context retrieval,
+thread addressing, and the handled reaction.
 
 - **Prerequisites:** a Slack app with **Socket Mode** enabled — an app-level token
   (`xapp-…`, scope `connections:write`) for the socket, plus the bot token
-  (`xoxb-…`, scopes `channels:history`, `chat:write`, `reactions:write`) the
-  `slack-responder` skill uses. Invite the bot to the channels it should watch.
+  (`xoxb-…`, scopes `app_mentions:read`, `channels:history`, `chat:write`,
+  `reactions:write`) used by the official `@slack/web-api` client. Add
+  `groups:history` for private channels. Under
+  *Event Subscriptions*, subscribe to `app_mention`, then invite the bot to the
+  channels it should watch.
 - **Configure:**
 
   ```bash
   export SLACK_APP_TOKEN="xapp-…"                  # Socket Mode (this extension)
-  export SLACK_CHANNEL_IDS="C0123ABCD C0456EFGH"   # optional; empty = every channel the bot is in
-  export SLACK_BOT_TOKEN="xoxb-…"                  # used by the slack-responder skill
+  export SLACK_CHANNEL_IDS="joined"                 # default: every channel the bot has joined
+  export SLACK_BOT_TOKEN="xoxb-…"                  # context/reply action adapter
   ```
 
-  This extension only needs `SLACK_APP_TOKEN` (the wake signal); it reads no
-  message text. `SLACK_BOT_TOKEN` is consumed by the skill.
+  Both tokens are required for an operational Slack channel: the app token owns
+  the wake transport and the bot token owns context/reply operations. The
+  source verifies the bot credential with `auth.test`; message text is fetched
+  only when the agent calls `channel_read`. Transient authentication or initial
+  connection failures retry without blocking other configured channels. Omit
+  `SLACK_CHANNEL_IDS` or set it to `joined` for the default. Set it to one or
+  more channel IDs to narrow the bot below its Slack membership boundary.
+
+#### Test against a real Slack workspace locally
+
+Socket Mode connects outbound, so local testing needs no public URL or tunnel.
+Follow the [local Slack runbook](docs/runbooks/slack-local.md) to configure the
+app, start the resident bot, and verify a mention-to-reply round trip.
 
 ### Minimal end-to-end
 
@@ -171,21 +192,26 @@ Connection lifecycle runs on **inference-free** pi hooks (`session_start` opens
 each push stream; `session_shutdown` closes them). Only a real event calls
 `pi.sendUserMessage` (a turn), idle-gated and coalesced across channels into one
 sweep. Full design, the pi primitives, and verification are in
-[docs/channel-events.md](docs/channel-events.md).
+[docs/channel-events.md](docs/channel-events.md). Source boundaries and the
+channel tool boundary, library evaluation, and per-channel dynamic-import
+convention are in
+[docs/architecture.md](docs/architecture.md).
 
 ## Add a channel
 
-One file + one registry entry: add `extensions/sources/<name>.ts` exporting a
-`ChannelSource`, then one entry in the `SOURCES` registry in `extensions/index.ts`.
+Add `extensions/sources/<name>.ts` with a `ChannelSource` and, for exact-item
+tools, `ChannelActions`, then add one entry in the `SOURCES` registry.
 
 ```text
 extensions/
-  index.ts            # the extension: hooks, notification queue, wake logic
+  index.ts            # hooks, notification queue, lazy adapter routing
+  channel-tools.ts    # channel_read / channel_respond
   sources/
-    types.ts          # ChannelSource / ChannelEvent
+    types.ts          # source, event, locator, and action contracts
     util.ts           # shared helpers (parseList, scopedLog, reconnect delay)
     jmap.ts           # JMAP EventSource source
     signal.ts         # signal-cli jsonRpc source
     github.ts         # GitHub notifications (polling) source
+    slack.ts          # Slack Socket Mode source + action adapter
 docs/channel-events.md
 ```

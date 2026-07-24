@@ -1,9 +1,9 @@
-# Channel events — native push into a pi session
+# Channel events — wake pi only when work arrives
 
-This extension lets a channel's **native push stream** wake the agent only when
-there is real work, instead of the loop extension waking the model on every tick
-to poll. It is the push counterpart to the model-polled channel skills
-(`mail`/`gmail`/`slack-responder`/…).
+Channel sources wake the agent when work arrives, avoiding model-driven polling
+on every loop tick. Sources may use push connections, a local daemon, or
+lightweight polling. Slack exact items use the extension's channel-neutral tools
+after the wake.
 
 ## Why
 
@@ -34,20 +34,21 @@ This extension uses **inference-free lifecycle hooks** for the connection and
 - **`session_start`** (no inference): read config from env, open the source's push
   connection, keep the returned `stop` handle.
 - **On event** (no inference until it wakes): the source calls back with a
-  **trusted ping** (`{ channel, summary }` — *never* the untrusted body). The
+  **trusted ping** (`{ channel, summary, locator? }` — *never* the untrusted
+  body). The
   extension sends one `sendUserMessage(..., { deliverAs: "followUp" })`: idle →
   runs now; streaming → runs after the current turn (never interrupts). Events are
-  **coalesced** behind a `wakePending` flag (cleared on `agent_end`) so a burst
-  folds into a single sweep — the channel skills already drain the whole inbox.
+  queued by channel or exact locator and drained after `agent_end`, so a burst
+  folds into as few turns as possible without losing distinct exact items.
 - **`session_shutdown`** (no inference): call `stop()` — idempotent, closes the
   connection.
-- **Trust boundary:** the wake prompt is trusted and body-free; the model fetches
-  and reads the real (untrusted) content via the skill, so attacker-controlled
-  text never enters as a user message. Same rule as skill references.
-- **Reliability:** keep a low-frequency loop tick as the heartbeat/reconnect
-  backstop. The push path is the fast path; the loop catches missed pings and
-  restarts. Server-side channel state (a message stays in `INBOX` until the skill
-  moves it) means a dropped push loses latency, not mail.
+- **Trust boundary:** the wake prompt is trusted and body-free. For located
+  items, the model passes the opaque locator to `channel_read`; fetched content
+  appears only inside explicit untrusted-content markers.
+- **Reliability:** each source owns recovery. JMAP, Signal, and Slack use the
+  shared supervisor (Slack only until its SDK owns reconnection), and GitHub
+  schedules its own polls. A separately configured model-polling loop
+  can provide an application-level backstop, but it does not restart sources.
 
 ## Multiple channels at once
 
@@ -63,9 +64,8 @@ Channel selection:
 | `jmap,signal` (list) | Start exactly those channels. |
 | `off` / `none` | Disabled; loop-polling unchanged. |
 
-Auto-detect is the composition-friendly default: a channel activates simply because
-its credentials are present, so adding a channel profile (which brings its Secret)
-lights up its source with no extra wiring.
+Auto-detect activates each source whose credentials are present. A channel
+profile can supply its secret without additional source-selection configuration.
 
 ## Configuration
 
@@ -73,12 +73,14 @@ lights up its source with no extra wiring.
 | --- | --- |
 | `XIN_BASE_URL` / `XIN_BASIC_USER` / `XIN_BASIC_PASS` | `jmap` source (same creds as the `mail` skill). |
 | `SIGNAL_NUMBER` / `SIGNAL_CLI_CONFIG` | `signal` source (same creds as the `signal-responder` skill). |
+| `GITHUB_TOKEN` | `github` notification source. |
+| `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` | `slack` source and action adapter. |
 
 ## Sources
 
-Adding a channel = one new `sources/<name>.ts` exporting a `ChannelSource` + one
-entry in the `SOURCES` registry in `extensions/index.ts`. The core extension, hooks,
-queue, and trust handling never change.
+To add a channel, create `sources/<name>.ts`, export its `ChannelSource` and
+optional action adapter, then register it in `extensions/index.ts`. The core
+hooks, queue, and trust boundary remain unchanged.
 
 - **`jmap`** (`extensions/sources/jmap.ts`) — JMAP EventSource (SSE, RFC 8620
   §7.3) on Stalwart; watches the account's `Email` `StateChange` and emits a
@@ -88,10 +90,23 @@ queue, and trust handling never change.
   (a dissimilar transport: child-process JSON-RPC, not HTTP SSE) and emits a
   trusted `new message` event per incoming message; the `signal-responder` skill
   does the receive/reply.
-- **`slack`** (`extensions/sources/slack.ts`) — Slack Socket Mode websocket
-  (`apps.connections.open` → ws; a third transport shape alongside SSE and the
-  child process). ACKs every envelope and emits a trusted `new message` event per
-  message in a watched channel; the `slack-responder` skill handles the data.
+- **`slack`** (`extensions/sources/slack.ts`) — the official
+  `@slack/socket-mode` client owns the Socket Mode websocket, acknowledgements,
+  reconnects, and shutdown. By default, the source listens for `app_mention` in
+  every channel the bot has joined; an explicit channel-ID allowlist can narrow
+  that Slack membership boundary. It emits a trusted `new mention` event
+  containing only validated opaque locators. Its `@slack/web-api` action adapter implements
+  `channel_read` and `channel_respond`, including bounded thread context,
+  threaded replies, and handled reactions.
+
+Source modules follow the dynamic-import convention in
+[architecture.md](architecture.md): the core registry probes environment
+variables without importing a source, then imports only selected, configured
+channel implementations at session startup.
+
+The agent-facing contract and its evaluation against Slack, JMAP, Signal,
+GitHub, and WhatsApp are documented in
+[architecture.md](architecture.md#agent-facing-tools).
 
 ## Composition — publish channels as outfitter profiles
 
@@ -105,13 +120,12 @@ skills: [gmail]
 extensions: [git:github.com/ai-outfitter/channels]
 ```
 
-Because loadout entries are slugs resolved and **merged by ID across layers**, a
-user's personal agent that draws from several channel profiles gets each channel
-skill once and the shared extension **deduplicated** to a single load. A
-`personal-assistant` profile that lists `skills: [gmail, slack-responder,
-signal-responder]` + the one extension is a unified agent assigned to all three
-channels, working a single notification queue. Set (or auto-detect) the channels
-whose credentials the deployment provides.
+Loadout entries are resolved by slug and merged by ID across layers. A personal
+agent can combine channel profiles while loading each skill once and
+deduplicating the shared extension. For example, a `personal-assistant` profile
+can select `gmail`, `slack-responder`, and `signal-responder` and process all
+three through one notification queue. Configure `OUTFITTER_CHANNELS`, or let
+credential auto-detection select the available channels.
 
 ## Verifying against the Stalwart demo
 

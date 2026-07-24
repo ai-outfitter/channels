@@ -28,7 +28,8 @@ export const RECONNECT_DELAY_MS = 5000;
  * timeout) without stopping the supervisor.
  *
  * The stop handle is idempotent, cancels an in-flight backoff, and — via the
- * signal — the live attempt, so no timer or connection outlives it.
+ * signal — the live attempt, so no timer or connection outlives it. It resolves
+ * only after the attempt's own teardown has finished.
  */
 export function supervise(
 	attempt: (signal: AbortSignal) => Promise<void>,
@@ -44,9 +45,12 @@ export function supervise(
 			if (signal.aborted || !(await backoff(delayMs, signal))) return;
 		}
 	};
-	void loop();
+	const running = loop();
 
-	return async () => controller.abort();
+	return async () => {
+		controller.abort();
+		await running;
+	};
 }
 
 /** Run one attempt; return `false` only when the supervisor was stopped. */

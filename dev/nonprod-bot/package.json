@@ -1,0 +1,35 @@
+{
+  "$schema": "https://www.schemastore.org/package.json",
+  "name": "nonprod-bot",
+  "version": "1.0.0",
+  "description": "A blank template for Slack apps",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "lint": "npx @biomejs/biome check",
+    "lint:fix": "npx @biomejs/biome check --write",
+    "start": "node app.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slack-samples/bolt-js-blank-template.git"
+  },
+  "keywords": [
+    "slack",
+    "bolt",
+    "slackapi"
+  ],
+  "author": "Slack Technologies, LLC",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/slack-samples/bolt-js-blank-template/issues"
+  },
+  "homepage": "https://github.com/slack-samples/bolt-js-blank-template#readme",
+  "dependencies": {
+    "@slack/bolt": "^5.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.5",
+    "@slack/cli-hooks": "^2.0.0"
+  }
+}

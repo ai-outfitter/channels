@@ -15,12 +15,59 @@ export interface ChannelSource {
 
 /**
  * A **trusted** "there is work" ping — deliberately carries no untrusted message
- * body. The channel skill fetches and reads the actual (untrusted) content, so
- * attacker-controlled text never enters the session as a user message.
+ * body. An action adapter fetches and exposes the actual (untrusted) content
+ * through a channel tool, so attacker-controlled text never enters the session
+ * as a user message.
  */
 export interface ChannelEvent {
 	/** Which channel produced the signal, e.g. "jmap". */
 	channel: string;
 	/** Short trusted human summary for logs/UI, e.g. "new mail". */
 	summary: string;
+	/**
+	 * Optional trusted structural locator. Values must be validated by the source
+	 * and must never contain sender-controlled message content.
+	 */
+	locator?: ChannelLocator;
+}
+
+/** A channel-specific reference that lets a skill fetch the untrusted content. */
+export interface ChannelLocator {
+	/**
+	 * Stable opaque key used for redelivery coalescing and channel tool calls.
+	 * Only the owning adapter may decode it.
+	 */
+	key: string;
+}
+
+/** One untrusted message returned by a channel adapter. */
+export interface ChannelContextMessage {
+	id: string;
+	author: string;
+	text: string;
+	target: boolean;
+}
+
+/** Channel-neutral context returned by `channel_read`. */
+export interface ChannelReadResult {
+	channel: string;
+	locator: string;
+	handled: boolean;
+	messages: readonly ChannelContextMessage[];
+}
+
+/** Channel-neutral outcome returned by `channel_respond`. */
+export interface ChannelRespondResult {
+	channel: string;
+	locator: string;
+	replied: boolean;
+	handled: boolean;
+	responseId?: string;
+	warning?: string;
+}
+
+/** Operations a channel adapter exposes to the agent-facing tools. */
+export interface ChannelActions {
+	read(locator: string): Promise<ChannelReadResult>;
+	respond(locator: string, response: string): Promise<ChannelRespondResult>;
 }

@@ -20,5 +20,5 @@
 		"noUnusedParameters": true,
 		"forceConsistentCasingInFileNames": true
 	},
-	"include": ["extensions/**/*.ts"]
+	"include": ["dev/**/*.ts", "extensions/**/*.ts", "tests/**/*.ts"]
 }
