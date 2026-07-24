@@ -58,7 +58,6 @@ export function supervise(
 				running,
 				delay(shutdownTimeoutMs, undefined, {
 					signal: timer.signal,
-					ref: false,
 				}).then(() => {
 					log(`source shutdown timed out after ${shutdownTimeoutMs}ms`);
 				}),
