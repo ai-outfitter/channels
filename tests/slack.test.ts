@@ -24,10 +24,12 @@ import {
 	createSlackSource,
 	mentionEvent,
 	type SlackClientFactories,
+	slackActionsConfigFromEnv,
 	slackConfigFromEnv,
 } from "../extensions/sources/slack.ts";
 import { parseSlackChannelIds } from "../extensions/sources/slack-config.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "../extensions/sources/types.ts";
+import { supervise } from "../extensions/sources/util.ts";
 
 test("local Slack preflight defaults to channels the bot has joined", () => {
 	assert.deepEqual(
@@ -372,11 +374,25 @@ test("Slack shutdown cancels an authentication retry backoff", async () => {
 	assert.equal(authAttempts, 1);
 });
 
-test("Slack config requires both Socket Mode and bot tokens", () => {
+test("source shutdown is bounded when an attempt ignores abort", async () => {
+	const logs: string[] = [];
+	const stop = supervise(
+		async () => new Promise<void>(() => {}),
+		(message) => logs.push(message),
+		60_000,
+		5,
+	);
+
+	await stop();
+	assert.deepEqual(logs, ["source shutdown timed out after 5ms"]);
+});
+
+test("Slack config requires and normalizes Socket Mode and bot tokens", () => {
 	const prior = {
 		app: process.env.SLACK_APP_TOKEN,
 		bot: process.env.SLACK_BOT_TOKEN,
 		channels: process.env.SLACK_CHANNEL_IDS,
+		emoji: process.env.LINK_SLACK_DONE_EMOJI,
 	};
 	try {
 		process.env.SLACK_APP_TOKEN = "xapp-test";
@@ -392,15 +408,24 @@ test("Slack config requires both Socket Mode and bot tokens", () => {
 		});
 
 		process.env.SLACK_CHANNEL_IDS = "joined";
+		process.env.SLACK_APP_TOKEN = "  xapp-test\n";
+		process.env.SLACK_BOT_TOKEN = "\txoxb-test  ";
 		assert.deepEqual(slackConfigFromEnv(), {
 			appToken: "xapp-test",
 			botToken: "xoxb-test",
 			channelIds: new Set(),
 		});
+
+		process.env.LINK_SLACK_DONE_EMOJI = " white_check_mark\n";
+		assert.deepEqual(slackActionsConfigFromEnv(), {
+			botToken: "xoxb-test",
+			doneEmoji: "white_check_mark",
+		});
 	} finally {
 		restoreEnv("SLACK_APP_TOKEN", prior.app);
 		restoreEnv("SLACK_BOT_TOKEN", prior.bot);
 		restoreEnv("SLACK_CHANNEL_IDS", prior.channels);
+		restoreEnv("LINK_SLACK_DONE_EMOJI", prior.emoji);
 	}
 });
 

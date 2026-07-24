@@ -68,8 +68,8 @@ interface SlackEnvelope {
 
 /** Build complete Slack channel config, or undefined when either token is absent. */
 export function slackConfigFromEnv(): SlackConfig | undefined {
-	const appToken = process.env.SLACK_APP_TOKEN;
-	const botToken = process.env.SLACK_BOT_TOKEN;
+	const appToken = process.env.SLACK_APP_TOKEN?.trim();
+	const botToken = process.env.SLACK_BOT_TOKEN?.trim();
 	if (!appToken || !botToken) return undefined;
 	return {
 		appToken,
@@ -80,9 +80,9 @@ export function slackConfigFromEnv(): SlackConfig | undefined {
 
 /** Build the Slack action adapter config from the responder's bot credential. */
 export function slackActionsConfigFromEnv(): SlackActionsConfig | undefined {
-	const botToken = process.env.SLACK_BOT_TOKEN;
+	const botToken = process.env.SLACK_BOT_TOKEN?.trim();
 	if (!botToken) return undefined;
-	const doneEmoji = process.env.LINK_SLACK_DONE_EMOJI || DEFAULT_DONE_EMOJI;
+	const doneEmoji = process.env.LINK_SLACK_DONE_EMOJI?.trim() || DEFAULT_DONE_EMOJI;
 	if (!EMOJI_NAME.test(doneEmoji)) {
 		throw new Error("LINK_SLACK_DONE_EMOJI is not a valid Slack emoji name");
 	}
