@@ -99,8 +99,6 @@ SLACK_CLI_APP_ID=A0BKPNHJ12N
 SLACK_CLI_TEAM_ID=T7GCW93AA
 SLACK_CLI_APP_NAME=nonprod-bot
 SLACK_CLI_ENVIRONMENT=local
-SLACK_APP_TOKEN=xapp-REPLACE_ME
-SLACK_BOT_TOKEN=xoxb-REPLACE_ME
 SLACK_CHANNEL_IDS=joined
 SLACK_VERIFY_CHANNEL_IDS=C0123ABCD
 ```
@@ -114,8 +112,27 @@ chmod 600 .env.slack.local
 Set `SLACK_DOTENV` to another path if a password manager or local secrets
 workflow writes the file elsewhere.
 
-To keep tokens out of shell history, enter them without putting their values in
-the command when you do not use the dotenv file:
+### Preferred: Slack CLI-managed tokens
+
+Install and authenticate the
+[Slack CLI](https://docs.slack.dev/tools/slack-cli/guides/installing-the-slack-cli-for-mac-and-linux/),
+then run:
+
+```bash
+npm run setup:slack
+npm run dev:slack:cli
+```
+
+`setup:slack` creates the ignored `dev/nonprod-bot` project from Slack's blank
+Bolt template and copies in the repository's small manifest and launcher
+templates. `dev:slack:cli` runs that project, allowing Slack CLI to inject
+`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` without persisting either secret in the
+repository or dotenv.
+
+### Alternative: provide tokens directly
+
+To run without Slack CLI, enter tokens without putting their values in shell
+history:
 
 ```bash
 read -rsp "Slack app token (xapp-): " SLACK_APP_TOKEN; echo
@@ -132,13 +149,15 @@ export SLACK_VERIFY_MARKER="[channels-local-smoke]"
 export LINK_SLACK_DONE_EMOJI="white_check_mark"
 ```
 
-Do not commit the tokens, paste them into chat, or store them in a tracked
-`.env` file. The verification terminal needs the same three required variables
-and the same marker and emoji overrides.
+Then run `npm run dev:slack`. Do not commit the tokens, paste them into chat, or
+store them in a tracked `.env` file. The verification terminal needs the same
+credentials when it is not launched by Slack CLI, plus the same marker and
+emoji overrides.
 
 ## Start the resident bot
 
-In the first configured terminal:
+With Slack CLI, `npm run dev:slack:cli` performs setup and starts the resident
+bot. With direct token environment variables, run:
 
 ```bash
 npm run dev:slack

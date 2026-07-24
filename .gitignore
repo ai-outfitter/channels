@@ -3,3 +3,4 @@ node_modules/
 .deepwork/
 .env.slack.local
 slack-debug-*.log
+/dev/nonprod-bot/
