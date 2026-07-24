@@ -13,7 +13,7 @@ import {
 	type ConversationsRepliesResponse,
 	WebClient,
 } from "@slack/web-api";
-import { parseSlackChannelIds } from "./slack-config.ts";
+import { compareSlackTimestamps, parseSlackChannelIds } from "./slack-config.ts";
 import type {
 	ChannelActions,
 	ChannelContextMessage,
@@ -315,7 +315,7 @@ function boundedThreadContext(
 }
 
 function compareMessages(left: SlackMessage, right: SlackMessage): number {
-	return Number(left.ts ?? 0) - Number(right.ts ?? 0);
+	return compareSlackTimestamps(left.ts ?? "0", right.ts ?? "0");
 }
 
 function contextMessage(message: SlackMessage, targetTs: string): ChannelContextMessage {

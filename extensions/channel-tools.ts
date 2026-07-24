@@ -91,7 +91,12 @@ function renderContext(result: ChannelReadResult): string {
 
 function renderMessage(message: ChannelContextMessage): string {
 	const target = message.target ? " [TARGET]" : "";
-	return `${message.author} at ${message.id}${target}:\n${message.text}`;
+	const heading = `${JSON.stringify(message.author)} at ${JSON.stringify(message.id)}${target}:`;
+	const text = message.text
+		.split(/\r\n|[\n\r\u2028\u2029]/)
+		.map((line) => `| ${line}`)
+		.join("\n");
+	return `${heading}\n${text}`;
 }
 
 function renderResponse(result: ChannelRespondResult): string {

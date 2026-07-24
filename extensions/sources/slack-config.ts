@@ -25,3 +25,26 @@ export function parseSlackChannelIds(raw: string | undefined): Set<string> {
 	}
 	return new Set(values);
 }
+
+/** Compare Slack decimal timestamps without losing fractional precision. */
+export function compareSlackTimestamps(left: string, right: string): number {
+	const leftParts = timestampParts(left);
+	const rightParts = timestampParts(right);
+	if (!leftParts || !rightParts) return left.localeCompare(right);
+
+	const seconds =
+		leftParts.seconds.length - rightParts.seconds.length ||
+		leftParts.seconds.localeCompare(rightParts.seconds);
+	if (seconds !== 0) return seconds;
+
+	const width = Math.max(leftParts.fraction.length, rightParts.fraction.length);
+	return leftParts.fraction
+		.padEnd(width, "0")
+		.localeCompare(rightParts.fraction.padEnd(width, "0"));
+}
+
+function timestampParts(value: string): { seconds: string; fraction: string } | undefined {
+	const match = /^(\d+)(?:\.(\d+))?$/.exec(value);
+	if (!match?.[1]) return undefined;
+	return { seconds: match[1], fraction: match[2] ?? "" };
+}

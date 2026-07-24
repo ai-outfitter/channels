@@ -1,6 +1,9 @@
 import { pathToFileURL } from "node:url";
 import { WebClient } from "@slack/web-api";
-import { parseSlackChannelIds } from "../extensions/sources/slack-config.ts";
+import {
+	compareSlackTimestamps,
+	parseSlackChannelIds,
+} from "../extensions/sources/slack-config.ts";
 import {
 	redactedSlackError,
 	runSlackPreflight,
@@ -59,6 +62,7 @@ export async function verifySlackRoundTrip(
 
 	const threadTs = located.message.thread_ts ?? located.message.ts;
 	if (!threadTs || !located.message.ts) throw new Error("located Slack mention has no timestamp");
+	const mentionTs = located.message.ts;
 	const replies = await client.conversations.replies({
 		channel: located.channelId,
 		ts: threadTs,
@@ -70,8 +74,8 @@ export async function verifySlackRoundTrip(
 	const botReplies = (replies.messages ?? []).filter(
 		(message) =>
 			message.user === botUserId &&
-			message.ts !== located.message.ts &&
-			Number(message.ts) > Number(located.message.ts),
+			message.ts !== mentionTs &&
+			Boolean(message.ts && compareSlackTimestamps(message.ts, mentionTs) > 0),
 	);
 	if (botReplies.length !== 1 || !botReplies[0]?.ts) {
 		throw new Error(`expected exactly one bot reply after the mention; found ${botReplies.length}`);
@@ -84,7 +88,7 @@ export async function verifySlackRoundTrip(
 
 	return {
 		channelId: located.channelId,
-		mentionTs: located.message.ts,
+		mentionTs,
 		threadTs,
 		botReplyTs: botReplies[0].ts,
 		handledReaction: doneEmoji,
@@ -112,7 +116,7 @@ async function latestMarkedMention(
 				message.text?.includes(`<@${botUserId}>`) &&
 				message.text.includes(marker) &&
 				message.ts &&
-				(!latest?.message.ts || Number(message.ts) > Number(latest.message.ts))
+				(!latest?.message.ts || compareSlackTimestamps(message.ts, latest.message.ts) > 0)
 			) {
 				latest = { channelId, message };
 			}
