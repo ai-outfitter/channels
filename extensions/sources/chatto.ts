@@ -7,7 +7,7 @@
  * notification row contains the notification ID needed for exact handled state.
  */
 import { createPromiseClient, type PromiseClient, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@connectrpc/connect-web";
 import { WebSocket } from "undici";
 import { MessageService } from "../vendor/chatto/chatto/api/v1/messages_connect.js";
 import { NotificationService } from "../vendor/chatto/chatto/api/v1/notifications_connect.js";
@@ -501,7 +501,6 @@ function connectApi(clients: {
 function chattoTransport(cfg: ChattoConfig): Transport {
 	return createConnectTransport({
 		baseUrl: `${cfg.baseUrl}/api/connect`,
-		httpVersion: "1.1",
 		interceptors: [
 			(next) => async (request) => {
 				request.header.set("authorization", `Bearer ${cfg.token}`);
