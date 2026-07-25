@@ -158,6 +158,23 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return configure(m.mattermostConfigFromEnv, m.createMattermostActions);
 		},
 	},
+	zulip: {
+		configured: () =>
+			Boolean(
+				process.env.ZULIP_ORGANIZATION_URL ||
+					process.env.ZULIP_BOT_EMAIL ||
+					process.env.ZULIP_API_KEY ||
+					process.env.ZULIP_CHANNEL_IDS,
+			),
+		async load() {
+			const m = await import("./sources/zulip.ts");
+			return configure(m.zulipConfigFromEnv, m.createZulipSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/zulip.ts");
+			return configure(m.zulipConfigFromEnv, m.createZulipActions);
+		},
+	},
 };
 
 export default function channelEventsExtension(
