@@ -1,14 +1,14 @@
 # channels
 
 A [Pi](https://github.com/earendil-works/pi) extension that watches email,
-Signal, GitHub notifications, and Slack mentions, then wakes the running session
-only when a source detects matching work. Sources may use push connections,
-local daemons, or lightweight polling. Multiple channels share one notification
-queue.
+Signal, GitHub notifications, and mentions in Slack, Chatto, Mattermost, and
+Zulip, then wakes the running session only when a source detects matching work.
+Sources may use push connections, local daemons, or lightweight polling.
+Multiple channels share one notification queue.
 
-The wake is a trusted, body-free ping ("there's new activity on `github`"). For
-exact items, the agent reads and replies through channel-neutral tools, so
-message contents never enter the session as instructions.
+The wake is a trusted, body-free ping ("there's new activity on `github`").
+Wake prompts contain no message content. For exact items, `channel_read` returns
+fetched content inside explicit untrusted-content markers.
 
 ## Install
 
@@ -51,11 +51,12 @@ new session — that's expected.
 The extension provides wake transport plus `channel_read` and
 `channel_respond`. Skills teach the agent when to use them. The
 [`ai-outfitter/community-profiles`](https://github.com/ai-outfitter/community-profiles)
-catalog publishes matching skills — `mail`, `signal-responder`, `slack-responder`
-— and ready-made agent profiles. Enable the channel's skill alongside this
-extension. Slack uses the common tools today; the existing JMAP, Signal, and
-GitHub skills retain their current workflows until their exact-item adapters are
-implemented.
+catalog publishes `mail`, `signal-responder`, `slack-responder`, and ready-made
+agent profiles. Enable a matching skill when one is available. Chatto,
+Mattermost, and Zulip expose the common tools directly, so the agent's profile
+or instructions must define when to read and respond. The existing JMAP, Signal,
+and GitHub skills retain their current workflows until their exact-item adapters
+are implemented.
 
 ## Choose which channels run
 
@@ -64,7 +65,7 @@ Set `OUTFITTER_CHANNELS` in your shell before launching pi:
 | `OUTFITTER_CHANNELS` | Behavior |
 | --- | --- |
 | unset | **Auto-detect** — start every channel whose credentials are present. |
-| `jmap,signal` | Start exactly those channels (comma/space list). |
+| `jmap,signal` | Start exactly those channels. Separate names with commas or spaces. Valid names: `jmap`, `signal`, `github`, `forgejo`, `slack`, `agent`, `chatto`, `mattermost`, `zulip`. |
 | `agent` | Start the native agent session chat channel. |
 | `off` / `none` | Disabled. |
 
@@ -272,6 +273,73 @@ Socket Mode connects outbound, so local testing needs no public URL or tunnel.
 Follow the [local Slack runbook](docs/runbooks/slack-local.md) to configure the
 app, start the resident bot, and verify a mention-to-reply round trip.
 
+### Chatto — `chatto`
+
+Connects to a self-hosted Chatto server's protocol-v2 realtime projection and
+wakes for mention notifications. `channel_read` validates the exact notification
+and reads up to ten room or thread messages; `channel_respond` replies in the
+correct thread and dismisses that notification.
+
+- **Prerequisites:** a Chatto identity and bearer token that can read the watched
+  rooms and notifications, post messages and thread replies, and dismiss its own
+  notifications.
+- **Configure:**
+
+  ```bash
+  export CHATTO_BASE_URL="https://chatto.example.com"
+  export CHATTO_TOKEN="…"
+  export CHATTO_ROOM_IDS="room-id-1,room-id-2"  # optional
+  ```
+
+  Omit `CHATTO_ROOM_IDS` to use every room visible to the identity. This adapter
+  is pinned to the protocol-v2 schema recorded in
+  [`extensions/vendor/chatto/SCHEMA.md`](extensions/vendor/chatto/SCHEMA.md).
+  Chatto `v0.4.16` does not expose that schema; use the pinned revision or a
+  later protocol-v2-compatible release described in the
+  [local Chatto runbook](docs/runbooks/chatto-local.md).
+
+### Mattermost — `mattermost`
+
+Uses Mattermost's WebSocket API for recipient-scoped posted events and its REST
+API for exact reads, replies, and handled reactions.
+
+- **Prerequisites:** a Mattermost bot account added to each watched channel, with
+  permission to read channel history, create posts and thread replies, and add
+  reactions.
+- **Configure:**
+
+  ```bash
+  export MATTERMOST_BASE_URL="https://mattermost.example.com"
+  export MATTERMOST_BOT_TOKEN="…"
+  export MATTERMOST_CHANNEL_IDS="channel-id-1,channel-id-2"  # optional
+  ```
+
+  Omit `MATTERMOST_CHANNEL_IDS` to accept mentions from every channel visible to
+  the bot. See the
+  [local Mattermost runbook](docs/runbooks/mattermost-local.md).
+
+### Zulip — `zulip`
+
+Maintains a Zulip realtime event queue, recreates expired queues, and wakes for
+channel mentions or direct messages. Reads stay within the original topic or
+direct conversation; replies preserve that address and add a
+`white_check_mark` reaction to the exact message.
+
+- **Prerequisites:** a Zulip bot subscribed to each watched channel, with access
+  to read messages, send replies, and add reactions.
+- **Configure:**
+
+  ```bash
+  export ZULIP_ORGANIZATION_URL="https://zulip.example.com"
+  export ZULIP_BOT_EMAIL="bot@zulip.example.com"
+  export ZULIP_API_KEY="…"
+  export ZULIP_CHANNEL_IDS="12,34"  # optional numeric channel IDs
+  ```
+
+  The allowlist applies only to channel messages; direct messages remain
+  eligible. Omit it to accept mentions from every channel visible to the bot.
+  See the [local Zulip runbook](docs/runbooks/zulip-local.md).
+
 ### Minimal end-to-end
 
 ```bash
@@ -320,5 +388,8 @@ extensions/
     signal.ts         # signal-cli jsonRpc source
     github.ts         # GitHub notifications (polling) source
     slack.ts          # Slack Socket Mode source + action adapter
+    chatto.ts         # Chatto realtime source + action adapter
+    mattermost.ts     # Mattermost WebSocket source + action adapter
+    zulip.ts          # Zulip event-queue source + action adapter
 docs/channel-events.md
 ```

@@ -15,8 +15,8 @@ There are three layers:
 
 1. A **source** detects work and emits a body-free `ChannelEvent`.
 2. The **channel tools** give the agent one stable read/respond interface.
-3. An **adapter** translates that interface to Slack, JMAP, Signal, GitHub, or a
-   future transport.
+3. An **adapter** translates that interface to Slack, Chatto, Mattermost, Zulip,
+   JMAP, Signal, GitHub, or a future transport.
 
 The agent should not need SDK-specific skills, raw HTTP recipes, credentials, or
 JSON response parsing. A channel skill teaches workflow and policy only.
@@ -83,17 +83,21 @@ The common tools own:
 - the invariant that a partial result (`replied: true`, `handled: false`) must not
   cause a duplicate reply.
 
-Only the Slack action adapter is implemented today. JMAP, Signal, and GitHub
-still wake their existing skills without exact-item locators until their action
-adapters are added.
+Slack, Chatto, Mattermost, and Zulip implement exact-item action adapters. JMAP,
+Signal, and GitHub still wake their existing skills without exact-item locators
+until their action adapters are added.
 
 ## Evaluation against real channels
 
-The two-tool boundary is shared; native semantics remain in adapters.
+Every adapter exposes the same two tools while retaining its channel's reply and
+handled-state semantics.
 
 | Channel | Recommended library/API | Read mapping | Respond and handled mapping | Boundary implication |
 | --- | --- | --- | --- | --- |
 | Slack | Official [`@slack/socket-mode`](https://docs.slack.dev/tools/node-slack-sdk/socket-mode/) and [`@slack/web-api`](https://docs.slack.dev/tools/node-slack-sdk/web-api/) | `conversations.history` for a top-level mention; paginated [`conversations.replies`](https://docs.slack.dev/reference/methods/conversations.replies/) for a thread | [`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/) into the thread, then [`reactions.add`](https://docs.slack.dev/reference/methods/reactions.add/) on the target | A reply can succeed while the handled reaction fails, so the result needs both states. |
+| Chatto | Generated ConnectRPC clients pinned to a specific schema, plus the [realtime WebSocket protocol](https://docs.chatto.run/reference/connectrpc-api/realtime/) | Validate the notification, then use room or thread events-around RPCs | Create a message in a new or existing thread, then dismiss the exact notification | Notification state, not message state, is the duplicate-suppression boundary. Protocol v2 is pinned because Chatto is pre-1.0. |
+| Mattermost | Native WebSocket plus the [Mattermost REST API](https://developers.mattermost.com/integrate/reference/rest-api/) | Fetch the exact post, then bounded channel history or thread posts | Create a post at the correct root, then add `white_check_mark` to the target | WebSocket `mentions` is recipient-scoped; reply and reaction remain separate operations. |
+| Zulip | Direct use of [realtime event queues](https://zulip.com/api/real-time-events) and REST | Fetch the exact message, then a bounded channel/topic or DM narrow | [Send](https://zulip.com/api/send-message) to the same topic or DM recipients, then [react](https://zulip.com/api/add-reaction) to the target | Channel allowlists do not suppress DMs. `REACTION_ALREADY_EXISTS` is already handled, while other failures produce partial success. |
 | JMAP mail | Direct `fetch` today; [`jmap-jam`](https://www.npmjs.com/package/jmap-jam) is a typed candidate for the adapter | [`Email/get` and `Thread/get`](https://www.rfc-editor.org/rfc/rfc8621.html) | `EmailSubmission/set` with `onSuccessUpdateEmail` to apply `$answered` or mailbox changes after submission | Submission and mailbox state have distinct outcomes, so a submitted reply must survive a later state-update failure. |
 | Signal | [`signal-cli`](https://github.com/AsamK/signal-cli) JSON-RPC daemon | Persist each receive notification in an adapter-owned durable inbox before emitting its locator | `send` with quote timestamp/author; receipts are available but there is no universal durable "handled by this bot" marker | A discarded receive notification cannot be fetched later. The locator must resolve to durable adapter-owned state. |
 | GitHub | Official [`octokit`](https://github.com/octokit/octokit.js) | Resolve a notification subject to its issue, pull request, review, or comment context | Create a plain-text comment or review, then [mark the notification thread read](https://docs.github.com/en/rest/activity/notifications) | Comment replies fit the common tool. Approval, request-changes, merge, and issue mutations need typed GitHub capabilities. Some token types cannot use every notifications endpoint. |
@@ -149,6 +153,9 @@ slack: {
 | Signal | `SIGNAL_NUMBER` or `SIGNAL_CLI_CONFIG` exists | `sources/signal.ts` |
 | GitHub | `GITHUB_TOKEN` exists | `sources/github.ts` |
 | Slack | `SLACK_APP_TOKEN` or `SLACK_BOT_TOKEN` exists | `sources/slack.ts` |
+| Chatto | any `CHATTO_*` adapter variable exists | `sources/chatto.ts` |
+| Mattermost | any `MATTERMOST_*` adapter variable exists | `sources/mattermost.ts` |
+| Zulip | any `ZULIP_*` adapter variable exists | `sources/zulip.ts` |
 
 The probe intentionally detects partial configuration so startup can log an
 actionable incomplete-configuration error. Do not add static channel SDK imports
@@ -165,7 +172,8 @@ needed if install or image-size isolation becomes important.
 Channel-only events use their channel name as the queue key, so repeated JMAP,
 Signal, or GitHub notifications coalesce into one sweep. Located events use the
 full opaque locator, preserving distinct Slack mentions while coalescing
-duplicate delivery of the same mention.
+duplicate delivery of the same mention. Chatto, Mattermost, and Zulip exact-item
+events use the same locator-key behavior.
 
 The wake prompt contains the locator string but no decoded native ids or message
 text. It directs the agent to pass each locator unchanged to `channel_read` and
@@ -213,3 +221,37 @@ The app token requires `connections:write`. The bot requires
 add `groups:history` for private channels. `SLACK_CHANNEL_IDS` defaults to
 `joined` when omitted. Explicit channel IDs narrow event handling below the
 channels the bot has joined; `joined` cannot be mixed with IDs.
+
+## Chatto, Mattermost, and Zulip implementations
+
+Chatto opens `/api/realtime`, negotiates protocol v2, subscribes to the
+authenticated projection, and converts unseen pending mention items in
+`notifications_replace` into `chatto:v1` locators. The locator identifies the
+notification, room, exact message event, and optional thread root. Reads
+revalidate the notification and retrieve at most ten room/thread events.
+Top-level mentions start a thread; threaded mentions stay in their thread.
+Handled state is the exact notification's dismissed state. The vendored schema
+and compatibility boundary are recorded in
+[`extensions/vendor/chatto/SCHEMA.md`](../extensions/vendor/chatto/SCHEMA.md).
+
+Mattermost authenticates its `/api/v4/websocket` connection with a bot token and
+accepts `posted` events only when the server's per-recipient `mentions` list
+contains that bot. A `mattermost:v1` locator identifies the exact post and
+channel. REST reads return at most ten posts, retaining the thread root when
+applicable. Replies use the existing root for a thread or the target post for a
+new thread, then add `white_check_mark` to the target.
+
+Zulip registers a message event queue and long-polls it until shutdown or
+expiry. When Zulip returns `BAD_EVENT_QUEUE_ID`, the polling loop exits and the
+supervisor registers a replacement queue. During teardown, the adapter attempts
+to delete the allocated queue and ignores one the server already considers
+expired. Channel messages require the bot's `mentioned` flag and optional
+numeric channel allowlist. Direct messages remain eligible. A `zulip:v1`
+locator identifies the exact message and, for channel messages, its channel.
+Reads use a bounded topic or DM narrow. Replies preserve the original topic or
+DM recipient set, then add `white_check_mark`; an existing identical reaction
+counts as handled.
+
+If a reply succeeds but the item remains unhandled, the adapter returns
+`replied: true, handled: false`. Callers must report that warning and must not
+retry the reply automatically.
