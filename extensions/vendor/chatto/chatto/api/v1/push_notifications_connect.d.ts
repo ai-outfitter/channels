@@ -1,0 +1,51 @@
+import { SendTestPushNotificationRequest, SendTestPushNotificationResponse, SubscribePushRequest, SubscribePushResponse, UnsubscribePushRequest, UnsubscribePushResponse } from "./push_notifications_pb.js";
+import { MethodIdempotency, MethodKind } from "@bufbuild/protobuf";
+/**
+ * Browser Web Push subscription commands for the current user.
+ *
+ * @generated from service chatto.api.v1.PushNotificationService
+ */
+export declare const PushNotificationService: {
+    readonly typeName: "chatto.api.v1.PushNotificationService";
+    readonly methods: {
+        /**
+         * Stores or updates the caller's browser push subscription.
+         *
+         * The server must have Web Push configured. Clients normally call this after
+         * the browser grants notification permission and returns a PushSubscription.
+         *
+         * @generated from rpc chatto.api.v1.PushNotificationService.Subscribe
+         */
+        readonly subscribe: {
+            readonly name: "Subscribe";
+            readonly I: typeof SubscribePushRequest;
+            readonly O: typeof SubscribePushResponse;
+            readonly kind: MethodKind.Unary;
+        };
+        /**
+         * Removes the caller's browser push subscription by endpoint.
+         *
+         * The call is idempotent: removing an unknown endpoint still succeeds.
+         *
+         * @generated from rpc chatto.api.v1.PushNotificationService.Unsubscribe
+         */
+        readonly unsubscribe: {
+            readonly name: "Unsubscribe";
+            readonly I: typeof UnsubscribePushRequest;
+            readonly O: typeof UnsubscribePushResponse;
+            readonly kind: MethodKind.Unary;
+            readonly idempotency: MethodIdempotency.Idempotent;
+        };
+        /**
+         * Sends a test notification to the caller's registered browser subscriptions.
+         *
+         * @generated from rpc chatto.api.v1.PushNotificationService.SendTestNotification
+         */
+        readonly sendTestNotification: {
+            readonly name: "SendTestNotification";
+            readonly I: typeof SendTestPushNotificationRequest;
+            readonly O: typeof SendTestPushNotificationResponse;
+            readonly kind: MethodKind.Unary;
+        };
+    };
+};

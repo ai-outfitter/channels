@@ -128,6 +128,20 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return config ? m.createAgentStreamForwarder(config, undefined, journal) : undefined;
 		},
 	},
+	chatto: {
+		configured: () =>
+			Boolean(
+				process.env.CHATTO_BASE_URL || process.env.CHATTO_TOKEN || process.env.CHATTO_ROOM_IDS,
+			),
+		async load() {
+			const m = await import("./sources/chatto.ts");
+			return configure(m.chattoConfigFromEnv, m.createChattoSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/chatto.ts");
+			return configure(m.chattoConfigFromEnv, m.createChattoActions);
+		},
+	},
 };
 
 export default function channelEventsExtension(
