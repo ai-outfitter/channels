@@ -18,6 +18,8 @@ export function parseList(raw: string | undefined): string[] {
 
 /** How long a source waits before re-establishing a dropped push connection. */
 export const RECONNECT_DELAY_MS = 5000;
+/** Maximum time shutdown waits for a source attempt to honor its abort signal. */
+export const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /**
  * Run a push connection and keep it alive: call `attempt`, and whenever it
@@ -28,12 +30,14 @@ export const RECONNECT_DELAY_MS = 5000;
  * timeout) without stopping the supervisor.
  *
  * The stop handle is idempotent, cancels an in-flight backoff, and — via the
- * signal — the live attempt, so no timer or connection outlives it.
+ * signal — the live attempt. It waits for teardown up to `shutdownTimeoutMs`,
+ * then logs and returns so a broken source cannot block session shutdown.
  */
 export function supervise(
 	attempt: (signal: AbortSignal) => Promise<void>,
 	log: (msg: string) => void,
 	delayMs: number = RECONNECT_DELAY_MS,
+	shutdownTimeoutMs: number = SHUTDOWN_TIMEOUT_MS,
 ): () => Promise<void> {
 	const controller = new AbortController();
 	const { signal } = controller;
@@ -44,9 +48,24 @@ export function supervise(
 			if (signal.aborted || !(await backoff(delayMs, signal))) return;
 		}
 	};
-	void loop();
+	const running = loop();
 
-	return async () => controller.abort();
+	return async () => {
+		controller.abort();
+		const timer = new AbortController();
+		try {
+			await Promise.race([
+				running,
+				delay(shutdownTimeoutMs, undefined, {
+					signal: timer.signal,
+				}).then(() => {
+					log(`source shutdown timed out after ${shutdownTimeoutMs}ms`);
+				}),
+			]);
+		} finally {
+			timer.abort();
+		}
+	};
 }
 
 /** Run one attempt; return `false` only when the supervisor was stopped. */

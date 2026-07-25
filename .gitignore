@@ -1,3 +1,6 @@
 node_modules/
 *.tsbuildinfo
 .deepwork/
+.env.slack.local
+slack-debug-*.log
+/dev/nonprod-bot/
