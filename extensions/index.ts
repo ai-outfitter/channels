@@ -142,6 +142,22 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return configure(m.chattoConfigFromEnv, m.createChattoActions);
 		},
 	},
+	mattermost: {
+		configured: () =>
+			Boolean(
+				process.env.MATTERMOST_BASE_URL ||
+					process.env.MATTERMOST_BOT_TOKEN ||
+					process.env.MATTERMOST_CHANNEL_IDS,
+			),
+		async load() {
+			const m = await import("./sources/mattermost.ts");
+			return configure(m.mattermostConfigFromEnv, m.createMattermostSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/mattermost.ts");
+			return configure(m.mattermostConfigFromEnv, m.createMattermostActions);
+		},
+	},
 };
 
 export default function channelEventsExtension(
