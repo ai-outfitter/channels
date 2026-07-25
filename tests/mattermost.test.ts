@@ -90,6 +90,11 @@ test("Mattermost actions read bounded thread context and handled state", async (
 	assert.equal(result.messages.length, 10);
 	assert.equal(result.messages[0]?.id, "root-1");
 	assert.equal(result.messages.at(-1)?.target, true);
+	const unhandled = await createMattermostActions(
+		config,
+		fakeApi({ target, threadContext: context, reactions: null }),
+	).read(locator);
+	assert.equal(unhandled.handled, false);
 });
 
 test("Mattermost actions reject invalid or mismatched locators", async () => {
@@ -106,6 +111,20 @@ test("Mattermost actions reject invalid or mismatched locators", async () => {
 		).read(locator),
 		/does not match/,
 	);
+	await assert.rejects(
+		createMattermostActions(
+			config,
+			fakeApi({ target: { ...target, channel_id: "channel-2" } }),
+		).respond(locator, "answer"),
+		/does not match/,
+	);
+	await assert.rejects(
+		createMattermostActions(
+			{ ...config, channelIds: new Set(["channel-2"]) },
+			fakeApi({ target }),
+		).read(locator),
+		/outside MATTERMOST_CHANNEL_IDS/,
+	);
 });
 
 test("Mattermost replies preserve thread addressing and report partial success", async () => {
@@ -115,6 +134,7 @@ test("Mattermost replies preserve thread addressing and report partial success",
 	const success = await createMattermostActions(
 		config,
 		fakeApi({
+			target,
 			onCreate: (value) => {
 				input = value;
 			},
@@ -131,6 +151,7 @@ test("Mattermost replies preserve thread addressing and report partial success",
 	const partial = await createMattermostActions(
 		config,
 		fakeApi({
+			target,
 			onCreate: () => {
 				replies += 1;
 			},
@@ -232,7 +253,7 @@ function fakeApi(
 		target?: MattermostPost;
 		channelContext?: MattermostPost[];
 		threadContext?: MattermostPost[];
-		reactions?: Array<{ user_id: string; post_id: string; emoji_name: string }>;
+		reactions?: Array<{ user_id: string; post_id: string; emoji_name: string }> | null;
 		onCreate?: (input: { channel_id: string; message: string; root_id: string }) => void;
 		reactionError?: Error;
 	} = {},
@@ -251,7 +272,7 @@ function fakeApi(
 			return options.threadContext ?? [];
 		},
 		async getReactions() {
-			return options.reactions ?? [];
+			return options.reactions === undefined ? [] : options.reactions;
 		},
 		async createPost(input) {
 			options.onCreate?.(input);

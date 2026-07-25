@@ -95,6 +95,12 @@ test("Zulip actions reject invalid and mismatched locators", async () => {
 		),
 		/does not match/,
 	);
+	await assert.rejects(
+		createZulipActions({ ...config, channelIds: new Set([8]) }, fakeApi({ target })).read(
+			locatorFor(target),
+		),
+		/outside ZULIP_CHANNEL_IDS/,
+	);
 });
 
 test("Zulip replies preserve addressing and report reaction partial success", async () => {
@@ -186,8 +192,8 @@ function messageEvent(
 	message: ZulipMessage,
 	id: number,
 	flags: string[] = ["mentioned"],
-): { id: number; type: string; message: ZulipMessage } {
-	return { id, type: "message", message: { ...message, flags } };
+): { id: number; type: string; message: ZulipMessage; flags: string[] } {
+	return { id, type: "message", message, flags };
 }
 
 function streamMessage(
@@ -206,7 +212,6 @@ function streamMessage(
 		stream_id: streamId,
 		subject: "agent work",
 		display_recipient: "operations",
-		flags: ["mentioned"],
 	};
 }
 

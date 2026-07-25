@@ -20,6 +20,9 @@ const log = scopedLog("zulip");
 const MAX_CONTEXT = 10;
 const DONE_EMOJI = "white_check_mark";
 const QUEUE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/;
+const DEFAULT_LONG_POLL_TIMEOUT_SECONDS = 90;
+const MAX_LONG_POLL_TIMEOUT_SECONDS = 3_600;
+const LONG_POLL_GRACE_MS = 5_000;
 
 export interface ZulipConfig {
 	baseUrl: string;
@@ -55,7 +58,6 @@ export interface ZulipMessage {
 	stream_id?: number;
 	subject?: string;
 	display_recipient: string | ZulipRecipient[];
-	flags?: string[];
 	reactions?: ZulipReaction[];
 }
 
@@ -63,6 +65,7 @@ interface ZulipEvent {
 	id: number;
 	type: string;
 	message?: ZulipMessage;
+	flags?: string[];
 }
 
 interface ZulipQueue {
@@ -117,6 +120,7 @@ export function createZulipActions(
 	return {
 		async read(locator): Promise<ChannelReadResult> {
 			const decoded = decodeZulipLocator(locator);
+			assertAllowedChannel(decoded, cfg.channelIds);
 			const [message, ownId] = await Promise.all([api.getMessage(decoded.messageId), getBotId()]);
 			assertMatchingMessage(message, decoded);
 			const context = boundedMessages(await api.getContext(message, ownId), message);
@@ -134,6 +138,7 @@ export function createZulipActions(
 
 		async respond(locator, response): Promise<ChannelRespondResult> {
 			const decoded = decodeZulipLocator(locator);
+			assertAllowedChannel(decoded, cfg.channelIds);
 			const [message, ownId] = await Promise.all([api.getMessage(decoded.messageId), getBotId()]);
 			assertMatchingMessage(message, decoded);
 			const responseId = await api.sendReply(message, ownId, response);
@@ -202,7 +207,8 @@ export function zulipMentionEvent(
 		channel &&
 		(!isPositiveInteger(message.stream_id) ||
 			(channelIds.size > 0 && !channelIds.has(message.stream_id)) ||
-			!message.flags?.includes("mentioned"))
+			!Array.isArray(raw.flags) ||
+			!raw.flags.includes("mentioned"))
 	) {
 		return undefined;
 	}
@@ -228,7 +234,14 @@ async function runZulipQueue(
 	let queue: ZulipQueue | undefined;
 	try {
 		queue = await api.registerQueue();
-		if (!QUEUE_ID.test(queue.queue_id) || !Number.isSafeInteger(queue.last_event_id)) {
+		if (
+			!QUEUE_ID.test(queue.queue_id) ||
+			!Number.isSafeInteger(queue.last_event_id) ||
+			(queue.event_queue_longpoll_timeout_seconds !== undefined &&
+				(!Number.isFinite(queue.event_queue_longpoll_timeout_seconds) ||
+					queue.event_queue_longpoll_timeout_seconds <= 0 ||
+					queue.event_queue_longpoll_timeout_seconds > MAX_LONG_POLL_TIMEOUT_SECONDS))
+		) {
 			throw new Error("Zulip returned invalid event queue metadata");
 		}
 		await consumeZulipEvents(cfg, api, queue, signal, botId, onEvent);
@@ -247,18 +260,74 @@ async function consumeZulipEvents(
 ): Promise<void> {
 	let lastEventId = queue.last_event_id;
 	while (!signal.aborted) {
-		let events: ZulipEvent[];
-		try {
-			events = await api.getEvents(queue.queue_id, lastEventId, signal);
-		} catch (error) {
-			if (signal.aborted || zulipErrorCode(error) === "BAD_EVENT_QUEUE_ID") return;
-			throw error;
-		}
+		const events = await pollZulipEvents(api, queue, lastEventId, signal);
+		if (!events) return;
 		for (const event of events) {
 			if (Number.isSafeInteger(event.id) && event.id > lastEventId) lastEventId = event.id;
 			emitZulipMention(event, botId, cfg.channelIds, onEvent);
 		}
 	}
+}
+
+async function pollZulipEvents(
+	api: ZulipApi,
+	queue: ZulipQueue,
+	lastEventId: number,
+	signal: AbortSignal,
+): Promise<ZulipEvent[] | undefined> {
+	const poll = zulipLongPoll(signal, queue);
+	try {
+		return await getZulipEvents(api, queue.queue_id, lastEventId, signal, poll);
+	} finally {
+		poll.dispose();
+	}
+}
+
+async function getZulipEvents(
+	api: ZulipApi,
+	queueId: string,
+	lastEventId: number,
+	signal: AbortSignal,
+	poll: ZulipLongPoll,
+): Promise<ZulipEvent[] | undefined> {
+	try {
+		return await api.getEvents(queueId, lastEventId, poll.signal);
+	} catch (error) {
+		if (signal.aborted || zulipErrorCode(error) === "BAD_EVENT_QUEUE_ID") return undefined;
+		if (poll.timedOut()) throw new Error("Zulip event long poll timed out");
+		throw error;
+	}
+}
+
+interface ZulipLongPoll {
+	signal: AbortSignal;
+	timedOut(): boolean;
+	dispose(): void;
+}
+
+function zulipLongPoll(signal: AbortSignal, queue: ZulipQueue): ZulipLongPoll {
+	const seconds = queue.event_queue_longpoll_timeout_seconds ?? DEFAULT_LONG_POLL_TIMEOUT_SECONDS;
+	const controller = new AbortController();
+	let didTimeOut = false;
+	const abort = (): void => controller.abort(signal.reason);
+	if (signal.aborted) abort();
+	else signal.addEventListener("abort", abort, { once: true });
+	const timer = setTimeout(
+		() => {
+			didTimeOut = true;
+			controller.abort(new Error("Zulip event long poll timed out"));
+		},
+		Math.ceil(seconds * 1000) + LONG_POLL_GRACE_MS,
+	);
+	timer.unref();
+	return {
+		signal: controller.signal,
+		timedOut: () => didTimeOut,
+		dispose: () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", abort);
+		},
+	};
 }
 
 function emitZulipMention(
@@ -307,7 +376,7 @@ function createZulipApi(cfg: ZulipConfig, fetchImpl: typeof fetch = fetch): Zuli
 	const messageQuery = (message: ZulipMessage, botId: number): URLSearchParams => {
 		const narrow = isChannelMessage(message)
 			? [
-					{ operator: "channel", operand: message.stream_id },
+					{ operator: "stream", operand: message.stream_id },
 					{ operator: "topic", operand: message.subject ?? "" },
 				]
 			: [
@@ -356,12 +425,14 @@ function createZulipApi(cfg: ZulipConfig, fetchImpl: typeof fetch = fetch): Zuli
 			const response = await request<{ message: ZulipMessage }>(`/messages/${messageId}`, {
 				query: params({ apply_markdown: false }),
 			});
+			if (!response.message) throw new Error("Zulip returned no message");
 			return response.message;
 		},
 		async getContext(message, botId) {
 			const response = await request<{ messages: ZulipMessage[] }>("/messages", {
 				query: messageQuery(message, botId),
 			});
+			if (!Array.isArray(response.messages)) throw new Error("Zulip returned no message context");
 			return response.messages;
 		},
 		async sendReply(message, botId, content) {
@@ -441,6 +512,12 @@ function assertMatchingMessage(message: ZulipMessage, locator: ZulipLocator): vo
 	const channelId = isChannelMessage(message) ? message.stream_id : undefined;
 	if (message.id !== locator.messageId || channelId !== locator.channelId) {
 		throw new Error("Zulip message does not match the channel locator");
+	}
+}
+
+function assertAllowedChannel(locator: ZulipLocator, channelIds: ReadonlySet<number>): void {
+	if (locator.channelId && channelIds.size > 0 && !channelIds.has(locator.channelId)) {
+		throw new Error("Zulip channel locator is outside ZULIP_CHANNEL_IDS");
 	}
 }
 

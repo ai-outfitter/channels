@@ -24,6 +24,7 @@ import {
 	RealtimeClientHello,
 	type RealtimeError,
 	type RealtimeProjectionEvent,
+	type RealtimeProjectionNotificationsReplace,
 	RealtimeServerFrame,
 	type RealtimeServerHello,
 	RealtimeSubscribeEvents,
@@ -121,8 +122,17 @@ export function createChattoActions(
 	return {
 		async read(locator): Promise<ChannelReadResult> {
 			const decoded = decodeChattoLocator(locator);
+			assertAllowedRoom(decoded, cfg.roomIds);
 			const notification = await api.getNotification(decoded.notificationId);
-			if (notification) assertMatchingMention(notification, decoded);
+			if (!notification) {
+				return {
+					channel: "chatto",
+					locator,
+					handled: true,
+					messages: [],
+				};
+			}
+			assertMatchingMention(notification, decoded);
 			const page = decoded.threadRootEventId
 				? await api.getThreadContext({
 						...decoded,
@@ -136,13 +146,17 @@ export function createChattoActions(
 			return {
 				channel: "chatto",
 				locator,
-				handled: notification === undefined,
+				handled: false,
 				messages,
 			};
 		},
 
 		async respond(locator, response): Promise<ChannelRespondResult> {
 			const decoded = decodeChattoLocator(locator);
+			assertAllowedRoom(decoded, cfg.roomIds);
+			const notification = await api.getNotification(decoded.notificationId);
+			if (!notification) throw new Error("Chatto notification is already handled");
+			assertMatchingMention(notification, decoded);
 			const responseId = await api.createReply(decoded, response);
 			const replied = {
 				channel: "chatto",
@@ -171,6 +185,7 @@ export function createChattoSource(
 	api: ChattoApi = createConnectChattoApi(cfg),
 ): ChannelSource {
 	let resumeCursor: string | undefined;
+	const emittedNotificationIds = new Set<string>();
 	return {
 		async start(onEvent) {
 			return supervise(
@@ -185,6 +200,7 @@ export function createChattoSource(
 						(cursor) => {
 							resumeCursor = cursor;
 						},
+						emittedNotificationIds,
 						onEvent,
 					);
 				},
@@ -214,7 +230,7 @@ export function mentionNotificationEvent(
 		!STRUCTURAL_ID.test(roomId) ||
 		!STRUCTURAL_ID.test(mention.eventId) ||
 		(roomIds.size > 0 && !roomIds.has(roomId)) ||
-		(mention.threadRootEventId !== undefined && !STRUCTURAL_ID.test(mention.threadRootEventId))
+		(mention.threadRootEventId && !STRUCTURAL_ID.test(mention.threadRootEventId))
 	) {
 		return undefined;
 	}
@@ -239,6 +255,7 @@ async function runChattoAttempt(
 	viewerId: string,
 	resumeCursor: string | undefined,
 	onCursor: (cursor: string) => void,
+	emittedNotificationIds: Set<string>,
 	onEvent: (event: ChannelEvent) => void,
 ): Promise<void> {
 	const socket = socketFactory(realtimeUrl(cfg.baseUrl));
@@ -293,6 +310,7 @@ async function runChattoAttempt(
 				viewerId,
 				resumeCursor,
 				onCursor,
+				emittedNotificationIds,
 				onEvent,
 				resetHeartbeat,
 			}).catch((error) => {
@@ -324,7 +342,8 @@ interface ChattoFrameContext {
 	viewerId: string;
 	resumeCursor: string | undefined;
 	onCursor(cursor: string): void;
-	onEvent(event: ChannelEvent): void;
+	emittedNotificationIds: Set<string>;
+	onEvent(event: ChannelEvent): unknown;
 	resetHeartbeat(): void;
 }
 
@@ -383,12 +402,24 @@ function handleChattoProjection(
 	if (!context.state.subscribed) throw new Error("Chatto projected events before subscription");
 	for (const operation of projection.operations) {
 		if (operation.operation.case !== "notificationsReplace") continue;
-		for (const notification of operation.operation.value.page?.notifications ?? []) {
-			const mention = mentionNotificationEvent(notification, context.viewerId, context.cfg.roomIds);
-			if (mention) context.onEvent(mention);
-		}
+		handleNotificationReplacement(operation.operation.value, context);
 	}
 	if (projection.resumeCursor) context.onCursor(projection.resumeCursor);
+}
+
+function handleNotificationReplacement(
+	replacement: RealtimeProjectionNotificationsReplace,
+	context: ChattoFrameContext,
+): void {
+	const notifications = replacement.page?.notifications ?? [];
+	const currentIds = new Set(notifications.map((notification) => notification.id));
+	for (const notification of notifications) {
+		if (context.emittedNotificationIds.has(notification.id)) continue;
+		const mention = mentionNotificationEvent(notification, context.viewerId, context.cfg.roomIds);
+		if (mention && context.onEvent(mention) === false) currentIds.delete(notification.id);
+	}
+	context.emittedNotificationIds.clear();
+	for (const id of currentIds) context.emittedNotificationIds.add(id);
 }
 
 function handleChattoError(error: RealtimeError): void {
@@ -536,9 +567,15 @@ function assertMatchingMention(notification: NotificationItem, locator: ChattoLo
 		notification.id !== locator.notificationId ||
 		mention.room?.id !== locator.roomId ||
 		mention.eventId !== locator.messageEventId ||
-		(mention.threadRootEventId ?? undefined) !== locator.threadRootEventId
+		(mention.threadRootEventId || undefined) !== locator.threadRootEventId
 	) {
 		throw new Error("Chatto notification does not match the channel locator");
+	}
+}
+
+function assertAllowedRoom(locator: ChattoLocator, roomIds: ReadonlySet<string>): void {
+	if (roomIds.size > 0 && !roomIds.has(locator.roomId)) {
+		throw new Error("Chatto channel locator is outside CHATTO_ROOM_IDS");
 	}
 }
 

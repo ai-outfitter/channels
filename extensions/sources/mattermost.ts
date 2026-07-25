@@ -60,7 +60,7 @@ export interface MattermostApi {
 	getPost(postId: string): Promise<MattermostPost>;
 	getChannelContext(channelId: string, postId: string): Promise<MattermostPost[]>;
 	getThreadContext(rootId: string, postId: string): Promise<MattermostPost[]>;
-	getReactions(postId: string): Promise<MattermostReaction[]>;
+	getReactions(postId: string): Promise<MattermostReaction[] | null>;
 	createPost(input: {
 		channel_id: string;
 		message: string;
@@ -120,6 +120,7 @@ export function createMattermostActions(
 	return {
 		async read(locator): Promise<ChannelReadResult> {
 			const decoded = decodeMattermostLocator(locator);
+			assertAllowedChannel(decoded, cfg.channelIds);
 			const [target, reactions, rawContext, ownId] = await Promise.all([
 				api.getPost(decoded.postId),
 				api.getReactions(decoded.postId),
@@ -133,7 +134,7 @@ export function createMattermostActions(
 			return {
 				channel: "mattermost",
 				locator,
-				handled: reactions.some(
+				handled: (reactions ?? []).some(
 					(reaction) =>
 						reaction.user_id === ownId &&
 						reaction.post_id === decoded.postId &&
@@ -145,7 +146,9 @@ export function createMattermostActions(
 
 		async respond(locator, response): Promise<ChannelRespondResult> {
 			const decoded = decodeMattermostLocator(locator);
-			const ownId = await getBotId();
+			assertAllowedChannel(decoded, cfg.channelIds);
+			const [ownId, target] = await Promise.all([getBotId(), api.getPost(decoded.postId)]);
+			assertMatchingPost(target, decoded);
 			const posted = await api.createPost({
 				channel_id: decoded.channelId,
 				message: response,
@@ -413,6 +416,12 @@ function assertMatchingPost(post: MattermostPost, locator: MattermostLocator): v
 		(post.root_id || undefined) !== locator.rootId
 	) {
 		throw new Error("Mattermost post does not match the channel locator");
+	}
+}
+
+function assertAllowedChannel(locator: MattermostLocator, channelIds: ReadonlySet<string>): void {
+	if (channelIds.size > 0 && !channelIds.has(locator.channelId)) {
+		throw new Error("Mattermost channel locator is outside MATTERMOST_CHANNEL_IDS");
 	}
 }
 

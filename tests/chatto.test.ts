@@ -27,6 +27,8 @@ import {
 	RealtimeCaughtUp,
 	RealtimeClientFrame,
 	RealtimeProjectionEvent,
+	RealtimeProjectionNotificationAction,
+	RealtimeProjectionNotificationChange,
 	RealtimeProjectionNotificationsReplace,
 	RealtimeProjectionOperation,
 	RealtimeServerFrame,
@@ -73,6 +75,10 @@ test("Chatto notifications emit body-free locators and enforce the room boundary
 	assert.doesNotMatch(event.locator.key, /untrusted|message-1|room-1|notification-1/);
 	assert.equal(mentionNotificationEvent(notification, "bot-1", new Set(["room-2"])), undefined);
 	assert.equal(mentionNotificationEvent(notification, "user-1", new Set()), undefined);
+	const emptyThread = mention("notification-2", "room-1", "message-2", "user-1");
+	if (emptyThread.kind.case !== "mention") throw new Error("expected mention");
+	emptyThread.kind.value.threadRootEventId = "";
+	assert.ok(mentionNotificationEvent(emptyThread, "bot-1", new Set())?.locator);
 });
 
 test("Chatto actions validate the notification and return bounded thread context", async () => {
@@ -104,6 +110,17 @@ test("Chatto actions validate the notification and return bounded thread context
 	assert.equal(result.messages.at(-1)?.target, true);
 	assert.equal(result.messages.at(-1)?.author, "Ada");
 	assert.deepEqual(calls, ["thread"]);
+
+	const emptyThread = mention("notification-2", "room-1", "reply-11", "user-1");
+	if (emptyThread.kind.case !== "mention") throw new Error("expected mention");
+	emptyThread.kind.value.threadRootEventId = "";
+	const emptyLocator = mentionNotificationEvent(emptyThread, "bot-1", new Set())?.locator?.key;
+	assert.ok(emptyLocator);
+	const emptyResult = await createChattoActions(
+		config,
+		fakeApi({ notification: emptyThread, roomPage: page }),
+	).read(emptyLocator);
+	assert.equal(emptyResult.handled, false);
 });
 
 test("Chatto reads dismissed notifications as handled and rejects mismatched locators", async () => {
@@ -116,6 +133,7 @@ test("Chatto reads dismissed notifications as handled and rejects mismatched loc
 		fakeApi({ notification: undefined, roomPage: page }),
 	).read(locator);
 	assert.equal(handled.handled, true);
+	assert.deepEqual(handled.messages, []);
 
 	const mismatched = mention("notification-1", "room-2", "message-1", "user-1");
 	await assert.rejects(
@@ -128,6 +146,13 @@ test("Chatto reads dismissed notifications as handled and rejects mismatched loc
 		createChattoActions(config, fakeApi()).read("chatto:v1:not-json"),
 		/invalid chatto/i,
 	);
+	await assert.rejects(
+		createChattoActions(
+			{ ...config, roomIds: new Set(["room-2"]) },
+			fakeApi({ notification, roomPage: page }),
+		).read(locator),
+		/outside CHATTO_ROOM_IDS/,
+	);
 });
 
 test("Chatto replies into the correct thread and preserves partial success", async () => {
@@ -138,6 +163,7 @@ test("Chatto replies into the correct thread and preserves partial success", asy
 	const success = await createChattoActions(
 		config,
 		fakeApi({
+			notification: top,
 			onReply: (locator) => {
 				repliedThread = locator.threadRootEventId ?? locator.messageEventId;
 			},
@@ -159,6 +185,7 @@ test("Chatto replies into the correct thread and preserves partial success", asy
 	const partial = await createChattoActions(
 		config,
 		fakeApi({
+			notification: threaded,
 			onReply: (locator) => {
 				replies += 1;
 				assert.equal(locator.threadRootEventId, "root-1");
@@ -170,11 +197,20 @@ test("Chatto replies into the correct thread and preserves partial success", asy
 	assert.equal(partial.replied, true);
 	assert.equal(partial.handled, false);
 	assert.match(partial.warning ?? "", /network down/);
+	await assert.rejects(
+		createChattoActions(config, fakeApi({ notification: undefined })).respond(
+			topLocator,
+			"duplicate",
+		),
+		/already handled/,
+	);
 });
 
 test("Chatto source negotiates protocol v2, resumes, filters, and shuts down", async (t) => {
 	const sockets: FakeSocket[] = [];
 	const events: string[] = [];
+	let deliveryAttempts = 0;
+	let rejectNextDelivery = true;
 	const source = createChattoSource(
 		config,
 		() => {
@@ -186,7 +222,13 @@ test("Chatto source negotiates protocol v2, resumes, filters, and shuts down", a
 		fakeApi({ viewer: "bot-1" }),
 	);
 	const stop = await source.start((event) => {
+		deliveryAttempts += 1;
+		if (rejectNextDelivery) {
+			rejectNextDelivery = false;
+			return false;
+		}
 		if (event.locator) events.push(event.locator.key);
+		return true;
 	});
 	t.after(stop);
 	await waitFor(() => sockets.length === 1);
@@ -210,11 +252,30 @@ test("Chatto source negotiates protocol v2, resumes, filters, and shuts down", a
 	});
 	first.emit("message", {
 		data: notificationProjection(
+			"bootstrap-cursor",
+			mention("notification-1", "room-1", "message-1", "user-1"),
+			false,
+		),
+	});
+	await waitFor(() => deliveryAttempts === 1);
+	assert.equal(events.length, 0);
+	first.emit("message", {
+		data: notificationProjection(
 			"cursor-1",
 			mention("notification-1", "room-1", "message-1", "user-1"),
 		),
 	});
 	await waitFor(() => events.length === 1);
+	assert.equal(deliveryAttempts, 2);
+	first.emit("message", {
+		data: notificationProjection(
+			"cursor-1b",
+			mention("notification-1", "room-1", "message-1", "user-1"),
+		),
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(events.length, 1);
+	assert.equal(deliveryAttempts, 2);
 	first.emit("message", {
 		data: new RealtimeServerFrame({
 			frame: { case: "caughtUp", value: new RealtimeCaughtUp({ cursor: "cursor-2" }) },
@@ -231,6 +292,20 @@ test("Chatto source negotiates protocol v2, resumes, filters, and shuts down", a
 	const resumed = RealtimeClientFrame.fromBinary(second.sent[1] ?? new Uint8Array());
 	if (resumed.frame.case !== "subscribeEvents") throw new Error("expected subscription");
 	assert.equal(resumed.frame.value.resumeCursor, "cursor-2");
+	second.emit("message", {
+		data: new RealtimeServerFrame({
+			frame: { case: "subscribed", value: new RealtimeSubscribed() },
+		}).toBinary(),
+	});
+	second.emit("message", {
+		data: notificationProjection(
+			"cursor-3",
+			mention("notification-1", "room-1", "message-1", "user-1"),
+			false,
+		),
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(events.length, 1);
 	await stop();
 	assert.equal(second.closed, true);
 });
@@ -353,7 +428,11 @@ function serverHello(): Uint8Array {
 	}).toBinary();
 }
 
-function notificationProjection(cursor: string, notification: NotificationItem): Uint8Array {
+function notificationProjection(
+	cursor: string,
+	notification: NotificationItem,
+	live = true,
+): Uint8Array {
 	return new RealtimeServerFrame({
 		frame: {
 			case: "projectionEvent",
@@ -365,6 +444,14 @@ function notificationProjection(cursor: string, notification: NotificationItem):
 							case: "notificationsReplace",
 							value: new RealtimeProjectionNotificationsReplace({
 								page: new ListNotificationsResponse({ notifications: [notification] }),
+								...(live
+									? {
+											change: new RealtimeProjectionNotificationChange({
+												action: RealtimeProjectionNotificationAction.CREATED,
+												notificationId: notification.id,
+											}),
+										}
+									: {}),
 							}),
 						},
 					}),

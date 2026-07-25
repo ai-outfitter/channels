@@ -285,18 +285,19 @@ export default function channelEventsExtension(
 		log(`waking agent for: ${[...new Set(events.map((event) => event.channel))].join(", ")}`);
 	};
 
-	const onEvent = (event: ChannelEvent): void => {
-		if (stopped) return; // ignore late callbacks from a source torn down mid-flight
+	const onEvent = (event: ChannelEvent): boolean => {
+		if (stopped) return false; // ignore late callbacks from a source torn down mid-flight
 		const key = channelEventKey(event);
 		if (!pending.has(key) && pending.size >= MAX_PENDING_EVENTS) {
 			if (!overflowLogged) {
 				overflowLogged = true;
 				log(`notification queue is full (${MAX_PENDING_EVENTS}); dropping new events`);
 			}
-			return;
+			return false;
 		}
 		pending.set(key, event);
 		maybeWake();
+		return true;
 	};
 
 	// Resolve and start one channel; returns its stop handle, or undefined when
