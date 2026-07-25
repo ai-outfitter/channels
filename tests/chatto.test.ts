@@ -388,7 +388,7 @@ function restoreSnapshot(snapshot: ReadonlyMap<string, string | undefined>): voi
 async function waitFor(predicate: () => boolean): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
 		if (predicate()) return;
-		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
 	throw new Error("condition was not met");
 }
