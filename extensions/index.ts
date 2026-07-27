@@ -314,7 +314,8 @@ export default function channelEventsExtension(
 				forwarder(event as MessageUpdateEvent);
 				return;
 			}
-			loading ??= agentRegistration
+			if (loading) return;
+			loading = agentRegistration
 				.loadStreamForwarder?.(agentJournal)
 				.then((loaded) => {
 					forwarder = loaded ?? null;

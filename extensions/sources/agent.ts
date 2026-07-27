@@ -142,13 +142,74 @@ export function createAgentSource(
 }
 
 export const STREAM_FLUSH_MS = 250;
+export const RESPOND_TOOL_NAME = "channel_respond";
 
 /**
- * Forward Pi assistant text events as ephemeral relay previews while a reply
- * is being produced. Consecutive `text_delta` events are coalesced and
- * flushed at most every `flushMs` so relay frame budgets hold. Previews are
- * only sent while exactly one delivered-but-unreplied agent message exists —
- * with several open targets the attribution would be a guess, so we skip.
+ * Incrementally read a JSON string value out of a partial JSON document.
+ * Returns the decoded value so far (possibly still growing), or undefined
+ * when the key or its opening quote has not appeared yet. Trailing
+ * incomplete escapes are held back until more input arrives.
+ */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: a single incremental scanner keeps escape handling in one place
+export function extractJsonStringValue(source: string, key: string): string | undefined {
+	const keyToken = `"${key}"`;
+	let index = source.indexOf(keyToken);
+	if (index < 0) return undefined;
+	index += keyToken.length;
+	while (index < source.length && " \t\r\n".includes(source[index] ?? "")) index += 1;
+	if (source[index] !== ":") return undefined;
+	index += 1;
+	while (index < source.length && " \t\r\n".includes(source[index] ?? "")) index += 1;
+	if (source[index] !== '"') return undefined;
+	index += 1;
+	const escapes: Record<string, string> = {
+		'"': '"',
+		"\\": "\\",
+		"/": "/",
+		b: "\b",
+		f: "\f",
+		n: "\n",
+		r: "\r",
+		t: "\t",
+	};
+	let value = "";
+	while (index < source.length) {
+		const char = source[index];
+		if (char === '"') return value;
+		if (char === "\\") {
+			const escaped = source[index + 1];
+			if (escaped === undefined) return value;
+			if (escaped === "u") {
+				const hex = source.slice(index + 2, index + 6);
+				if (hex.length < 4 || Number.isNaN(Number.parseInt(hex, 16))) return value;
+				value += String.fromCharCode(Number.parseInt(hex, 16));
+				index += 6;
+				continue;
+			}
+			value += escapes[escaped] ?? escaped;
+			index += 2;
+			continue;
+		}
+		value += char;
+		index += 1;
+	}
+	return value;
+}
+
+/**
+ * Forward the in-progress reply as ephemeral relay previews while it is
+ * being produced. Two sources feed the preview, both reusing Pi's text
+ * event vocabulary on the wire:
+ *
+ * - assistant text events pass through as-is;
+ * - `channel_respond` tool-call argument deltas are decoded incrementally
+ *   and re-emitted as synthesized text events, because the durable reply
+ *   body is that tool call's `response` parameter, not assistant prose.
+ *
+ * Deltas are coalesced and flushed at most every `flushMs` so relay frame
+ * budgets hold. Previews are only sent while exactly one
+ * delivered-but-unreplied agent message exists — with several open targets
+ * the attribution would be a guess, so we skip.
  */
 export function createAgentStreamForwarder(
 	config: AgentChannelConfig,
@@ -162,6 +223,8 @@ export function createAgentStreamForwarder(
 	let bufferedDelta = "";
 	let bufferedIndex = 0;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+	const toolArgs = new Map<number, string>();
+	const toolEmitted = new Map<number, number>();
 
 	const soleOpenTarget = (): string | undefined => {
 		const open = journal.openTargets(config.endpointId);
@@ -186,6 +249,23 @@ export function createAgentStreamForwarder(
 		emit({ type: "text_delta", contentIndex: bufferedIndex, delta });
 	};
 
+	const bufferDelta = (contentIndex: number, delta: string): void => {
+		if (bufferedDelta !== "" && bufferedIndex !== contentIndex) flushDeltas();
+		bufferedIndex = contentIndex;
+		bufferedDelta += delta;
+		flushTimer ??= setTimeout(flushDeltas, flushMs);
+		flushTimer.unref?.();
+	};
+
+	const respondToolAt = (
+		partial: { content: ReadonlyArray<{ type?: string; name?: string }> },
+		contentIndex: number,
+	): boolean => {
+		const block = partial.content[contentIndex];
+		return block?.type === "toolCall" && block.name === RESPOND_TOOL_NAME;
+	};
+
+	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: one event dispatcher keeps the preview pipeline's state together
 	return (event) => {
 		const assistant = event.assistantMessageEvent;
 		switch (assistant.type) {
@@ -194,11 +274,8 @@ export function createAgentStreamForwarder(
 				emit({ type: "text_start", contentIndex: assistant.contentIndex });
 				break;
 			case "text_delta":
-				if (bufferedDelta !== "" && bufferedIndex !== assistant.contentIndex) flushDeltas();
-				bufferedIndex = assistant.contentIndex;
-				bufferedDelta += assistant.delta;
-				flushTimer ??= setTimeout(flushDeltas, flushMs);
-				flushTimer.unref?.();
+				if (!soleOpenTarget()) break;
+				bufferDelta(assistant.contentIndex, assistant.delta);
 				break;
 			case "text_end":
 				bufferedDelta = "";
@@ -212,6 +289,42 @@ export function createAgentStreamForwarder(
 					content: assistant.content,
 				});
 				break;
+			case "toolcall_start":
+				toolArgs.set(assistant.contentIndex, "");
+				toolEmitted.set(assistant.contentIndex, 0);
+				break;
+			case "toolcall_delta": {
+				const args = (toolArgs.get(assistant.contentIndex) ?? "") + assistant.delta;
+				toolArgs.set(assistant.contentIndex, args);
+				if (!respondToolAt(assistant.partial, assistant.contentIndex)) break;
+				if (!soleOpenTarget()) break;
+				const response = extractJsonStringValue(args, "response");
+				if (response === undefined) break;
+				const emitted = toolEmitted.get(assistant.contentIndex) ?? 0;
+				if (emitted === 0) emit({ type: "text_start", contentIndex: assistant.contentIndex });
+				if (response.length > emitted) {
+					bufferDelta(assistant.contentIndex, response.slice(emitted));
+					toolEmitted.set(assistant.contentIndex, response.length);
+				}
+				break;
+			}
+			case "toolcall_end": {
+				toolArgs.delete(assistant.contentIndex);
+				const emitted = toolEmitted.get(assistant.contentIndex) ?? 0;
+				toolEmitted.delete(assistant.contentIndex);
+				const call = assistant.toolCall;
+				if (call.name !== RESPOND_TOOL_NAME || emitted === 0) break;
+				bufferedDelta = "";
+				if (flushTimer) {
+					clearTimeout(flushTimer);
+					flushTimer = undefined;
+				}
+				const response = (call.arguments as { response?: unknown }).response;
+				if (typeof response === "string") {
+					emit({ type: "text_end", contentIndex: assistant.contentIndex, content: response });
+				}
+				break;
+			}
 			default:
 				break;
 		}
