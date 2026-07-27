@@ -139,6 +139,19 @@ Heartbeats expire stale registrations. A replacement connection for the same
 endpoint is duplicate-safe and closes the old connection. HTTPS `/healthz`
 reports liveness; `/readyz` reports whether durable delivery storage is writable.
 
+### Singleton conversations
+
+An assistant-style endpoint can be configured to hold **one running
+conversation across all channels and peers**
+(`AGENT_RELAY_SINGLETON_ENDPOINTS`, a comma/space list of endpoint ids). The
+relay folds every accepted message and streaming preview to or from a listed
+endpoint into that endpoint's own conversation — the endpoint id doubles as
+the conversation id — regardless of the conversation id the sender supplied.
+Replies and history follow automatically because the agent journals the
+canonical id. Consequence, by design: every peer authorized to converse with
+the endpoint sees the endpoint's whole thread; the privacy boundary is the
+relay credential route, not the conversation.
+
 ### Ephemeral streaming previews
 
 While producing a durable reply, a sender may push chat-plane streaming

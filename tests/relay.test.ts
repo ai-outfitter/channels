@@ -518,3 +518,69 @@ test("relay forwards ephemeral stream previews without persisting them", async (
 		await rm(root, { recursive: true, force: true });
 	}
 });
+
+test("singleton endpoints fold every peer and channel into one conversation", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-singleton-test-"));
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath: join(root, "relay.json"),
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		singletonEndpoints: ["bob-agent"],
+		logger: () => {},
+	});
+	try {
+		const alice = await TestClient.open(relay.url);
+		const bob = await TestClient.open(relay.url);
+		await alice.authenticate("alice-secret", "alice-web", "operator:alice");
+		await bob.authenticate("bob-secret", "bob-agent", "agent:bob");
+
+		// Sender-supplied conversation ids are overridden on the way in.
+		alice.send({
+			type: "send",
+			requestId: "send-1",
+			input: { recipient: "bob-agent", conversationId: "made-up-1", body: "first" },
+		});
+		const first = await alice.next((frame) => frame.type === "accepted");
+		assert.equal((first.message as { conversationId: string }).conversationId, "bob-agent");
+
+		alice.send({
+			type: "send",
+			requestId: "send-2",
+			input: { recipient: "bob-agent", conversationId: "made-up-2", body: "second" },
+		});
+		const second = await alice.next((frame) => frame.type === "accepted");
+		assert.equal((second.message as { conversationId: string }).conversationId, "bob-agent");
+
+		// The agent's outbound reply lands in its own thread too.
+		const delivered1 = await bob.next((frame) => frame.type === "deliver");
+		bob.send({ type: "ack", cursor: delivered1.cursor });
+		bob.send({
+			type: "send",
+			requestId: "reply-1",
+			input: { recipient: "alice-web", conversationId: "agent-chose-this", body: "reply" },
+		});
+		const reply = await bob.next((frame) => frame.type === "accepted");
+		assert.equal((reply.message as { conversationId: string }).conversationId, "bob-agent");
+
+		// Streaming previews are folded the same way.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "another-made-up",
+				event: { type: "text_start", contentIndex: 0 },
+			},
+		});
+		const preview = await alice.next((frame) => frame.type === "stream");
+		assert.equal(preview.conversationId, "bob-agent");
+
+		alice.close();
+		bob.close();
+	} finally {
+		await relay.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});

@@ -46,6 +46,15 @@ export interface RelayServerConfig {
 	readonly maxConnections?: number;
 	readonly maxFramesPerWindow?: number;
 	readonly maxStreamFramesPerWindow?: number;
+	/**
+	 * Endpoints that hold one running conversation across all channels and
+	 * peers. Every message to or from a listed endpoint is folded into that
+	 * endpoint's own conversation (its id doubles as the conversation id),
+	 * regardless of the conversation id the sender supplied. Consequence:
+	 * every peer authorized to converse with the endpoint sees its whole
+	 * thread — the boundary is the credential route, not the conversation.
+	 */
+	readonly singletonEndpoints?: readonly string[];
 	readonly rateWindowMs?: number;
 	readonly logger?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -420,6 +429,24 @@ function handleList(
 	socket.send({ type: "endpoints", requestId, endpoints } satisfies RelayServerFrame);
 }
 
+/**
+ * The singleton conversation for a message between `sender` and `recipient`,
+ * or undefined when neither side is configured as a singleton endpoint. The
+ * recipient wins when both are listed so a message lands in the thread of
+ * the endpoint being addressed.
+ */
+function singletonConversationFor(
+	config: RelayServerConfig,
+	sender: string,
+	recipient: string,
+): string | undefined {
+	const endpoints = config.singletonEndpoints;
+	if (!endpoints || endpoints.length === 0) return undefined;
+	if (endpoints.includes(recipient)) return recipient;
+	if (endpoints.includes(sender)) return sender;
+	return undefined;
+}
+
 async function handleSend(
 	frame: Record<string, unknown>,
 	socket: ServerWebSocket,
@@ -430,13 +457,15 @@ async function handleSend(
 	if (!frame.input || typeof frame.input !== "object" || Array.isArray(frame.input)) {
 		throw new Error("invalid send input");
 	}
-	const input = frame.input as unknown as AgentSendInput;
+	let input = frame.input as unknown as AgentSendInput;
 	if (
 		!connection.credential.send.includes("*") &&
 		!connection.credential.send.includes(input.recipient)
 	) {
 		throw new RelayProtocolError("route_forbidden", "route is not authorized");
 	}
+	const singleton = singletonConversationFor(context.config, connection.endpoint, input.recipient);
+	if (singleton) input = { ...input, conversationId: singleton };
 	const accepted = await context.store.accept(connection.endpoint, input);
 	socket.send({
 		type: "accepted",
@@ -498,7 +527,9 @@ function handleStream(
 	const input = frame.input as Record<string, unknown>;
 	const id = validateIdentifier(String(input.id ?? ""), "message id");
 	const recipient = validateIdentifier(String(input.recipient ?? ""), "endpoint id");
-	const conversationId = validateIdentifier(String(input.conversationId ?? ""), "conversation id");
+	const conversationId =
+		singletonConversationFor(context.config, connection.endpoint, recipient) ??
+		validateIdentifier(String(input.conversationId ?? ""), "conversation id");
 	const replyTo =
 		input.replyTo === undefined
 			? undefined
@@ -738,6 +769,9 @@ function validateServerConfig(config: RelayServerConfig): void {
 	requireConfiguredInteger(config.maintenanceMs, "maintenance interval", 100, 24 * 60 * 60 * 1_000);
 	requireConfiguredInteger(config.maxConnections, "connection limit", 1, 100_000);
 	requireConfiguredInteger(config.maxFramesPerWindow, "frame rate limit", 1, 1_000_000);
+	for (const endpoint of config.singletonEndpoints ?? []) {
+		validateIdentifier(endpoint, "singleton endpoint id");
+	}
 	requireConfiguredInteger(
 		config.maxStreamFramesPerWindow,
 		"stream frame rate limit",
@@ -858,6 +892,10 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 	const maxFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_FRAMES_PER_WINDOW");
 	const maxStreamFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW");
 	const rateWindowMs = optionalIntegerEnv("AGENT_RELAY_RATE_WINDOW_MS");
+	const singletonEndpoints = (process.env.AGENT_RELAY_SINGLETON_ENDPOINTS ?? "")
+		.split(/[\s,]+/)
+		.map((value) => value.trim())
+		.filter(Boolean);
 	return {
 		host,
 		port,
@@ -868,6 +906,7 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 		...(maxConnections === undefined ? {} : { maxConnections }),
 		...(maxFramesPerWindow === undefined ? {} : { maxFramesPerWindow }),
 		...(maxStreamFramesPerWindow === undefined ? {} : { maxStreamFramesPerWindow }),
+		...(singletonEndpoints.length > 0 ? { singletonEndpoints } : {}),
 		...(rateWindowMs === undefined ? {} : { rateWindowMs }),
 	};
 }
