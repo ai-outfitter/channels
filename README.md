@@ -93,6 +93,55 @@ pi --mode rpc
 Messages are committed atomically before send returns, survive process restarts,
 and are idempotent when the sender retries with the same message ID.
 
+For remote clients, use the same endpoint/principal variables with:
+
+```bash
+export AGENT_RELAY_URL=wss://relay.example.com/v1/connect
+export AGENT_RELAY_TOKEN=replace-with-revocable-secret
+export AGENT_RELAY_CURSOR_PATH=/var/lib/outfitter/agent-relay-state.json
+```
+
+The cursor state file durably stores accepted deliveries before acknowledging
+them. Without it, the client intentionally does not acknowledge and the relay
+replays messages after reconnect.
+
+### Run the Channels relay
+
+The relay is a separately runnable, single-node HTTPS/WSS service with durable
+offline queues:
+
+```bash
+export AGENT_RELAY_HOST=0.0.0.0
+export AGENT_RELAY_PORT=8787
+export AGENT_RELAY_STORE_PATH=/var/lib/channels/relay.json
+export AGENT_RELAY_CREDENTIALS_PATH=/run/secrets/relay-credentials.json
+export AGENT_RELAY_TLS_KEY_PATH=/run/secrets/tls.key
+export AGENT_RELAY_TLS_CERT_PATH=/run/secrets/tls.crt
+npm run relay
+```
+
+The credentials document authorizes registration, routes, and discovery:
+
+```json
+{
+  "credentials": [
+    {
+      "token": "replace-with-secret",
+      "principal": "agent:researcher",
+      "register": ["researcher"],
+      "send": ["reviewer"],
+      "list": ["reviewer"]
+    }
+  ]
+}
+```
+
+`send: ["*"]` explicitly allows every recipient. Keep credentials in a
+permission-restricted secret file. The relay requires TLS, except when
+`AGENT_RELAY_ALLOW_INSECURE=1` is explicitly set on a loopback-only development
+listener. WSS connects at `/v1/connect`; HTTPS liveness and readiness are
+`/healthz` and `/readyz`.
+
 ## Set up each channel
 
 pi has no per-extension config file, so each channel is configured with **shell

@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	open,
+	readdir,
+	readFile,
+	rename,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -251,9 +261,10 @@ export class FilesystemAgentTransport implements AgentTransport {
 
 async function ensureDirectory(path: string): Promise<void> {
 	await mkdir(path, { recursive: true, mode: DIRECTORY_MODE });
-	await stat(path).then(async (info) => {
+	await stat(path).then((info) => {
 		if (!info.isDirectory()) throw new Error(`${path} is not a directory`);
 	});
+	await chmod(path, DIRECTORY_MODE);
 }
 
 async function atomicJson(path: string, value: unknown, exclusive = false): Promise<void> {

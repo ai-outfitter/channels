@@ -32,6 +32,7 @@
 		"dev:slack:cli": "bash dev/run-slack-cli-local.sh",
 		"setup:slack": "bash dev/setup-slack-cli-app.sh",
 		"verify:slack": "node --experimental-strip-types dev/slack-verify.ts",
+		"relay": "node --experimental-strip-types extensions/relay/server.ts",
 		"lint": "biome check dev/*.ts extensions/ tests/",
 		"format": "biome check --write dev/*.ts extensions/ tests/",
 		"typecheck": "tsc --noEmit",

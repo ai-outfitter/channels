@@ -177,4 +177,3 @@ failure makes readiness false and prevents an `accepted` response.
 | Relay auth | invalid/revoked credential, impersonation, cross-route rejection |
 | Relay recovery | offline delivery, cursor replay, duplicate suppression, heartbeat expiry |
 | Operations | TLS requirement, health/readiness, storage failure, redacted logs |
-
