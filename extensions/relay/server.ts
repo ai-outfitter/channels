@@ -7,6 +7,8 @@ import {
 } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	type AgentEndpoint,
@@ -869,11 +871,16 @@ function formatHost(host: string): string {
 }
 
 export async function configFromEnv(): Promise<RelayServerConfig> {
-	const host = process.env.AGENT_RELAY_HOST?.trim() || "127.0.0.1";
+	// Defaults assume the common deployment: the relay hosted inside an
+	// agent's pi process, so only AGENT_RELAY_SERVER=1 plus the credential
+	// and TLS paths need configuring. TLS remains fail-closed: a non-loopback
+	// host without cert/key still refuses to start.
+	const host = process.env.AGENT_RELAY_HOST?.trim() || "0.0.0.0";
 	const port = Number(process.env.AGENT_RELAY_PORT ?? "8787");
-	const storePath = process.env.AGENT_RELAY_STORE_PATH?.trim();
+	const storePath =
+		process.env.AGENT_RELAY_STORE_PATH?.trim() ||
+		join(homedir(), ".channels", "relay", "store.json");
 	const credentialsPath = process.env.AGENT_RELAY_CREDENTIALS_PATH?.trim();
-	if (!storePath) throw new Error("AGENT_RELAY_STORE_PATH is required");
 	if (!credentialsPath) throw new Error("AGENT_RELAY_CREDENTIALS_PATH is required");
 	const credentialsDocument = JSON.parse(await readFile(credentialsPath, "utf8")) as {
 		credentials?: RelayCredential[];
@@ -892,7 +899,12 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 	const maxFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_FRAMES_PER_WINDOW");
 	const maxStreamFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW");
 	const rateWindowMs = optionalIntegerEnv("AGENT_RELAY_RATE_WINDOW_MS");
-	const singletonEndpoints = (process.env.AGENT_RELAY_SINGLETON_ENDPOINTS ?? "")
+	// A relay hosted inside an agent is that agent's relay: default the
+	// singleton conversation to the hosting endpoint. Explicit env overrides;
+	// an empty value opts out.
+	const singletonSource =
+		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS ?? process.env.AGENT_ENDPOINT_ID ?? "";
+	const singletonEndpoints = singletonSource
 		.split(/[\s,]+/)
 		.map((value) => value.trim())
 		.filter(Boolean);

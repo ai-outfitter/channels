@@ -584,3 +584,33 @@ test("singleton endpoints fold every peer and channel into one conversation", as
 		await rm(root, { recursive: true, force: true });
 	}
 });
+
+test("configFromEnv defaults the singleton endpoint to the hosting agent", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-env-test-"));
+	const credentialsPath = join(root, "credentials.json");
+	const { writeFile } = await import("node:fs/promises");
+	await writeFile(credentialsPath, JSON.stringify({ credentials: CREDENTIALS }));
+	const saved = { ...process.env };
+	try {
+		process.env.AGENT_RELAY_CREDENTIALS_PATH = credentialsPath;
+		process.env.AGENT_ENDPOINT_ID = "link:vega";
+		delete process.env.AGENT_RELAY_SINGLETON_ENDPOINTS;
+		delete process.env.AGENT_RELAY_HOST;
+		delete process.env.AGENT_RELAY_STORE_PATH;
+		delete process.env.AGENT_RELAY_TLS_KEY_PATH;
+		delete process.env.AGENT_RELAY_TLS_CERT_PATH;
+		const { configFromEnv } = await import("../extensions/relay/server.ts");
+		const config = await configFromEnv();
+		assert.deepEqual(config.singletonEndpoints, ["link:vega"]);
+		assert.equal(config.host, "0.0.0.0");
+		assert.ok(config.storePath.endsWith("/.channels/relay/store.json"));
+
+		// Explicit empty opts out of the singleton default.
+		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS = "";
+		const optedOut = await configFromEnv();
+		assert.equal(optedOut.singletonEndpoints, undefined);
+	} finally {
+		process.env = saved;
+		await rm(root, { recursive: true, force: true });
+	}
+});

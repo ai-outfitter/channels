@@ -17,6 +17,7 @@ import type {
 	ChannelRespondResult,
 	ChannelSource,
 } from "./types.ts";
+import { scopedLog } from "./util.ts";
 
 export interface AgentChannelConfig {
 	readonly endpointId: string;
@@ -111,6 +112,9 @@ async function releaseSharedAgentTransport(
 	await transport.close();
 }
 
+export const SUBSCRIBE_RETRY_INITIAL_MS = 1_000;
+export const SUBSCRIBE_RETRY_MAX_MS = 30_000;
+
 export function createAgentSource(
 	config: AgentChannelConfig,
 	createTransport: (
@@ -118,19 +122,60 @@ export function createAgentSource(
 		journal?: AgentSessionJournal,
 	) => AgentTransport = sharedAgentTransport,
 	journal = new AgentSessionJournal(),
+	retryInitialMs = SUBSCRIBE_RETRY_INITIAL_MS,
 ): ChannelSource {
+	const log = scopedLog("agent");
 	return {
 		async start(onEvent) {
 			const transport = createTransport(config, journal);
-			const unsubscribe = await transport.subscribe((messageId) => {
+			const deliver = (messageId: string) => {
 				onEvent({
 					channel: "agent",
 					summary: "new agent message",
 					locator: { key: agentLocator(messageId) },
 				});
-			});
+			};
+			// The initial subscribe races the relay's own startup when the relay
+			// runs inside this very process (and the Service endpoint appearing
+			// when it hairpins through Kubernetes), so it retries with capped
+			// backoff instead of giving up. Established connections already
+			// reconnect inside the transport.
+			let unsubscribe: (() => Promise<void>) | undefined;
+			let stopped = false;
+			let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+			const trySubscribe = async (): Promise<boolean> => {
+				try {
+					const cancel = await transport.subscribe(deliver);
+					if (stopped) {
+						await cancel();
+						return true;
+					}
+					unsubscribe = cancel;
+					return true;
+				} catch (err) {
+					log(`connect failed, will retry: ${(err as Error).message}`);
+					return false;
+				}
+			};
+
+			const scheduleRetry = (delayMs: number): void => {
+				if (stopped) return;
+				retryTimer = setTimeout(() => {
+					void trySubscribe().then((connected) => {
+						if (connected) log("connected after retry");
+						else scheduleRetry(Math.min(delayMs * 2, SUBSCRIBE_RETRY_MAX_MS));
+					});
+				}, delayMs);
+				retryTimer.unref?.();
+			};
+
+			if (!(await trySubscribe())) scheduleRetry(retryInitialMs);
+
 			return async () => {
-				await unsubscribe();
+				stopped = true;
+				if (retryTimer) clearTimeout(retryTimer);
+				if (unsubscribe) await unsubscribe();
 				if (createTransport === sharedAgentTransport) {
 					await releaseSharedAgentTransport(config, transport);
 				} else {
