@@ -222,6 +222,7 @@ export function createAgentStreamForwarder(
 ): (event: MessageUpdateEvent) => void {
 	let bufferedDelta = "";
 	let bufferedIndex = 0;
+	let bufferedTarget: string | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 	const toolArgs = new Map<number, string>();
 	const toolEmitted = new Map<number, number>();
@@ -231,8 +232,23 @@ export function createAgentStreamForwarder(
 		return open.length === 1 ? open[0]?.message.id : undefined;
 	};
 
-	const emit = (event: RelayStreamEvent): void => {
-		const targetId = soleOpenTarget();
+	// Exact attribution: the channel_respond call names its target via the
+	// locator argument, which streams before (or alongside) the response.
+	// Require the closing quote so a half-streamed locator never decodes to
+	// the wrong message; locators are base64url so no JSON escapes occur.
+	const targetFromArgs = (args: string): string | undefined => {
+		const match = /"locator"\s*:\s*"(agent:v1:[A-Za-z0-9_-]+)"/.exec(args);
+		if (!match?.[1]) return undefined;
+		try {
+			const messageId = decodeAgentLocator(match[1]);
+			const target = journal.message(messageId);
+			return target?.message.recipient === config.endpointId ? messageId : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+
+	const emit = (targetId: string | undefined, event: RelayStreamEvent): void => {
 		if (!targetId) return;
 		const transport = createTransport(config, journal);
 		void transport.stream?.(targetId, event).catch(() => {});
@@ -246,12 +262,15 @@ export function createAgentStreamForwarder(
 		if (bufferedDelta === "") return;
 		const delta = bufferedDelta;
 		bufferedDelta = "";
-		emit({ type: "text_delta", contentIndex: bufferedIndex, delta });
+		emit(bufferedTarget, { type: "text_delta", contentIndex: bufferedIndex, delta });
 	};
 
-	const bufferDelta = (contentIndex: number, delta: string): void => {
-		if (bufferedDelta !== "" && bufferedIndex !== contentIndex) flushDeltas();
+	const bufferDelta = (targetId: string, contentIndex: number, delta: string): void => {
+		if (bufferedDelta !== "" && (bufferedIndex !== contentIndex || bufferedTarget !== targetId)) {
+			flushDeltas();
+		}
 		bufferedIndex = contentIndex;
+		bufferedTarget = targetId;
 		bufferedDelta += delta;
 		flushTimer ??= setTimeout(flushDeltas, flushMs);
 		flushTimer.unref?.();
@@ -271,19 +290,21 @@ export function createAgentStreamForwarder(
 		switch (assistant.type) {
 			case "text_start":
 				flushDeltas();
-				emit({ type: "text_start", contentIndex: assistant.contentIndex });
+				emit(soleOpenTarget(), { type: "text_start", contentIndex: assistant.contentIndex });
 				break;
-			case "text_delta":
-				if (!soleOpenTarget()) break;
-				bufferDelta(assistant.contentIndex, assistant.delta);
+			case "text_delta": {
+				const target = soleOpenTarget();
+				if (!target) break;
+				bufferDelta(target, assistant.contentIndex, assistant.delta);
 				break;
+			}
 			case "text_end":
 				bufferedDelta = "";
 				if (flushTimer) {
 					clearTimeout(flushTimer);
 					flushTimer = undefined;
 				}
-				emit({
+				emit(soleOpenTarget(), {
 					type: "text_end",
 					contentIndex: assistant.contentIndex,
 					content: assistant.content,
@@ -297,18 +318,22 @@ export function createAgentStreamForwarder(
 				const args = (toolArgs.get(assistant.contentIndex) ?? "") + assistant.delta;
 				toolArgs.set(assistant.contentIndex, args);
 				if (!respondToolAt(assistant.partial, assistant.contentIndex)) break;
-				if (!soleOpenTarget()) break;
+				const target = targetFromArgs(args);
+				if (!target) break;
 				const response = extractJsonStringValue(args, "response");
 				if (response === undefined) break;
 				const emitted = toolEmitted.get(assistant.contentIndex) ?? 0;
-				if (emitted === 0) emit({ type: "text_start", contentIndex: assistant.contentIndex });
+				if (emitted === 0) {
+					emit(target, { type: "text_start", contentIndex: assistant.contentIndex });
+				}
 				if (response.length > emitted) {
-					bufferDelta(assistant.contentIndex, response.slice(emitted));
+					bufferDelta(target, assistant.contentIndex, response.slice(emitted));
 					toolEmitted.set(assistant.contentIndex, response.length);
 				}
 				break;
 			}
 			case "toolcall_end": {
+				const args = toolArgs.get(assistant.contentIndex) ?? "";
 				toolArgs.delete(assistant.contentIndex);
 				const emitted = toolEmitted.get(assistant.contentIndex) ?? 0;
 				toolEmitted.delete(assistant.contentIndex);
@@ -319,9 +344,18 @@ export function createAgentStreamForwarder(
 					clearTimeout(flushTimer);
 					flushTimer = undefined;
 				}
+				const locator = (call.arguments as { locator?: unknown }).locator;
+				const target =
+					typeof locator === "string"
+						? targetFromArgs(JSON.stringify({ locator }))
+						: targetFromArgs(args);
 				const response = (call.arguments as { response?: unknown }).response;
-				if (typeof response === "string") {
-					emit({ type: "text_end", contentIndex: assistant.contentIndex, content: response });
+				if (target && typeof response === "string") {
+					emit(target, {
+						type: "text_end",
+						contentIndex: assistant.contentIndex,
+						content: response,
+					});
 				}
 				break;
 			}

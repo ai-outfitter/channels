@@ -54,7 +54,7 @@ test("forwarder streams channel_respond argument deltas as text events", async (
 	update({
 		type: "toolcall_delta",
 		contentIndex: 0,
-		delta: '{"locator":"agent:v1:x","response":"Hello, ',
+		delta: '{"locator":"agent:v1:bWVzc2FnZS0x","response":"Hello, ',
 		partial,
 	});
 	update({ type: "toolcall_delta", contentIndex: 0, delta: "world", partial });
@@ -66,7 +66,7 @@ test("forwarder streams channel_respond argument deltas as text events", async (
 			type: "toolCall",
 			id: "call-1",
 			name: "channel_respond",
-			arguments: { locator: "agent:v1:x", response: "Hello, world!" },
+			arguments: { locator: "agent:v1:bWVzc2FnZS0x", response: "Hello, world!" },
 		},
 		partial,
 	});
