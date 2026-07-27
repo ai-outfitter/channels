@@ -21,7 +21,9 @@
  * - set to `off`/`none` → disabled (keeps pure loop-polling).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerAgentTools } from "./agent-tools.ts";
 import { registerChannelTools } from "./channel-tools.ts";
+import type { AgentChannelActions } from "./sources/agent.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "./sources/types.ts";
 import { parseList, scopedLog } from "./sources/util.ts";
 
@@ -36,6 +38,8 @@ export interface SourceRegistration {
 	load(): Promise<ChannelSource | undefined>;
 	/** Dynamically load the channel's agent-facing actions, when supported. */
 	loadActions?(): Promise<ChannelActions | undefined>;
+	/** Load the native agent channel's discovery/send actions, when supported. */
+	loadAgentActions?(): Promise<AgentChannelActions | undefined>;
 }
 
 /** Run a source module's env-config probe and construct it when configured. */
@@ -82,6 +86,27 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return configure(m.slackActionsConfigFromEnv, m.createSlackActions);
 		},
 	},
+	agent: {
+		configured: () =>
+			Boolean(
+				process.env.AGENT_ENDPOINT_ID ||
+					process.env.AGENT_SPOOL_PATH ||
+					process.env.AGENT_RELAY_URL ||
+					process.env.AGENT_RELAY_TOKEN,
+			),
+		async load() {
+			const m = await import("./sources/agent.ts");
+			return configure(m.agentConfigFromEnv, m.createAgentSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/agent.ts");
+			return configure(m.agentConfigFromEnv, m.createAgentActions);
+		},
+		async loadAgentActions() {
+			const m = await import("./sources/agent.ts");
+			return configure(m.agentConfigFromEnv, m.createAgentActions);
+		},
+	},
 };
 
 export default function channelEventsExtension(
@@ -96,6 +121,7 @@ export default function channelEventsExtension(
 	const wanted =
 		selection === undefined ? Object.keys(sources) : [...new Set(parseList(selection))];
 	const actionCache = new Map<string, Promise<ChannelActions>>();
+	let agentActions: Promise<AgentChannelActions> | undefined;
 
 	registerChannelTools(pi, async (locator) => {
 		const channel = locatorChannel(locator);
@@ -121,6 +147,26 @@ export default function channelEventsExtension(
 			actionCache.set(channel, actions);
 		}
 		return actions;
+	});
+	registerAgentTools(pi, async () => {
+		if (!wanted.includes("agent")) throw new Error('channel "agent" is not selected');
+		const registration = sources.agent;
+		if (!registration?.loadAgentActions) {
+			throw new Error('channel "agent" does not support agent tools');
+		}
+		if (!agentActions) {
+			agentActions = registration
+				.loadAgentActions()
+				.then((loaded) => {
+					if (!loaded) throw new Error('channel "agent" actions are not configured');
+					return loaded;
+				})
+				.catch((error) => {
+					agentActions = undefined;
+					throw error;
+				});
+		}
+		return agentActions;
 	});
 
 	const stops: Array<() => Promise<void>> = [];

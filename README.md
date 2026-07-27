@@ -65,10 +65,33 @@ Set `OUTFITTER_CHANNELS` in your shell before launching pi:
 | --- | --- |
 | unset | **Auto-detect** — start every channel whose credentials are present. |
 | `jmap,signal` | Start exactly those channels (comma/space list). |
+| `agent` | Start the native agent session chat channel. |
 | `off` / `none` | Disabled. |
 
 Auto-detect enables a channel when its required environment variables are
 present.
+
+### Native agent session chat — `agent`
+
+The `agent` channel carries agent-to-agent and authorized operator-to-agent chat.
+It adds `agent_list` and `agent_send` for discovery and sending, while incoming
+messages continue through `channel_read` and `channel_respond`. Wakes contain
+only an opaque `agent:v1` locator.
+
+For two agents on the same host, point both at one permission-restricted spool
+and give each a stable endpoint:
+
+```bash
+export OUTFITTER_CHANNELS=agent
+export AGENT_ENDPOINT_ID=researcher
+export AGENT_PRINCIPAL_ID=agent:researcher       # optional; defaults to endpoint
+export AGENT_SPOOL_PATH=/var/lib/outfitter/agent-spool
+export AGENT_SPOOL_POLL_MS=250                   # optional; minimum 25
+pi --mode rpc
+```
+
+Messages are committed atomically before send returns, survive process restarts,
+and are idempotent when the sender retries with the same message ID.
 
 ## Set up each channel
 
