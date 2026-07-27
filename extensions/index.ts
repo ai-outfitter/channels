@@ -21,7 +21,10 @@
  * - set to `off`/`none` → disabled (keeps pure loop-polling).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { AgentSessionJournal } from "./agent/journal.ts";
+import { registerAgentTools } from "./agent-tools.ts";
 import { registerChannelTools } from "./channel-tools.ts";
+import type { AgentChannelActions } from "./sources/agent.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "./sources/types.ts";
 import { parseList, scopedLog } from "./sources/util.ts";
 
@@ -33,9 +36,11 @@ export interface SourceRegistration {
 	/** Cheap environment probe that must not import the channel implementation. */
 	configured(): boolean;
 	/** Dynamically load and configure the channel implementation. */
-	load(): Promise<ChannelSource | undefined>;
+	load(journal?: AgentSessionJournal): Promise<ChannelSource | undefined>;
 	/** Dynamically load the channel's agent-facing actions, when supported. */
-	loadActions?(): Promise<ChannelActions | undefined>;
+	loadActions?(journal?: AgentSessionJournal): Promise<ChannelActions | undefined>;
+	/** Load the native agent channel's discovery/send actions, when supported. */
+	loadAgentActions?(journal?: AgentSessionJournal): Promise<AgentChannelActions | undefined>;
 }
 
 /** Run a source module's env-config probe and construct it when configured. */
@@ -82,6 +87,30 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return configure(m.slackActionsConfigFromEnv, m.createSlackActions);
 		},
 	},
+	agent: {
+		configured: () =>
+			Boolean(
+				process.env.AGENT_ENDPOINT_ID ||
+					process.env.AGENT_SPOOL_PATH ||
+					process.env.AGENT_RELAY_URL ||
+					process.env.AGENT_RELAY_TOKEN,
+			),
+		async load(journal) {
+			const m = await import("./sources/agent.ts");
+			const config = m.agentConfigFromEnv();
+			return config ? m.createAgentSource(config, undefined, journal) : undefined;
+		},
+		async loadActions(journal) {
+			const m = await import("./sources/agent.ts");
+			const config = m.agentConfigFromEnv();
+			return config ? m.createAgentActions(config, undefined, journal) : undefined;
+		},
+		async loadAgentActions(journal) {
+			const m = await import("./sources/agent.ts");
+			const config = m.agentConfigFromEnv();
+			return config ? m.createAgentActions(config, undefined, journal) : undefined;
+		},
+	},
 };
 
 export default function channelEventsExtension(
@@ -96,6 +125,10 @@ export default function channelEventsExtension(
 	const wanted =
 		selection === undefined ? Object.keys(sources) : [...new Set(parseList(selection))];
 	const actionCache = new Map<string, Promise<ChannelActions>>();
+	let agentActions: Promise<AgentChannelActions> | undefined;
+	const agentJournal = new AgentSessionJournal((customType, data) => {
+		pi.appendEntry(customType, data);
+	});
 
 	registerChannelTools(pi, async (locator) => {
 		const channel = locatorChannel(locator);
@@ -109,7 +142,7 @@ export default function channelEventsExtension(
 		let actions = actionCache.get(channel);
 		if (!actions) {
 			actions = registration
-				.loadActions()
+				.loadActions(channel === "agent" ? agentJournal : undefined)
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" actions are not configured`);
 					return loaded;
@@ -121,6 +154,26 @@ export default function channelEventsExtension(
 			actionCache.set(channel, actions);
 		}
 		return actions;
+	});
+	registerAgentTools(pi, async () => {
+		if (!wanted.includes("agent")) throw new Error('channel "agent" is not selected');
+		const registration = sources.agent;
+		if (!registration?.loadAgentActions) {
+			throw new Error('channel "agent" does not support agent tools');
+		}
+		if (!agentActions) {
+			agentActions = registration
+				.loadAgentActions(agentJournal)
+				.then((loaded) => {
+					if (!loaded) throw new Error('channel "agent" actions are not configured');
+					return loaded;
+				})
+				.catch((error) => {
+					agentActions = undefined;
+					throw error;
+				});
+		}
+		return agentActions;
 	});
 
 	const stops: Array<() => Promise<void>> = [];
@@ -189,7 +242,7 @@ export default function channelEventsExtension(
 			return undefined;
 		}
 		try {
-			const source = await registration.load();
+			const source = await registration.load(kind === "agent" ? agentJournal : undefined);
 			if (!source) {
 				log(`channel "${kind}" configuration is incomplete; skipping`);
 				return undefined;
@@ -201,8 +254,9 @@ export default function channelEventsExtension(
 		}
 	};
 
-	pi.on("session_start", async () => {
+	pi.on("session_start", async (_event, ctx) => {
 		if (stops.length > 0 || starting) return; // idempotent across reload / concurrent fires
+		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
 		starting = true;
 		stopped = false;
 		try {

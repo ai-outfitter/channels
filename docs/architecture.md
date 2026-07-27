@@ -4,6 +4,11 @@ The Channels extension turns external activity into trusted, body-free wakes for
 one resident Pi session. Transport sources detect activity; channel adapters read
 and act on the untrusted content after the agent wakes.
 
+The native agent-to-agent and operator-to-agent plane is specified separately in
+[Agent Session Gateway](agent-session-gateway.md). It reuses this extension's
+body-free wake and channel-tool boundary while keeping chat distinct from session
+observation, control, and hosted workload lifecycle.
+
 ## Boundaries
 
 There are three layers:
