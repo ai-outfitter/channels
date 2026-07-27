@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/ai-outfitter/channels/compare/v1.0.0...v1.1.0) (2026-07-27)
+
+
+### Features
+
+* add agent session channel and authenticated relay ([#12](https://github.com/ai-outfitter/channels/issues/12)) ([f1b0c2e](https://github.com/ai-outfitter/channels/commit/f1b0c2e8d388326a82471b466773bd8ac0d71e76))
+* add Slack mention channel support ([#3](https://github.com/ai-outfitter/channels/issues/3)) ([cac9647](https://github.com/ai-outfitter/channels/commit/cac964724f149208a4d0fe2aca39e3e0a234045d))
+
 ## [1.0.0](https://github.com/ai-outfitter/channels/compare/v0.1.0...v1.0.0) (2026-07-23)
 
 
