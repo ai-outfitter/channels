@@ -197,6 +197,10 @@ channel tool boundary, library evaluation, and per-channel dynamic-import
 convention are in
 [docs/architecture.md](docs/architecture.md).
 
+Native agent-to-agent and authorized operator-to-agent chat, including the
+identity model and boundaries from observation/control/lifecycle, is specified in
+[Agent Session Gateway](docs/agent-session-gateway.md).
+
 ## Add a channel
 
 Add `extensions/sources/<name>.ts` with a `ChannelSource` and, for exact-item
