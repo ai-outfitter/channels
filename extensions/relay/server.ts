@@ -731,7 +731,7 @@ function formatHost(host: string): string {
 	return host.includes(":") ? `[${host}]` : host;
 }
 
-async function configFromEnv(): Promise<RelayServerConfig> {
+export async function configFromEnv(): Promise<RelayServerConfig> {
 	const host = process.env.AGENT_RELAY_HOST?.trim() || "127.0.0.1";
 	const port = Number(process.env.AGENT_RELAY_PORT ?? "8787");
 	const storePath = process.env.AGENT_RELAY_STORE_PATH?.trim();
