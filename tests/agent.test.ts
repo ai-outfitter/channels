@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FilesystemAgentTransport } from "../extensions/agent/filesystem.ts";
+import { AGENT_SESSION_ENTRY_TYPE, AgentSessionJournal } from "../extensions/agent/journal.ts";
 import {
 	AGENT_MAX_BODY_BYTES,
 	agentLocator,
@@ -77,6 +78,14 @@ test("filesystem transport completes a durable two-agent round trip exactly once
 		const read = await bob.read("request-1");
 		assert.equal(read.target.state, "read");
 		assert.equal(read.messages[0]?.message.body, "hello Bob");
+		const retryAfterDelivery = await alice.send({
+			id: "request-1",
+			recipient: "bob",
+			conversationId: "conversation-1",
+			body: "hello Bob",
+		});
+		assert.equal(retryAfterDelivery.duplicate, true);
+		assert.equal(retryAfterDelivery.message.createdAt, sent.message.createdAt);
 		const replied = await bob.respond("request-1", "hello Alice");
 		assert.equal(replied.target.state, "replied");
 
@@ -124,6 +133,46 @@ test("filesystem retry and restart recover the committed message without duplica
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("Pi custom entries restore messages, transitions, requester-scoped history, and relay cursor", () => {
+	const entries: unknown[] = [];
+	const append = (customType: string, data: unknown) => {
+		entries.push({ type: "custom", customType, data });
+	};
+	const journal = new AgentSessionJournal(append);
+	const request = {
+		version: 1 as const,
+		id: "journal-request",
+		conversationId: "journal-conversation",
+		sender: "alice",
+		recipient: "bob",
+		createdAt: "2026-07-26T12:00:00.000Z",
+		body: "persist me",
+	};
+	journal.recordMessage(request, "delivered");
+	journal.transition(request.id, "read");
+	journal.recordRelayCheckpoint("bob", 17);
+	assert.equal(entries.length, 3);
+	assert.equal((entries[0] as { customType: string }).customType, AGENT_SESSION_ENTRY_TYPE);
+
+	const restored = new AgentSessionJournal();
+	restored.restore(entries);
+	assert.equal(restored.message(request.id)?.state, "read");
+	assert.equal(restored.relayCheckpoint("bob"), 17);
+	assert.deepEqual(
+		restored.conversations(50, Number.MAX_SAFE_INTEGER, "alice").map((item) => item.id),
+		["journal-conversation"],
+	);
+	assert.equal(restored.conversations(50, Number.MAX_SAFE_INTEGER, "mallory").length, 0);
+	assert.equal(
+		restored.history("journal-conversation", 50, Number.MAX_SAFE_INTEGER, "alice").length,
+		1,
+	);
+	assert.equal(
+		restored.history("journal-conversation", 50, Number.MAX_SAFE_INTEGER, "mallory").length,
+		0,
+	);
 });
 
 test("filesystem spool is permission restricted and rejects conflicting id reuse", async () => {

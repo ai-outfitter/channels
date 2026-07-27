@@ -98,12 +98,14 @@ For remote clients, use the same endpoint/principal variables with:
 ```bash
 export AGENT_RELAY_URL=wss://relay.example.com/v1/connect
 export AGENT_RELAY_TOKEN=replace-with-revocable-secret
-export AGENT_RELAY_CURSOR_PATH=/var/lib/outfitter/agent-relay-state.json
 ```
 
-The cursor state file durably stores accepted deliveries before acknowledging
-them. Without it, the client intentionally does not acknowledge and the relay
-replays messages after reconnect.
+Messages, state transitions, and the relay delivery checkpoint are appended to
+Pi's native JSONL session as custom entries. The client acknowledges a relay
+delivery only after both the envelope and checkpoint have been appended. A
+workspace PVC therefore preserves the canonical conversation state across
+resident-agent restarts; there is no separate channel transcript or cursor
+database.
 
 ### Run the Channels relay
 
@@ -113,12 +115,22 @@ offline queues:
 ```bash
 export AGENT_RELAY_HOST=0.0.0.0
 export AGENT_RELAY_PORT=8787
-export AGENT_RELAY_STORE_PATH=/var/lib/channels/relay.json
+export AGENT_RELAY_STORE_PATH=/var/lib/channels/relay-delivery.json
 export AGENT_RELAY_CREDENTIALS_PATH=/run/secrets/relay-credentials.json
 export AGENT_RELAY_TLS_KEY_PATH=/run/secrets/tls.key
 export AGENT_RELAY_TLS_CERT_PATH=/run/secrets/tls.crt
 npm run relay
 ```
+
+The single-node relay atomically stores only bounded, unacknowledged delivery
+envelopes. It compacts message bodies immediately after recipient ACK and keeps
+only bounded, body-free hashes for retry deduplication. Stale unacknowledged
+envelopes expire after seven days. Transcript queries are correlated and routed
+to the connected target agent, which answers from its Pi session; the relay
+never answers them from its delivery store. Runtime limits default to 1,000
+connections and 120 client frames per minute; deployments may lower them with
+`AGENT_RELAY_MAX_CONNECTIONS`, `AGENT_RELAY_MAX_FRAMES_PER_WINDOW`, and
+`AGENT_RELAY_RATE_WINDOW_MS`.
 
 The credentials document authorizes registration, routes, and discovery:
 

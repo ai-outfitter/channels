@@ -71,8 +71,8 @@ interface AgentMessageV1 {
 
 The channel locator is `agent:v1:<base64url message-id>`. Locators, wake prompts,
 URLs, log fields, and metric labels contain structural identifiers only. Message
-bodies appear only in durable message storage and inside the explicit untrusted
-markers returned by `channel_read`.
+bodies appear only in Pi's native JSONL session, transient unacknowledged
+delivery queues, and the explicit untrusted markers returned by `channel_read`.
 
 Limits are normative defaults and may only be configured downward at a trust
 boundary:
@@ -85,7 +85,7 @@ boundary:
 | Pending endpoint queue | 1,000 messages |
 | Locator | 512 characters |
 | Relay frame | 64 KiB |
-| Local/relay retention | 7 days |
+| Unacknowledged local/relay delivery retention | 7 days |
 
 Messages for one conversation are presented by `(createdAt, id)`. This is a
 deterministic display order, not a global clock guarantee. Delivery is
@@ -114,34 +114,46 @@ recovered as a retry of an already accepted operation.
 
 ## Storage and transport
 
-The transport contract contains only endpoint discovery, send, read, respond,
-and subscribe. The agent adapter owns locator validation, context bounds, and
-state rendering. A transport owns durable queues, idempotency, authentication,
-and wake notification.
+The transport contract contains endpoint discovery, send, read, respond, and
+subscribe. The agent adapter owns locator validation, context bounds, state
+rendering, and the Pi session projection. Pi custom JSONL entries are the
+canonical message and state-transition history. They do not participate in LLM
+context; `channel_read` explicitly selects and bounds the untrusted context.
+A transport owns only durable unacknowledged delivery, retry idempotency,
+authentication, and wake notification.
 
 The same-host transport uses a permission-restricted filesystem spool. Each
-message and acknowledgement is committed by write-to-temporary, `fsync`, rename,
-and directory `fsync`. Startup and a periodic scan recover notifications missed
-between the atomic rename and filesystem observation.
+unacknowledged envelope is committed by write-to-temporary, `fsync`, atomic
+publish, and directory `fsync`. A recipient appends the envelope to its Pi
+session before unlinking and directory-syncing the spool entry. Startup and a
+periodic scan recover notifications missed between atomic publish and
+filesystem observation. The spool is not conversation storage.
 
-The remote transport uses outbound TLS WebSockets. The single-node relay stores
-messages before returning `accepted`, queues them while recipients are offline,
-and replays after a client resumes from its last durable cursor. Heartbeats
-expire stale registrations. A replacement connection for the same endpoint is
-duplicate-safe and closes the old connection. HTTPS `/healthz` reports liveness;
-`/readyz` reports whether durable storage is writable.
+The remote transport uses outbound TLS WebSockets. The single-node relay
+atomically stores bounded unacknowledged envelopes before returning `accepted`,
+queues them while recipients are offline, and replays after a client resumes
+from its last Pi-session checkpoint. The agent appends an inbound envelope and
+checkpoint before ACK; ACK immediately compacts those message bodies from relay
+storage. Bounded body hashes remain temporarily for idempotent retries.
+Heartbeats expire stale registrations. A replacement connection for the same
+endpoint is duplicate-safe and closes the old connection. HTTPS `/healthz`
+reports liveness; `/readyz` reports whether durable delivery storage is writable.
 
-The relay owns transport persistence, not long-term conversation archives.
-Operator clients that need history beyond retention must persist their own
-authorized projection.
+The relay never owns or answers transcript history. `list_conversations` and
+`read_history` are correlated queries routed to the connected target agent.
+That agent answers from its Pi custom entries and restricts results to
+conversations containing the authenticated requester endpoint. Queries fail
+while the target is offline.
 
 ## Flows
 
 ### Same-host agent-to-agent
 
 1. Sender calls `agent_send` with recipient, conversation, body, and optional ID.
-2. The spool atomically accepts the envelope and returns its stable ID.
-3. Recipient watcher emits an `agent` event containing only the locator.
+2. The spool atomically accepts the envelope and the sender appends it to its Pi
+   session before returning its stable ID.
+3. Recipient appends the envelope to its Pi session, removes the spool entry,
+   and emits an `agent` event containing only the locator.
 4. Pi receives a body-free wake and calls `channel_read`.
 5. Recipient calls `channel_respond`; the reply is atomically accepted once.
 
@@ -151,7 +163,8 @@ authorized projection.
    authenticate their principals/endpoints.
 2. Operator submits a message; relay authorizes its route and durably accepts it.
 3. Relay delivers immediately or retains it while the agent is offline.
-4. Agent acknowledges its cursor only after local durable acceptance.
+4. Agent appends the envelope and cursor to its Pi JSONL session, then
+   acknowledges; the relay compacts the acknowledged body.
 5. Reconnect resumes after that cursor, replaying any unacknowledged delivery.
 
 ## Redaction and operations

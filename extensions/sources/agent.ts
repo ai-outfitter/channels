@@ -1,4 +1,5 @@
 import { FilesystemAgentTransport } from "../agent/filesystem.ts";
+import { AgentSessionJournal } from "../agent/journal.ts";
 import { RelayAgentTransport } from "../agent/relay.ts";
 import {
 	type AgentEndpoint,
@@ -21,7 +22,6 @@ export interface AgentChannelConfig {
 	readonly spoolPath: string;
 	readonly relayUrl?: string;
 	readonly relayToken?: string;
-	readonly relayStatePath?: string;
 	readonly pollMs?: number;
 }
 
@@ -50,41 +50,54 @@ export function agentConfigFromEnv(
 		principalId: env.AGENT_PRINCIPAL_ID?.trim() || endpointId,
 		spoolPath: spoolPath ?? "",
 		...(relayUrl ? { relayUrl, relayToken: relayToken ?? "" } : {}),
-		...(env.AGENT_RELAY_CURSOR_PATH?.trim()
-			? { relayStatePath: env.AGENT_RELAY_CURSOR_PATH.trim() }
-			: {}),
 		...(parsedPoll === undefined ? {} : { pollMs: parsedPoll }),
 	};
 }
 
-export function createFilesystemAgentTransport(config: AgentChannelConfig): AgentTransport {
+export function createFilesystemAgentTransport(
+	config: AgentChannelConfig,
+	journal = new AgentSessionJournal(),
+): AgentTransport {
 	if (config.relayUrl && config.relayToken) {
-		return new RelayAgentTransport({
-			url: config.relayUrl,
-			token: config.relayToken,
+		return new RelayAgentTransport(
+			{
+				url: config.relayUrl,
+				token: config.relayToken,
+				endpointId: config.endpointId,
+				principalId: config.principalId,
+			},
+			journal,
+		);
+	}
+	return new FilesystemAgentTransport(
+		{
+			root: config.spoolPath,
 			endpointId: config.endpointId,
 			principalId: config.principalId,
-			...(config.relayStatePath ? { statePath: config.relayStatePath } : {}),
-		});
-	}
-	return new FilesystemAgentTransport({
-		root: config.spoolPath,
-		endpointId: config.endpointId,
-		principalId: config.principalId,
-		...(config.pollMs === undefined ? {} : { pollMs: config.pollMs }),
-	});
+			...(config.pollMs === undefined ? {} : { pollMs: config.pollMs }),
+		},
+		journal,
+	);
 }
 
-const sharedTransports = new Map<string, AgentTransport>();
+const sharedTransports = new Map<
+	string,
+	{ readonly transport: AgentTransport; readonly journal: AgentSessionJournal }
+>();
 
-function sharedAgentTransport(config: AgentChannelConfig): AgentTransport {
+function sharedAgentTransport(
+	config: AgentChannelConfig,
+	journal = new AgentSessionJournal(),
+): AgentTransport {
 	const key = JSON.stringify(config);
-	let transport = sharedTransports.get(key);
-	if (!transport) {
-		transport = createFilesystemAgentTransport(config);
-		sharedTransports.set(key, transport);
+	let shared = sharedTransports.get(key);
+	if (!shared) {
+		shared = { transport: createFilesystemAgentTransport(config, journal), journal };
+		sharedTransports.set(key, shared);
+	} else if (shared.journal !== journal) {
+		throw new Error("agent transport is already attached to another Pi session");
 	}
-	return transport;
+	return shared.transport;
 }
 
 async function releaseSharedAgentTransport(
@@ -92,17 +105,21 @@ async function releaseSharedAgentTransport(
 	transport: AgentTransport,
 ): Promise<void> {
 	const key = JSON.stringify(config);
-	if (sharedTransports.get(key) === transport) sharedTransports.delete(key);
+	if (sharedTransports.get(key)?.transport === transport) sharedTransports.delete(key);
 	await transport.close();
 }
 
 export function createAgentSource(
 	config: AgentChannelConfig,
-	createTransport: (config: AgentChannelConfig) => AgentTransport = sharedAgentTransport,
+	createTransport: (
+		config: AgentChannelConfig,
+		journal?: AgentSessionJournal,
+	) => AgentTransport = sharedAgentTransport,
+	journal = new AgentSessionJournal(),
 ): ChannelSource {
 	return {
 		async start(onEvent) {
-			const transport = createTransport(config);
+			const transport = createTransport(config, journal);
 			const unsubscribe = await transport.subscribe((messageId) => {
 				onEvent({
 					channel: "agent",
@@ -124,12 +141,16 @@ export function createAgentSource(
 
 export function createAgentActions(
 	config: AgentChannelConfig,
-	createTransport: (config: AgentChannelConfig) => AgentTransport = sharedAgentTransport,
+	createTransport: (
+		config: AgentChannelConfig,
+		journal?: AgentSessionJournal,
+	) => AgentTransport = sharedAgentTransport,
+	journal = new AgentSessionJournal(),
 ): AgentChannelActions {
 	let injectedTransport: AgentTransport | undefined;
 	const getTransport = (): AgentTransport => {
-		if (createTransport === sharedAgentTransport) return sharedAgentTransport(config);
-		injectedTransport ??= createTransport(config);
+		if (createTransport === sharedAgentTransport) return sharedAgentTransport(config, journal);
+		injectedTransport ??= createTransport(config, journal);
 		return injectedTransport;
 	};
 	return {

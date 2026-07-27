@@ -1,4 +1,9 @@
-import type { AgentEndpoint, AgentMessageV1, AgentSendInput } from "../agent/types.ts";
+import type {
+	AgentEndpoint,
+	AgentMessageState,
+	AgentMessageV1,
+	AgentSendInput,
+} from "../agent/types.ts";
 
 export const RELAY_PROTOCOL_VERSION = 1 as const;
 export const RELAY_MAX_FRAME_BYTES = 64 * 1024;
@@ -38,11 +43,15 @@ export interface RelaySendFrame {
 export interface RelayListConversationsFrame {
 	readonly type: "list_conversations";
 	readonly requestId: string;
+	readonly endpoint: string;
+	readonly limit?: number;
+	readonly beforeCursor?: number;
 }
 
 export interface RelayConversationSummary {
 	readonly id: string;
 	readonly updatedAt: string;
+	readonly cursor: number;
 	readonly participants: readonly string[];
 }
 
@@ -55,16 +64,67 @@ export interface RelayConversationsFrame {
 export interface RelayReadHistoryFrame {
 	readonly type: "read_history";
 	readonly requestId: string;
+	readonly endpoint: string;
 	readonly conversationId: string;
 	readonly limit?: number;
 	readonly beforeCursor?: number;
+}
+
+export interface RelayHistoryItem {
+	readonly cursor: number;
+	readonly message: AgentMessageV1;
+	readonly state: AgentMessageState;
+	readonly responseId?: string;
+	readonly updatedAt: string;
 }
 
 export interface RelayHistoryFrame {
 	readonly type: "history";
 	readonly requestId: string;
 	readonly conversationId: string;
-	readonly messages: readonly { readonly cursor: number; readonly message: AgentMessageV1 }[];
+	readonly messages: readonly RelayHistoryItem[];
+}
+
+export type RelaySessionQueryRequest =
+	| {
+			readonly type: "list_conversations";
+			readonly limit: number;
+			readonly beforeCursor: number;
+	  }
+	| {
+			readonly type: "read_history";
+			readonly conversationId: string;
+			readonly limit: number;
+			readonly beforeCursor: number;
+	  };
+
+export interface RelaySessionQueryFrame {
+	readonly type: "session_query";
+	readonly queryId: string;
+	readonly requesterEndpoint: string;
+	readonly request: RelaySessionQueryRequest;
+}
+
+export type RelaySessionQueryResult =
+	| {
+			readonly type: "conversations";
+			readonly conversations: readonly RelayConversationSummary[];
+	  }
+	| {
+			readonly type: "history";
+			readonly conversationId: string;
+			readonly messages: readonly RelayHistoryItem[];
+	  }
+	| {
+			readonly type: "error";
+			readonly code: string;
+			readonly message: string;
+	  };
+
+export interface RelaySessionResultFrame {
+	readonly type: "session_result";
+	readonly queryId: string;
+	readonly result: RelaySessionQueryResult;
 }
 
 export interface RelayAcceptedFrame {
@@ -109,6 +169,7 @@ export type RelayClientFrame =
 	| RelayListConversationsFrame
 	| RelayReadHistoryFrame
 	| RelaySendFrame
+	| RelaySessionResultFrame
 	| RelayAckFrame
 	| RelayPongFrame;
 
@@ -119,6 +180,7 @@ export type RelayServerFrame =
 	| RelayHistoryFrame
 	| RelayAcceptedFrame
 	| RelayDeliverFrame
+	| RelaySessionQueryFrame
 	| RelayPingFrame
 	| RelayErrorFrame;
 

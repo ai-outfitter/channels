@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
 	createServer as createHttpServer,
@@ -11,10 +11,11 @@ import { pathToFileURL } from "node:url";
 import { type AgentEndpoint, type AgentSendInput, validateIdentifier } from "../agent/types.ts";
 import {
 	parseRelayFrame,
+	RELAY_MAX_FRAME_BYTES,
 	RELAY_PROTOCOL_VERSION,
-	type RelayConversationSummary,
 	type RelayErrorFrame,
 	type RelayServerFrame,
+	type RelaySessionQueryRequest,
 } from "./protocol.ts";
 import { RelayStore } from "./store.ts";
 import { ServerWebSocket, websocketAccept } from "./websocket.ts";
@@ -35,6 +36,10 @@ export interface RelayServerConfig {
 	readonly tls?: { readonly key: string | Buffer; readonly cert: string | Buffer };
 	readonly allowInsecureLoopback?: boolean;
 	readonly heartbeatMs?: number;
+	readonly maintenanceMs?: number;
+	readonly maxConnections?: number;
+	readonly maxFramesPerWindow?: number;
+	readonly rateWindowMs?: number;
 	readonly logger?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -43,6 +48,15 @@ interface AuthenticatedConnection {
 	readonly credential: RelayCredential;
 	readonly endpoint: string;
 	lastPongAt: number;
+	lastIssuedCursor: number;
+}
+
+interface PendingQuery {
+	readonly requester: AuthenticatedConnection;
+	readonly targetEndpoint: string;
+	readonly requestId: string;
+	readonly request: RelaySessionQueryRequest;
+	readonly timer: ReturnType<typeof setTimeout>;
 }
 
 export interface RunningRelay {
@@ -55,6 +69,8 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 	const store = new RelayStore(config.storePath);
 	await store.initialize();
 	const connections = new Map<string, AuthenticatedConnection>();
+	const pendingQueries = new Map<string, PendingQuery>();
+	const websockets = new Set<ServerWebSocket>();
 	const log = config.logger ?? ((record) => console.error(JSON.stringify(record)));
 	const requestHandler = async (
 		request: IncomingMessage,
@@ -90,6 +106,11 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 			socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
 			return;
 		}
+		if (websockets.size >= (config.maxConnections ?? 1_000)) {
+			socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+			log({ event: "connection_rejected", code: "connection_limit" });
+			return;
+		}
 		socket.write(
 			[
 				"HTTP/1.1 101 Switching Protocols",
@@ -101,27 +122,58 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 			].join("\r\n"),
 		);
 		let connection: AuthenticatedConnection | undefined;
-		const websocket = new ServerWebSocket(
+		let handling = Promise.resolve();
+		let rateWindowStartedAt = Date.now();
+		let framesInWindow = 0;
+		let websocket: ServerWebSocket;
+		websocket = new ServerWebSocket(
 			socket,
 			head,
 			(text) => {
-				void handleText(text, websocket, connection, {
-					config,
-					store,
-					connections,
-					log,
-					setConnection(value) {
-						connection = value;
-					},
-				});
+				const now = Date.now();
+				if (now - rateWindowStartedAt >= (config.rateWindowMs ?? 60_000)) {
+					rateWindowStartedAt = now;
+					framesInWindow = 0;
+				}
+				framesInWindow += 1;
+				if (framesInWindow > (config.maxFramesPerWindow ?? 120)) {
+					log({
+						event: "request_rejected",
+						code: "rate_limited",
+						...(connection ? { endpoint: connection.endpoint } : {}),
+					});
+					sendError(websocket, "rate_limited", "request rate limit exceeded");
+					websocket.close(1008);
+					return;
+				}
+				handling = handling
+					.then(() =>
+						handleText(text, websocket, connection, {
+							config,
+							store,
+							connections,
+							pendingQueries,
+							log,
+							setConnection(value) {
+								connection = value;
+							},
+						}),
+					)
+					.catch(() => {
+						sendError(websocket, "invalid_request", "request was rejected");
+						websocket.close(1008);
+					});
 			},
 			() => {
+				websockets.delete(websocket);
+				if (connection) cancelQueriesFor(connection, pendingQueries);
 				if (connection && connections.get(connection.endpoint) === connection) {
 					connections.delete(connection.endpoint);
 					log({ event: "disconnected", endpoint: connection.endpoint });
 				}
 			},
 		);
+		websockets.add(websocket);
 	});
 
 	const heartbeatMs = config.heartbeatMs ?? 15_000;
@@ -137,6 +189,18 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 		}
 	}, heartbeatMs);
 	heartbeat.unref();
+	const maintenance = setInterval(
+		() => {
+			void store.pruneExpired().then(
+				(removed) => {
+					if (removed > 0) log({ event: "retention_pruned", messages: removed });
+				},
+				() => log({ event: "maintenance_failed", code: "storage_unavailable" }),
+			);
+		},
+		config.maintenanceMs ?? 60 * 60 * 1_000,
+	);
+	maintenance.unref();
 
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -151,10 +215,14 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 		url: `${scheme}://${formatHost(config.host)}:${address.port}/v1/connect`,
 		async close() {
 			clearInterval(heartbeat);
+			clearInterval(maintenance);
 			for (const connection of connections.values()) connection.socket.close(1001);
+			for (const pending of pendingQueries.values()) clearTimeout(pending.timer);
+			pendingQueries.clear();
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
+			store.close();
 		},
 	};
 }
@@ -163,6 +231,7 @@ interface HandlerContext {
 	readonly config: RelayServerConfig;
 	readonly store: RelayStore;
 	readonly connections: Map<string, AuthenticatedConnection>;
+	readonly pendingQueries: Map<string, PendingQuery>;
 	readonly log: (record: Readonly<Record<string, unknown>>) => void;
 	setConnection(connection: AuthenticatedConnection): void;
 }
@@ -181,7 +250,13 @@ async function handleText(
 		return;
 	}
 	if (!connection) {
-		await authenticate(frame, socket, context);
+		try {
+			await authenticate(frame, socket, context);
+		} catch {
+			context.log({ event: "authentication_failed" });
+			sendError(socket, "authentication_failed", "authentication failed");
+			socket.close(1008);
+		}
 		return;
 	}
 	try {
@@ -193,13 +268,30 @@ async function handleText(
 				await handleSend(frame, socket, connection, context);
 				break;
 			case "list_conversations":
-				await handleListConversations(frame, socket, connection, context);
+				handleSessionQuery(frame, connection, context);
 				break;
 			case "read_history":
-				await handleReadHistory(frame, socket, connection, context);
+				handleSessionQuery(frame, connection, context);
+				break;
+			case "session_result":
+				handleSessionResult(frame, connection, context);
 				break;
 			case "ack":
-				await context.store.acknowledge(connection.endpoint, requireCursor(frame.cursor));
+				{
+					const cursor = requireCursor(frame.cursor);
+					if (cursor > connection.lastIssuedCursor) {
+						throw new RelayProtocolError(
+							"invalid_cursor",
+							"cursor was not issued to this connection",
+						);
+					}
+					const acknowledged = await context.store.acknowledge(connection.endpoint, cursor);
+					context.log({
+						event: "acknowledged",
+						endpoint: connection.endpoint,
+						cursor: acknowledged,
+					});
+				}
 				break;
 			case "pong":
 				connection.lastPongAt = Date.now();
@@ -248,14 +340,21 @@ async function authenticate(
 		return;
 	}
 	validateIdentifier(endpoint, "endpoint id");
-	const cursor = requireCursor(frame.cursor);
+	const requestedCursor = requireCursor(frame.cursor);
 	const previous = context.connections.get(endpoint);
+	if (previous && requestedCursor !== previous.lastIssuedCursor) {
+		sendError(socket, "stale_resume", "registration resume cursor is stale");
+		socket.close(1008);
+		return;
+	}
+	const cursor = await context.store.resume(endpoint, requestedCursor);
 	if (previous) previous.socket.close(1008);
 	const connection: AuthenticatedConnection = {
 		socket,
 		credential,
 		endpoint,
 		lastPongAt: Date.now(),
+		lastIssuedCursor: cursor,
 	};
 	context.connections.set(endpoint, connection);
 	context.setConnection(connection);
@@ -267,6 +366,7 @@ async function authenticate(
 			cursor: pending.cursor,
 			message: pending.message,
 		} satisfies RelayServerFrame);
+		connection.lastIssuedCursor = pending.cursor;
 	}
 }
 
@@ -314,7 +414,7 @@ async function handleSend(
 		type: "accepted",
 		requestId,
 		message: accepted.message,
-		state: "accepted",
+		state: accepted.state,
 		duplicate: accepted.duplicate,
 	} satisfies RelayServerFrame);
 	context.log({
@@ -328,69 +428,115 @@ async function handleSend(
 		duplicate: accepted.duplicate,
 	});
 	const recipient = context.connections.get(accepted.message.recipient);
-	recipient?.socket.send({
-		type: "deliver",
-		cursor: accepted.cursor,
-		message: accepted.message,
-	} satisfies RelayServerFrame);
-}
-
-async function handleListConversations(
-	frame: Record<string, unknown>,
-	socket: ServerWebSocket,
-	connection: AuthenticatedConnection,
-	context: HandlerContext,
-): Promise<void> {
-	const requestId = requireRequestId(frame.requestId);
-	const allowed = authorizedMessages(await context.store.history(), connection.credential);
-	const summaries = new Map<string, RelayConversationSummary>();
-	for (const entry of allowed) {
-		const previous = summaries.get(entry.message.conversationId);
-		const participants = new Set(previous?.participants ?? []);
-		participants.add(entry.message.sender);
-		participants.add(entry.message.recipient);
-		summaries.set(entry.message.conversationId, {
-			id: entry.message.conversationId,
-			updatedAt:
-				!previous || entry.message.createdAt > previous.updatedAt
-					? entry.message.createdAt
-					: previous.updatedAt,
-			participants: [...participants].sort(),
-		});
+	if (recipient && accepted.queued) {
+		recipient.socket.send({
+			type: "deliver",
+			cursor: accepted.cursor,
+			message: accepted.message,
+		} satisfies RelayServerFrame);
+		recipient.lastIssuedCursor = Math.max(recipient.lastIssuedCursor, accepted.cursor);
 	}
-	socket.send({
-		type: "conversations",
-		requestId,
-		conversations: [...summaries.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
-	} satisfies RelayServerFrame);
 }
 
-async function handleReadHistory(
+function handleSessionQuery(
 	frame: Record<string, unknown>,
-	socket: ServerWebSocket,
 	connection: AuthenticatedConnection,
 	context: HandlerContext,
-): Promise<void> {
+): void {
 	const requestId = requireRequestId(frame.requestId);
-	if (typeof frame.conversationId !== "string") throw new Error("conversation id is required");
-	const conversationId = validateIdentifier(frame.conversationId, "conversation id");
-	const limit =
-		frame.limit === undefined ? 50 : requireInteger(frame.limit, "history limit", 1, 50);
-	const beforeCursor =
-		frame.beforeCursor === undefined
-			? Number.MAX_SAFE_INTEGER
-			: requireInteger(frame.beforeCursor, "history cursor", 1, Number.MAX_SAFE_INTEGER);
-	const messages = authorizedMessages(await context.store.history(), connection.credential)
-		.filter(
-			(entry) => entry.message.conversationId === conversationId && entry.cursor < beforeCursor,
-		)
-		.slice(-limit);
-	socket.send({
-		type: "history",
+	if (typeof frame.endpoint !== "string") throw new Error("target endpoint is required");
+	const targetEndpoint = validateIdentifier(frame.endpoint, "endpoint id");
+	if (!canRouteQuery(connection.credential, targetEndpoint)) {
+		throw new RelayProtocolError("route_forbidden", "session query route is not authorized");
+	}
+	const target = context.connections.get(targetEndpoint);
+	if (!target) throw new RelayProtocolError("target_offline", "target agent is not connected");
+	const request = parseSessionQueryRequest(frame);
+	const queryId = randomUUID();
+	const timer = setTimeout(() => {
+		const pending = context.pendingQueries.get(queryId);
+		if (!pending) return;
+		context.pendingQueries.delete(queryId);
+		sendError(pending.requester.socket, "query_timeout", "target agent did not answer", requestId);
+	}, 10_000);
+	timer.unref();
+	context.pendingQueries.set(queryId, {
+		requester: connection,
+		targetEndpoint,
 		requestId,
-		conversationId,
-		messages,
+		request,
+		timer,
+	});
+	target.socket.send({
+		type: "session_query",
+		queryId,
+		requesterEndpoint: connection.endpoint,
+		request,
 	} satisfies RelayServerFrame);
+	context.log({
+		event: "session_query_routed",
+		endpoint: connection.endpoint,
+		targetEndpoint,
+		queryId,
+	});
+}
+
+function handleSessionResult(
+	frame: Record<string, unknown>,
+	connection: AuthenticatedConnection,
+	context: HandlerContext,
+): void {
+	if (typeof frame.queryId !== "string") throw new Error("query id is required");
+	const queryId = validateIdentifier(frame.queryId, "query id");
+	const pending = context.pendingQueries.get(queryId);
+	if (!pending || pending.targetEndpoint !== connection.endpoint) {
+		throw new RelayProtocolError("unknown_query", "session query is not pending for this endpoint");
+	}
+	if (!frame.result || typeof frame.result !== "object" || Array.isArray(frame.result)) {
+		throw new Error("invalid session query result");
+	}
+	if (frameBytes(frame) > RELAY_MAX_FRAME_BYTES) {
+		throw new RelayProtocolError(
+			"response_too_large",
+			"session query response exceeds frame limit",
+		);
+	}
+	const result = frame.result as Record<string, unknown>;
+	context.pendingQueries.delete(queryId);
+	clearTimeout(pending.timer);
+	if (result.type === "error") {
+		sendError(
+			pending.requester.socket,
+			typeof result.code === "string" ? result.code : "query_failed",
+			typeof result.message === "string" ? result.message : "target agent rejected query",
+			pending.requestId,
+		);
+		return;
+	}
+	if (result.type === "conversations" && Array.isArray(result.conversations)) {
+		pending.requester.socket.send({
+			type: "conversations",
+			requestId: pending.requestId,
+			conversations: result.conversations,
+		} satisfies RelayServerFrame);
+		return;
+	}
+	if (
+		result.type === "history" &&
+		typeof result.conversationId === "string" &&
+		Array.isArray(result.messages) &&
+		pending.request.type === "read_history" &&
+		result.conversationId === pending.request.conversationId
+	) {
+		pending.requester.socket.send({
+			type: "history",
+			requestId: pending.requestId,
+			conversationId: result.conversationId,
+			messages: result.messages,
+		} satisfies RelayServerFrame);
+		return;
+	}
+	throw new Error("invalid session query result");
 }
 
 function sendError(
@@ -407,6 +553,67 @@ function sendError(
 	} satisfies RelayErrorFrame);
 }
 
+function frameBytes(frame: unknown): number {
+	return Buffer.byteLength(JSON.stringify(frame));
+}
+
+function parseSessionQueryRequest(frame: Record<string, unknown>): RelaySessionQueryRequest {
+	const beforeCursor =
+		frame.beforeCursor === undefined
+			? Number.MAX_SAFE_INTEGER
+			: requireInteger(frame.beforeCursor, "session cursor", 1, Number.MAX_SAFE_INTEGER);
+	if (frame.type === "list_conversations") {
+		return {
+			type: "list_conversations",
+			limit:
+				frame.limit === undefined ? 50 : requireInteger(frame.limit, "conversation limit", 1, 100),
+			beforeCursor,
+		};
+	}
+	if (frame.type === "read_history") {
+		if (typeof frame.conversationId !== "string") {
+			throw new Error("conversation id is required");
+		}
+		return {
+			type: "read_history",
+			conversationId: validateIdentifier(frame.conversationId, "conversation id"),
+			limit: frame.limit === undefined ? 50 : requireInteger(frame.limit, "history limit", 1, 50),
+			beforeCursor,
+		};
+	}
+	throw new Error("unsupported session query");
+}
+
+function canRouteQuery(credential: RelayCredential, endpoint: string): boolean {
+	return (
+		credential.send.includes("*") ||
+		credential.send.includes(endpoint) ||
+		credential.list?.includes("*") === true ||
+		credential.list?.includes(endpoint) === true
+	);
+}
+
+function cancelQueriesFor(
+	connection: AuthenticatedConnection,
+	pendingQueries: Map<string, PendingQuery>,
+): void {
+	for (const [queryId, pending] of pendingQueries) {
+		if (pending.requester !== connection && pending.targetEndpoint !== connection.endpoint) {
+			continue;
+		}
+		pendingQueries.delete(queryId);
+		clearTimeout(pending.timer);
+		if (pending.targetEndpoint === connection.endpoint && pending.requester !== connection) {
+			sendError(
+				pending.requester.socket,
+				"target_disconnected",
+				"target agent disconnected",
+				pending.requestId,
+			);
+		}
+	}
+}
+
 function findCredential(
 	credentials: readonly RelayCredential[],
 	token: string,
@@ -416,20 +623,6 @@ function findCredential(
 		const expected = Buffer.from(credential.token);
 		return expected.length === candidate.length && timingSafeEqual(expected, candidate);
 	});
-}
-
-function authorizedMessages(
-	messages: Awaited<ReturnType<RelayStore["history"]>>,
-	credential: RelayCredential,
-): Awaited<ReturnType<RelayStore["history"]>> {
-	const owned = new Set(credential.register);
-	const visible = new Set([...credential.register, ...credential.send, ...(credential.list ?? [])]);
-	const wildcard = visible.has("*");
-	return messages.filter(
-		(entry) =>
-			(owned.has(entry.message.sender) && (wildcard || visible.has(entry.message.recipient))) ||
-			(owned.has(entry.message.recipient) && (wildcard || visible.has(entry.message.sender))),
-	);
 }
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup validation enumerates independent fail-closed checks
@@ -444,14 +637,54 @@ function validateServerConfig(config: RelayServerConfig): void {
 			throw new Error("TLS is required except for explicitly enabled loopback development");
 		}
 	}
+	requireConfiguredInteger(config.heartbeatMs, "heartbeat interval", 10, 60 * 60 * 1_000);
+	requireConfiguredInteger(config.maintenanceMs, "maintenance interval", 100, 24 * 60 * 60 * 1_000);
+	requireConfiguredInteger(config.maxConnections, "connection limit", 1, 100_000);
+	requireConfiguredInteger(config.maxFramesPerWindow, "frame rate limit", 1, 1_000_000);
+	requireConfiguredInteger(config.rateWindowMs, "rate window", 100, 60 * 60 * 1_000);
+	const tokens = new Set<string>();
+	const endpointOwners = new Map<string, string>();
 	for (const credential of config.credentials) {
 		if (!credential.token) throw new Error("relay credential token is required");
+		if (tokens.has(credential.token)) throw new Error("relay credential tokens must be unique");
+		tokens.add(credential.token);
 		validateIdentifier(credential.principal, "principal id");
-		for (const endpoint of credential.register) validateIdentifier(endpoint, "endpoint id");
+		for (const endpoint of credential.register) {
+			validateIdentifier(endpoint, "endpoint id");
+			const owner = endpointOwners.get(endpoint);
+			if (owner && owner !== credential.principal) {
+				throw new Error(`endpoint "${endpoint}" has multiple credential owners`);
+			}
+			endpointOwners.set(endpoint, credential.principal);
+		}
 		for (const endpoint of credential.send) {
 			if (endpoint !== "*") validateIdentifier(endpoint, "endpoint id");
 		}
+		for (const endpoint of credential.list ?? []) {
+			if (endpoint !== "*") validateIdentifier(endpoint, "endpoint id");
+		}
+		const visible = [
+			...new Set([...credential.register, ...credential.send, ...(credential.list ?? [])]),
+		].filter((endpoint) => endpoint !== "*");
+		const discoveryProbe = {
+			type: "endpoints",
+			requestId: "x".repeat(128),
+			endpoints: visible.map((id) => ({ id, principal: endpointOwners.get(id) ?? id })),
+		};
+		if (frameBytes(discoveryProbe) > RELAY_MAX_FRAME_BYTES) {
+			throw new Error(`credential for "${credential.principal}" has too many visible endpoints`);
+		}
 	}
+}
+
+function requireConfiguredInteger(
+	value: number | undefined,
+	label: string,
+	minimum: number,
+	maximum: number,
+): void {
+	if (value === undefined) return;
+	requireInteger(value, label, minimum, maximum);
 }
 
 function requireRequestId(value: unknown): string {
@@ -518,6 +751,9 @@ async function configFromEnv(): Promise<RelayServerConfig> {
 		keyPath && certPath
 			? { key: await readFile(keyPath), cert: await readFile(certPath) }
 			: undefined;
+	const maxConnections = optionalIntegerEnv("AGENT_RELAY_MAX_CONNECTIONS");
+	const maxFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_FRAMES_PER_WINDOW");
+	const rateWindowMs = optionalIntegerEnv("AGENT_RELAY_RATE_WINDOW_MS");
 	return {
 		host,
 		port,
@@ -525,7 +761,18 @@ async function configFromEnv(): Promise<RelayServerConfig> {
 		credentials: credentialsDocument.credentials,
 		...(tls ? { tls } : {}),
 		allowInsecureLoopback: process.env.AGENT_RELAY_ALLOW_INSECURE === "1",
+		...(maxConnections === undefined ? {} : { maxConnections }),
+		...(maxFramesPerWindow === undefined ? {} : { maxFramesPerWindow }),
+		...(rateWindowMs === undefined ? {} : { rateWindowMs }),
 	};
+}
+
+function optionalIntegerEnv(name: string): number | undefined {
+	const value = process.env[name]?.trim();
+	if (!value) return undefined;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be an integer`);
+	return parsed;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

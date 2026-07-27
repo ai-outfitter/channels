@@ -1,20 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
 	chmod,
+	link,
 	mkdir,
 	open,
 	readdir,
 	readFile,
 	rename,
+	rmdir,
 	stat,
 	unlink,
-	writeFile,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { AgentSessionJournal } from "./journal.ts";
 import {
-	AGENT_MAX_CONTEXT_BYTES,
-	AGENT_MAX_CONTEXT_MESSAGES,
 	AGENT_MAX_PENDING_MESSAGES,
 	AGENT_PROTOCOL_VERSION,
 	type AgentEndpoint,
@@ -24,9 +24,6 @@ import {
 	type AgentSendInput,
 	type AgentSendResult,
 	type AgentTransport,
-	advanceState,
-	compareMessages,
-	type StoredAgentMessage,
 	validateBody,
 	validateIdentifier,
 	validateMessage,
@@ -41,14 +38,18 @@ export interface FilesystemAgentConfig {
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
+const LOCK_STALE_MS = 30_000;
+const LOCK_RETRY_MS = 10;
 
 export class FilesystemAgentTransport implements AgentTransport {
 	readonly endpoint: AgentEndpoint;
 	readonly #root: string;
 	readonly #pollMs: number;
+	readonly #journal: AgentSessionJournal;
+	#initialization: Promise<void> | undefined;
 	#closed = false;
 
-	constructor(config: FilesystemAgentConfig) {
+	constructor(config: FilesystemAgentConfig, journal = new AgentSessionJournal()) {
 		if (!config.root) throw new Error("agent spool path is required");
 		const id = validateIdentifier(config.endpointId, "endpoint id");
 		this.endpoint = {
@@ -57,13 +58,29 @@ export class FilesystemAgentTransport implements AgentTransport {
 		};
 		this.#root = config.root;
 		this.#pollMs = config.pollMs ?? 250;
+		this.#journal = journal;
 	}
 
 	async initialize(): Promise<void> {
-		await ensureDirectory(this.#root);
-		await ensureDirectory(this.#endpointsRoot());
-		await ensureDirectory(this.#inbox(this.endpoint.id));
-		await atomicJson(this.#endpointMetadata(this.endpoint.id), this.endpoint);
+		if (this.#closed) throw new Error("agent transport is closed");
+		this.#initialization ??= (async () => {
+			await ensureDirectory(this.#root);
+			await ensureDirectory(this.#endpointsRoot());
+			await ensureDirectory(this.#inbox(this.endpoint.id));
+			const metadata = this.#endpointMetadata(this.endpoint.id);
+			await withDirectoryLock(`${metadata}.lock`, async () => {
+				const existing = await optionalJson<AgentEndpoint>(metadata);
+				if (existing) {
+					if (existing.id !== this.endpoint.id || existing.principal !== this.endpoint.principal) {
+						throw new Error(`endpoint "${this.endpoint.id}" is already registered`);
+					}
+					return;
+				}
+				await atomicJson(metadata, this.endpoint, true);
+			});
+			await this.#queuedMessages(this.endpoint.id);
+		})();
+		await this.#initialization;
 	}
 
 	async list(): Promise<readonly AgentEndpoint[]> {
@@ -88,6 +105,11 @@ export class FilesystemAgentTransport implements AgentTransport {
 		await this.initialize();
 		const recipient = validateIdentifier(input.recipient, "recipient");
 		const id = validateIdentifier(input.id ?? randomUUID(), "message id");
+		const recorded = this.#journal.message(id);
+		if (recorded) {
+			assertSameSend(recorded.message, this.endpoint.id, input);
+			return { message: recorded.message, state: recorded.state, duplicate: true };
+		}
 		const message = validateMessage({
 			version: AGENT_PROTOCOL_VERSION,
 			id,
@@ -101,59 +123,55 @@ export class FilesystemAgentTransport implements AgentTransport {
 				: { replyTo: validateIdentifier(input.replyTo, "reply target") }),
 		});
 		await ensureDirectory(this.#inbox(recipient));
-		const path = this.#messagePath(recipient, id);
-		const existing = await optionalJson<StoredAgentMessage>(path);
-		if (existing) {
-			if (!sameImmutableMessage(existing.message, message)) {
-				throw new Error(`message id "${id}" already exists with different content`);
+		return withDirectoryLock(join(this.#inbox(recipient), ".queue-lock"), async () => {
+			const path = this.#messagePath(recipient, id);
+			const existing = await optionalJson<{
+				readonly version: 1;
+				readonly message: AgentMessageV1;
+			}>(path);
+			if (existing) {
+				const existingMessage = validateMessage(existing.message);
+				if (!sameImmutableMessage(existingMessage, message)) {
+					throw new Error(`message id "${id}" already exists with different content`);
+				}
+				const stored = this.#journal.recordMessage(existingMessage, "accepted");
+				return { message: stored.message, state: stored.state, duplicate: true };
 			}
-			return { message: existing.message, state: existing.state, duplicate: true };
-		}
-		const pending = await this.#storedMessages(recipient);
-		if (
-			pending.filter((item) => item.state !== "handled" && item.state !== "replied").length >=
-			AGENT_MAX_PENDING_MESSAGES
-		) {
-			throw new Error(`recipient queue is full (${AGENT_MAX_PENDING_MESSAGES})`);
-		}
-		const stored: StoredAgentMessage = {
-			message,
-			state: "accepted",
-			updatedAt: new Date().toISOString(),
-		};
-		try {
-			await atomicJson(path, stored, true);
-			return { message, state: "accepted", duplicate: false };
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const raced = await readJson<StoredAgentMessage>(path);
-			if (!sameImmutableMessage(raced.message, message)) {
-				throw new Error(`message id "${id}" already exists with different content`);
+			const pending = await this.#queuedMessages(recipient);
+			if (pending.length >= AGENT_MAX_PENDING_MESSAGES) {
+				throw new Error(`recipient queue is full (${AGENT_MAX_PENDING_MESSAGES})`);
 			}
-			return { message: raced.message, state: raced.state, duplicate: true };
-		}
+			await atomicJson(path, { version: 1, message }, true);
+			const stored = this.#journal.recordMessage(message, "accepted");
+			return { message: stored.message, state: stored.state, duplicate: false };
+		});
 	}
 
 	async read(messageId: string): Promise<AgentReadResult> {
 		await this.initialize();
 		const id = validateIdentifier(messageId, "message id");
-		const targetPath = this.#messagePath(this.endpoint.id, id);
-		const target = await readJson<StoredAgentMessage>(targetPath);
-		validateMessage(target.message);
-		const updated = await this.#update(targetPath, target, "read");
-		const conversation = (await this.#storedMessages(this.endpoint.id))
-			.filter((entry) => entry.message.conversationId === target.message.conversationId)
-			.sort(compareMessages);
-		return { target: updated, messages: boundedContext(conversation, id) };
+		const target = await this.#receive(id);
+		if (!target || target.message.recipient !== this.endpoint.id) {
+			throw new Error("agent message was not delivered to this endpoint");
+		}
+		const updated =
+			target.state === "accepted" || target.state === "delivered"
+				? this.#journal.transition(id, "read")
+				: target;
+		return { target: updated, messages: this.#journal.context(id) };
 	}
 
 	async respond(messageId: string, response: string): Promise<AgentRespondResult> {
 		await this.initialize();
 		const id = validateIdentifier(messageId, "message id");
-		const targetPath = this.#messagePath(this.endpoint.id, id);
-		const target = await readJson<StoredAgentMessage>(targetPath);
-		validateMessage(target.message);
+		const target = await this.#receive(id);
+		if (!target || target.message.recipient !== this.endpoint.id) {
+			throw new Error("agent message was not delivered to this endpoint");
+		}
 		const responseId = stableResponseId(this.endpoint.id, id, validateBody(response));
+		if (target.responseId && target.responseId !== responseId) {
+			throw new Error("agent message already has a different response");
+		}
 		const sent = await this.send({
 			id: responseId,
 			recipient: target.message.sender,
@@ -161,23 +179,20 @@ export class FilesystemAgentTransport implements AgentTransport {
 			body: response,
 			replyTo: id,
 		});
-		const updated = await this.#update(targetPath, target, "replied", responseId);
+		const updated =
+			target.state === "replied" ? target : this.#journal.transition(id, "replied", responseId);
 		return { target: updated, response: sent };
 	}
 
 	async subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>> {
 		await this.initialize();
-		const seen = new Set<string>();
 		const controller = new AbortController();
 		const scan = async (): Promise<void> => {
-			for (const item of await this.#storedMessages(this.endpoint.id)) {
-				if (item.state === "handled" || item.state === "replied" || seen.has(item.message.id)) {
-					continue;
-				}
-				seen.add(item.message.id);
-				const path = this.#messagePath(this.endpoint.id, item.message.id);
-				await this.#update(path, item, "delivered");
-				onMessage(item.message.id);
+			for (const message of await this.#queuedMessages(this.endpoint.id)) {
+				const path = this.#messagePath(this.endpoint.id, message.id);
+				const stored = this.#journal.recordMessage(message, "delivered");
+				await durableUnlink(path);
+				onMessage(stored.message.id);
 			}
 		};
 		await scan();
@@ -201,7 +216,7 @@ export class FilesystemAgentTransport implements AgentTransport {
 		this.#closed = true;
 	}
 
-	async #storedMessages(endpoint: string): Promise<StoredAgentMessage[]> {
+	async #queuedMessages(endpoint: string): Promise<AgentMessageV1[]> {
 		const inbox = this.#inbox(endpoint);
 		let names: string[];
 		try {
@@ -210,36 +225,41 @@ export class FilesystemAgentTransport implements AgentTransport {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 			throw error;
 		}
-		const messages: StoredAgentMessage[] = [];
+		const messages: AgentMessageV1[] = [];
 		for (const name of names) {
 			if (!name.endsWith(".json")) continue;
 			try {
-				const stored = await readJson<StoredAgentMessage>(join(inbox, name));
-				validateMessage(stored.message);
-				messages.push(stored);
+				const envelope = await readJson<{ readonly version: 1; readonly message: AgentMessageV1 }>(
+					join(inbox, name),
+				);
+				if (envelope.version !== 1) continue;
+				const message = validateMessage(envelope.message);
+				if (message.recipient !== endpoint) continue;
+				messages.push(message);
 			} catch {
 				// Atomic writes prevent partial JSON. Ignore corrupt administrator-owned files.
 			}
 		}
-		return messages;
+		return messages.sort(
+			(a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+		);
 	}
 
-	async #update(
-		path: string,
-		current: StoredAgentMessage,
-		state: StoredAgentMessage["state"],
-		responseId?: string,
-	): Promise<StoredAgentMessage> {
-		const latest = (await optionalJson<StoredAgentMessage>(path)) ?? current;
-		const chosenResponseId = latest.responseId ?? responseId;
-		const updated: StoredAgentMessage = {
-			message: latest.message,
-			state: advanceState(latest.state, state),
-			updatedAt: new Date().toISOString(),
-			...(chosenResponseId ? { responseId: chosenResponseId } : {}),
-		};
-		await atomicJson(path, updated);
-		return updated;
+	async #receive(messageId: string) {
+		const recorded = this.#journal.message(messageId);
+		if (recorded) return recorded;
+		const path = this.#messagePath(this.endpoint.id, messageId);
+		const envelope = await readJson<{ readonly version: 1; readonly message: AgentMessageV1 }>(
+			path,
+		);
+		if (envelope.version !== 1) throw new Error("unsupported agent delivery envelope");
+		const message = validateMessage(envelope.message);
+		if (message.recipient !== this.endpoint.id) {
+			throw new Error("agent message was not delivered to this endpoint");
+		}
+		const stored = this.#journal.recordMessage(message, "delivered");
+		await durableUnlink(path);
+		return stored;
 	}
 
 	#endpointsRoot(): string {
@@ -280,10 +300,10 @@ async function atomicJson(path: string, value: unknown, exclusive = false): Prom
 	}
 	try {
 		if (exclusive) {
-			await writeFile(path, content, { flag: "wx", mode: FILE_MODE });
-			const final = await open(path, "r");
-			await final.sync();
-			await final.close();
+			// A hard link publishes the already-fsynced temporary inode without
+			// overwriting a raced writer and without exposing a partially written
+			// final path.
+			await link(temporary, path);
 			await unlink(temporary);
 		} else {
 			await rename(temporary, path);
@@ -294,6 +314,45 @@ async function atomicJson(path: string, value: unknown, exclusive = false): Prom
 	} catch (error) {
 		await unlink(temporary).catch(() => {});
 		throw error;
+	}
+}
+
+async function durableUnlink(path: string): Promise<void> {
+	try {
+		await unlink(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	const directory = await open(dirname(path), "r");
+	try {
+		await directory.sync();
+	} finally {
+		await directory.close();
+	}
+}
+
+async function withDirectoryLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
+	const deadline = Date.now() + LOCK_STALE_MS;
+	while (true) {
+		try {
+			await mkdir(lockPath, { mode: DIRECTORY_MODE });
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const info = await stat(lockPath).catch(() => undefined);
+			if (info && Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+				await rmdir(lockPath).catch(() => {});
+				continue;
+			}
+			if (Date.now() >= deadline) throw new Error(`timed out waiting for lock ${lockPath}`);
+			await delay(LOCK_RETRY_MS);
+		}
+	}
+	try {
+		return await operation();
+	} finally {
+		await rmdir(lockPath).catch(() => {});
 	}
 }
 
@@ -322,23 +381,16 @@ function sameImmutableMessage(a: AgentMessageV1, b: AgentMessageV1): boolean {
 	);
 }
 
-function boundedContext(
-	messages: readonly StoredAgentMessage[],
-	targetId: string,
-): readonly StoredAgentMessage[] {
-	const targetIndex = messages.findIndex((item) => item.message.id === targetId);
-	const start = Math.max(0, targetIndex - AGENT_MAX_CONTEXT_MESSAGES + 1);
-	const selected: StoredAgentMessage[] = [];
-	let bytes = 0;
-	for (let index = targetIndex; index >= start; index -= 1) {
-		const item = messages[index];
-		if (!item) continue;
-		const size = Buffer.byteLength(item.message.body);
-		if (selected.length > 0 && bytes + size > AGENT_MAX_CONTEXT_BYTES) break;
-		selected.unshift(item);
-		bytes += size;
+function assertSameSend(message: AgentMessageV1, sender: string, input: AgentSendInput): void {
+	if (
+		message.sender !== sender ||
+		message.recipient !== input.recipient ||
+		message.conversationId !== input.conversationId ||
+		message.body !== input.body ||
+		message.replyTo !== input.replyTo
+	) {
+		throw new Error(`message id "${message.id}" already exists with different content`);
 	}
-	return selected;
 }
 
 function stableResponseId(endpoint: string, messageId: string, response: string): string {

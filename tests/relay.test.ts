@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WebSocket } from "undici";
+import { AgentSessionJournal } from "../extensions/agent/journal.ts";
 import { RelayAgentTransport } from "../extensions/agent/relay.ts";
 import { type RelayCredential, startRelayServer } from "../extensions/relay/server.ts";
+import { RelayStore } from "../extensions/relay/store.ts";
 
 interface Frame {
 	readonly type: string;
@@ -52,6 +54,25 @@ class TestClient {
 		if (existing) return Promise.resolve(existing);
 		return new Promise((resolve) => {
 			this.#waiters.push({ predicate, resolve });
+		});
+	}
+
+	async expectNone(predicate: (frame: Frame) => boolean, durationMs = 50): Promise<void> {
+		const existing = this.#frames.find(predicate);
+		if (existing) throw new Error(`unexpected frame: ${JSON.stringify(existing)}`);
+		await new Promise<void>((resolve, reject) => {
+			const waiter = {
+				predicate,
+				resolve(frame: Frame) {
+					reject(new Error(`unexpected frame: ${JSON.stringify(frame)}`));
+				},
+			};
+			this.#waiters.push(waiter);
+			setTimeout(() => {
+				const index = this.#waiters.indexOf(waiter);
+				if (index >= 0) this.#waiters.splice(index, 1);
+				resolve();
+			}, durationMs);
 		});
 	}
 
@@ -105,6 +126,37 @@ test("relay requires TLS outside explicit loopback development", async () => {
 		}),
 		/TLS is required/,
 	);
+});
+
+test("relay store durably queues only unacked bodies and keeps body-free retry metadata", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-store-"));
+	const path = join(root, "relay.json");
+	const store = new RelayStore(path);
+	try {
+		const accepted = await store.accept("alice-web", {
+			id: "compact-me",
+			recipient: "bob-agent",
+			conversationId: "delivery-only",
+			body: "body removed after ack",
+		});
+		assert.match(await readFile(path, "utf8"), /body removed after ack/);
+		await Promise.all([store.ready(), store.acknowledge("bob-agent", accepted.cursor)]);
+		const persisted = await readFile(path, "utf8");
+		assert.doesNotMatch(persisted, /body removed after ack/);
+		assert.equal((await store.pending("bob-agent", 0)).length, 0);
+		const duplicate = await store.accept("alice-web", {
+			id: "compact-me",
+			recipient: "bob-agent",
+			conversationId: "delivery-only",
+			body: "body removed after ack",
+		});
+		assert.equal(duplicate.duplicate, true);
+		assert.equal(duplicate.queued, false);
+		assert.equal(duplicate.message.createdAt, accepted.message.createdAt);
+	} finally {
+		store.close();
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("relay authenticates routes, persists offline messages, resumes cursors, and redacts logs", async () => {
@@ -187,6 +239,22 @@ test("relay authenticates routes, persists offline messages, resumes cursors, an
 		assert.equal((firstDelivery.message as { id: string }).id, "message-1");
 		const firstCursor = firstDelivery.cursor as number;
 		bob.send({ type: "ack", cursor: firstCursor });
+		await waitFor(async () => !(await readFile(storePath, "utf8")).includes("private first body"));
+		alice.send({
+			type: "send",
+			requestId: "duplicate-after-ack",
+			input: {
+				id: "message-1",
+				recipient: "bob-agent",
+				conversationId: "conversation-1",
+				body: "private first body",
+			},
+		});
+		assert.equal(
+			(await alice.next((frame) => frame.requestId === "duplicate-after-ack")).duplicate,
+			true,
+		);
+		await bob.expectNone((frame) => frame.type === "deliver");
 		bob.close();
 
 		alice.send({
@@ -200,24 +268,6 @@ test("relay authenticates routes, persists offline messages, resumes cursors, an
 			},
 		});
 		await alice.next((frame) => frame.requestId === "send-2");
-		alice.send({ type: "list_conversations", requestId: "conversations-1" });
-		const conversations = await alice.next((frame) => frame.requestId === "conversations-1");
-		assert.deepEqual(
-			(conversations.conversations as Array<{ id: string }>).map((item) => item.id),
-			["conversation-1"],
-		);
-		alice.send({
-			type: "read_history",
-			requestId: "history-1",
-			conversationId: "conversation-1",
-			limit: 1,
-		});
-		const history = await alice.next((frame) => frame.requestId === "history-1");
-		assert.equal((history.messages as unknown[]).length, 1);
-		assert.equal(
-			(history.messages as Array<{ message: { id: string } }>)[0]?.message.id,
-			"message-2",
-		);
 
 		await relay.close();
 		alice.close();
@@ -279,20 +329,22 @@ test("WSS client transport satisfies the same two-agent read/respond contract", 
 		allowInsecureLoopback: true,
 		logger: () => {},
 	});
+	const bobJournal = new AgentSessionJournal();
 	const alice = new RelayAgentTransport({
 		url: relay.url,
 		token: "alice-secret",
 		endpointId: "alice-web",
 		principalId: "operator:alice",
-		statePath: join(root, "alice-state.json"),
 	});
-	const bob = new RelayAgentTransport({
-		url: relay.url,
-		token: "bob-secret",
-		endpointId: "bob-agent",
-		principalId: "agent:bob",
-		statePath: join(root, "bob-state.json"),
-	});
+	const bob = new RelayAgentTransport(
+		{
+			url: relay.url,
+			token: "bob-secret",
+			endpointId: "bob-agent",
+			principalId: "agent:bob",
+		},
+		bobJournal,
+	);
 	try {
 		let receiveBob = (_id: string): void => {};
 		const bobDelivery = new Promise<string>((resolve) => {
@@ -318,6 +370,31 @@ test("WSS client transport satisfies the same two-agent read/respond contract", 
 		assert.equal(await bobDelivery, "client-request");
 		assert.equal((await bob.read("client-request")).target.state, "read");
 		const response = await bob.respond("client-request", "transport contract response");
+		bobJournal.recordMessage(
+			{
+				version: 1,
+				id: "private-to-bob",
+				conversationId: "not-alices-conversation",
+				sender: "mallory-agent",
+				recipient: "bob-agent",
+				createdAt: "2026-07-26T12:00:00.000Z",
+				body: "must not leak to Alice",
+			},
+			"delivered",
+		);
+		assert.deepEqual(
+			(await alice.listConversations("bob-agent")).map((conversation) => conversation.id),
+			["client-contract"],
+		);
+		const history = await alice.readHistory("bob-agent", "client-contract");
+		assert.deepEqual(
+			history.map((item) => item.message.id),
+			["client-request", response.response.message.id],
+		);
+		await assert.rejects(
+			alice.readHistory("bob-agent", "not-alices-conversation"),
+			/session query was rejected/,
+		);
 		assert.equal(await aliceDelivery, response.response.message.id);
 		assert.equal(
 			(await alice.read(response.response.message.id)).target.message.body,
@@ -330,3 +407,11 @@ test("WSS client transport satisfies the same two-agent read/respond contract", 
 		await rm(root, { recursive: true, force: true });
 	}
 });
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!(await predicate())) {
+		if (Date.now() >= deadline) throw new Error("timed out waiting for relay state");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}

@@ -7,6 +7,7 @@ export const AGENT_MAX_CONTEXT_MESSAGES = 50;
 export const AGENT_MAX_CONTEXT_BYTES = 256 * 1024;
 export const AGENT_MAX_PENDING_MESSAGES = 1_000;
 export const AGENT_MAX_LOCATOR_LENGTH = 512;
+export const AGENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/;
 
