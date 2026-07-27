@@ -166,6 +166,23 @@ export class AgentSessionJournal {
 		return this.#messages.get(validateIdentifier(messageId, "message id"))?.stored;
 	}
 
+	/**
+	 * Messages delivered to `endpoint` that are still awaiting a reply
+	 * (`delivered` or `read`), oldest first. Used to correlate streaming
+	 * previews with the message currently being answered.
+	 */
+	openTargets(endpoint: string): readonly StoredAgentMessage[] {
+		const id = validateIdentifier(endpoint, "endpoint id");
+		return [...this.#messages.values()]
+			.filter(
+				(item) =>
+					item.stored.message.recipient === id &&
+					(item.stored.state === "delivered" || item.stored.state === "read"),
+			)
+			.sort((a, b) => a.cursor - b.cursor)
+			.map((item) => item.stored);
+	}
+
 	context(messageId: string): readonly StoredAgentMessage[] {
 		const target = this.message(messageId);
 		if (!target) throw new Error("agent message is not present in this Pi session");

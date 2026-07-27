@@ -10,6 +10,7 @@ import {
 	type RelayHistoryItem,
 	type RelaySessionQueryRequest,
 	type RelaySessionQueryResult,
+	type RelayStreamEvent,
 } from "../relay/protocol.ts";
 import { AgentSessionJournal } from "./journal.ts";
 import {
@@ -194,6 +195,39 @@ export class RelayAgentTransport implements AgentTransport {
 		return (response.messages as unknown[]).map((value) =>
 			validateHistoryItem(value, this.endpoint.id, targetEndpoint, conversationId),
 		);
+	}
+
+	/**
+	 * Push an ephemeral streaming preview of the reply being produced for
+	 * `messageId`. Fire-and-forget: previews are never journaled, never
+	 * acknowledged, and silently dropped when the transport is not connected.
+	 * The durable `respond()` supersedes previews via `replyTo`.
+	 */
+	async stream(messageId: string, event: RelayStreamEvent): Promise<void> {
+		const id = validateIdentifier(messageId, "message id");
+		const target = this.#journal.message(id);
+		if (!target || target.message.recipient !== this.endpoint.id) return;
+		let socket: WebSocket;
+		try {
+			socket = await this.#ensureConnected();
+		} catch {
+			return;
+		}
+		const frame: RelayClientFrame = {
+			type: "stream",
+			input: {
+				id: streamPreviewId(this.endpoint.id, id),
+				recipient: target.message.sender,
+				conversationId: target.message.conversationId,
+				replyTo: id,
+				event,
+			},
+		};
+		try {
+			socket.send(JSON.stringify(frame));
+		} catch {
+			// Previews are best-effort; the durable reply still follows.
+		}
 	}
 
 	async subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>> {
@@ -553,6 +587,16 @@ function validateHistoryItem(
 		...(responseId ? { responseId } : {}),
 		updatedAt: item.updatedAt,
 	};
+}
+
+/** Stable per-target preview id so every chunk updates one message. */
+function streamPreviewId(endpoint: string, messageId: string): string {
+	return `preview-${createHash("sha256")
+		.update(endpoint)
+		.update("\0")
+		.update(messageId)
+		.digest("hex")
+		.slice(0, 32)}`;
 }
 
 function stableResponseId(endpoint: string, messageId: string, response: string): string {

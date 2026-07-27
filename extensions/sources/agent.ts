@@ -1,3 +1,4 @@
+import type { MessageUpdateEvent } from "@earendil-works/pi-coding-agent";
 import { FilesystemAgentTransport } from "../agent/filesystem.ts";
 import { AgentSessionJournal } from "../agent/journal.ts";
 import { RelayAgentTransport } from "../agent/relay.ts";
@@ -9,6 +10,7 @@ import {
 	agentLocator,
 	decodeAgentLocator,
 } from "../agent/types.ts";
+import type { RelayStreamEvent } from "../relay/protocol.ts";
 import type {
 	ChannelActions,
 	ChannelReadResult,
@@ -136,6 +138,83 @@ export function createAgentSource(
 				}
 			};
 		},
+	};
+}
+
+export const STREAM_FLUSH_MS = 250;
+
+/**
+ * Forward Pi assistant text events as ephemeral relay previews while a reply
+ * is being produced. Consecutive `text_delta` events are coalesced and
+ * flushed at most every `flushMs` so relay frame budgets hold. Previews are
+ * only sent while exactly one delivered-but-unreplied agent message exists —
+ * with several open targets the attribution would be a guess, so we skip.
+ */
+export function createAgentStreamForwarder(
+	config: AgentChannelConfig,
+	createTransport: (
+		config: AgentChannelConfig,
+		journal?: AgentSessionJournal,
+	) => AgentTransport = sharedAgentTransport,
+	journal = new AgentSessionJournal(),
+	flushMs = STREAM_FLUSH_MS,
+): (event: MessageUpdateEvent) => void {
+	let bufferedDelta = "";
+	let bufferedIndex = 0;
+	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const soleOpenTarget = (): string | undefined => {
+		const open = journal.openTargets(config.endpointId);
+		return open.length === 1 ? open[0]?.message.id : undefined;
+	};
+
+	const emit = (event: RelayStreamEvent): void => {
+		const targetId = soleOpenTarget();
+		if (!targetId) return;
+		const transport = createTransport(config, journal);
+		void transport.stream?.(targetId, event).catch(() => {});
+	};
+
+	const flushDeltas = (): void => {
+		if (flushTimer) {
+			clearTimeout(flushTimer);
+			flushTimer = undefined;
+		}
+		if (bufferedDelta === "") return;
+		const delta = bufferedDelta;
+		bufferedDelta = "";
+		emit({ type: "text_delta", contentIndex: bufferedIndex, delta });
+	};
+
+	return (event) => {
+		const assistant = event.assistantMessageEvent;
+		switch (assistant.type) {
+			case "text_start":
+				flushDeltas();
+				emit({ type: "text_start", contentIndex: assistant.contentIndex });
+				break;
+			case "text_delta":
+				if (bufferedDelta !== "" && bufferedIndex !== assistant.contentIndex) flushDeltas();
+				bufferedIndex = assistant.contentIndex;
+				bufferedDelta += assistant.delta;
+				flushTimer ??= setTimeout(flushDeltas, flushMs);
+				flushTimer.unref?.();
+				break;
+			case "text_end":
+				bufferedDelta = "";
+				if (flushTimer) {
+					clearTimeout(flushTimer);
+					flushTimer = undefined;
+				}
+				emit({
+					type: "text_end",
+					contentIndex: assistant.contentIndex,
+					content: assistant.content,
+				});
+				break;
+			default:
+				break;
+		}
 	};
 }
 

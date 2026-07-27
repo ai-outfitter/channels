@@ -20,7 +20,7 @@
  *   present. Unconfigured sources are skipped.
  * - set to `off`/`none` → disabled (keeps pure loop-polling).
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, MessageUpdateEvent } from "@earendil-works/pi-coding-agent";
 import { AgentSessionJournal } from "./agent/journal.ts";
 import { registerAgentTools } from "./agent-tools.ts";
 import { registerChannelTools } from "./channel-tools.ts";
@@ -41,6 +41,10 @@ export interface SourceRegistration {
 	loadActions?(journal?: AgentSessionJournal): Promise<ChannelActions | undefined>;
 	/** Load the native agent channel's discovery/send actions, when supported. */
 	loadAgentActions?(journal?: AgentSessionJournal): Promise<AgentChannelActions | undefined>;
+	/** Load a forwarder that streams Pi assistant text events as previews. */
+	loadStreamForwarder?(
+		journal?: AgentSessionJournal,
+	): Promise<((event: MessageUpdateEvent) => void) | undefined>;
 }
 
 /** Run a source module's env-config probe and construct it when configured. */
@@ -109,6 +113,11 @@ const SOURCES: Record<string, SourceRegistration> = {
 			const m = await import("./sources/agent.ts");
 			const config = m.agentConfigFromEnv();
 			return config ? m.createAgentActions(config, undefined, journal) : undefined;
+		},
+		async loadStreamForwarder(journal) {
+			const m = await import("./sources/agent.ts");
+			const config = m.agentConfigFromEnv();
+			return config ? m.createAgentStreamForwarder(config, undefined, journal) : undefined;
 		},
 	},
 };
@@ -291,6 +300,32 @@ export default function channelEventsExtension(
 		wakeInFlight = false;
 		maybeWake();
 	});
+
+	// Stream assistant text as ephemeral previews to the agent channel while a
+	// reply is in flight. Loaded lazily on the first assistant token; failures
+	// disable streaming for the session rather than affecting the turn.
+	const agentRegistration = sources.agent;
+	if (wanted.includes("agent") && agentRegistration?.loadStreamForwarder) {
+		let forwarder: ((event: MessageUpdateEvent) => void) | null | undefined;
+		let loading: Promise<void> | undefined;
+		pi.on("message_update", (event) => {
+			if (forwarder === null) return;
+			if (forwarder) {
+				forwarder(event as MessageUpdateEvent);
+				return;
+			}
+			loading ??= agentRegistration
+				.loadStreamForwarder?.(agentJournal)
+				.then((loaded) => {
+					forwarder = loaded ?? null;
+					forwarder?.(event as MessageUpdateEvent);
+				})
+				.catch((err) => {
+					forwarder = null;
+					log(`stream previews disabled: ${(err as Error).message}`);
+				});
+		});
+	}
 
 	pi.on("session_shutdown", async () => {
 		stopped = true;

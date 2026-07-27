@@ -415,3 +415,106 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Pr
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
+
+test("relay forwards ephemeral stream previews without persisting them", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-stream-test-"));
+	const logs: Array<Readonly<Record<string, unknown>>> = [];
+	const storePath = join(root, "relay.json");
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath,
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		logger: (record) => logs.push(record),
+	});
+	try {
+		const alice = await TestClient.open(relay.url);
+		const bob = await TestClient.open(relay.url);
+		assert.equal(
+			(await alice.authenticate("alice-secret", "alice-web", "operator:alice")).type,
+			"authenticated",
+		);
+		assert.equal(
+			(await bob.authenticate("bob-secret", "bob-agent", "agent:bob")).type,
+			"authenticated",
+		);
+
+		// Preview events reuse Pi's text event vocabulary and pass through.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				replyTo: "message-1",
+				event: { type: "text_start", contentIndex: 0 },
+			},
+		});
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				replyTo: "message-1",
+				event: { type: "text_delta", contentIndex: 0, delta: "Hello, wor" },
+			},
+		});
+		const started = await alice.next((frame) => frame.type === "stream");
+		assert.deepEqual(started, {
+			type: "stream",
+			id: "preview-1",
+			conversationId: "conversation-1",
+			sender: "bob-agent",
+			recipient: "alice-web",
+			replyTo: "message-1",
+			event: { type: "text_start", contentIndex: 0 },
+		});
+		const delta = await alice.next((frame) => frame.type === "stream");
+		assert.deepEqual(delta.event, {
+			type: "text_delta",
+			contentIndex: 0,
+			delta: "Hello, wor",
+		});
+
+		// Unauthorized routes are refused.
+		alice.send({
+			type: "stream",
+			input: {
+				id: "preview-2",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "text_start", contentIndex: 0 },
+			},
+		});
+		const forbidden = await alice.next((frame) => frame.type === "error");
+		assert.equal(forbidden.code, "route_forbidden");
+
+		// Previews to offline recipients vanish; nothing is stored or spooled.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "text_end", contentIndex: 0, content: "Hello, world" },
+			},
+		});
+		await alice.next((frame) => frame.type === "stream");
+		const persisted = await readFile(storePath, "utf8").catch(() => "");
+		assert.ok(!persisted.includes("Hello"), "previews must never be persisted");
+		assert.ok(!persisted.includes("preview-1"), "preview ids must never be persisted");
+
+		// Structural logging only: no preview text in log records.
+		const serialized = JSON.stringify(logs);
+		assert.ok(!serialized.includes("Hello"), "log records must not contain preview text");
+		assert.ok(serialized.includes("stream_forwarded"));
+
+		alice.close();
+		bob.close();
+	} finally {
+		await relay.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});

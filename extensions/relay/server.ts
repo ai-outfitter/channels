@@ -8,7 +8,12 @@ import {
 import { createServer as createHttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
-import { type AgentEndpoint, type AgentSendInput, validateIdentifier } from "../agent/types.ts";
+import {
+	type AgentEndpoint,
+	type AgentSendInput,
+	validateBody,
+	validateIdentifier,
+} from "../agent/types.ts";
 import {
 	parseRelayFrame,
 	RELAY_MAX_FRAME_BYTES,
@@ -16,6 +21,7 @@ import {
 	type RelayErrorFrame,
 	type RelayServerFrame,
 	type RelaySessionQueryRequest,
+	type RelayStreamEvent,
 } from "./protocol.ts";
 import { RelayStore } from "./store.ts";
 import { ServerWebSocket, websocketAccept } from "./websocket.ts";
@@ -39,6 +45,7 @@ export interface RelayServerConfig {
 	readonly maintenanceMs?: number;
 	readonly maxConnections?: number;
 	readonly maxFramesPerWindow?: number;
+	readonly maxStreamFramesPerWindow?: number;
 	readonly rateWindowMs?: number;
 	readonly logger?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -123,20 +130,13 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 		);
 		let connection: AuthenticatedConnection | undefined;
 		let handling = Promise.resolve();
-		let rateWindowStartedAt = Date.now();
-		let framesInWindow = 0;
+		const withinRateBudget = createFrameRateLimiter(config);
 		let websocket: ServerWebSocket;
 		websocket = new ServerWebSocket(
 			socket,
 			head,
 			(text) => {
-				const now = Date.now();
-				if (now - rateWindowStartedAt >= (config.rateWindowMs ?? 60_000)) {
-					rateWindowStartedAt = now;
-					framesInWindow = 0;
-				}
-				framesInWindow += 1;
-				if (framesInWindow > (config.maxFramesPerWindow ?? 120)) {
+				if (!withinRateBudget(text)) {
 					log({
 						event: "request_rejected",
 						code: "rate_limited",
@@ -227,6 +227,31 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 	};
 }
 
+/**
+ * Per-connection frame budget. Ephemeral stream previews arrive far more
+ * often than control frames, so they draw from their own budget. Detection
+ * peeks at the serialized prefix; a mismatch only mis-buckets the frame.
+ */
+function createFrameRateLimiter(config: RelayServerConfig): (text: string) => boolean {
+	let windowStartedAt = Date.now();
+	let framesInWindow = 0;
+	let streamFramesInWindow = 0;
+	return (text) => {
+		const now = Date.now();
+		if (now - windowStartedAt >= (config.rateWindowMs ?? 60_000)) {
+			windowStartedAt = now;
+			framesInWindow = 0;
+			streamFramesInWindow = 0;
+		}
+		if (text.startsWith('{"type":"stream"')) {
+			streamFramesInWindow += 1;
+			return streamFramesInWindow <= (config.maxStreamFramesPerWindow ?? 1_200);
+		}
+		framesInWindow += 1;
+		return framesInWindow <= (config.maxFramesPerWindow ?? 120);
+	};
+}
+
 interface HandlerContext {
 	readonly config: RelayServerConfig;
 	readonly store: RelayStore;
@@ -266,6 +291,9 @@ async function handleText(
 				break;
 			case "send":
 				await handleSend(frame, socket, connection, context);
+				break;
+			case "stream":
+				handleStream(frame, connection, context);
 				break;
 			case "list_conversations":
 				handleSessionQuery(frame, connection, context);
@@ -436,6 +464,75 @@ async function handleSend(
 		} satisfies RelayServerFrame);
 		recipient.lastIssuedCursor = Math.max(recipient.lastIssuedCursor, accepted.cursor);
 	}
+}
+
+function parseStreamEvent(value: unknown): RelayStreamEvent {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("invalid stream event");
+	}
+	const event = value as Record<string, unknown>;
+	const contentIndex = event.contentIndex;
+	if (typeof contentIndex !== "number" || !Number.isInteger(contentIndex) || contentIndex < 0) {
+		throw new Error("invalid stream event content index");
+	}
+	switch (event.type) {
+		case "text_start":
+			return { type: "text_start", contentIndex };
+		case "text_delta":
+			return { type: "text_delta", contentIndex, delta: validateBody(String(event.delta ?? "")) };
+		case "text_end":
+			return { type: "text_end", contentIndex, content: validateBody(String(event.content ?? "")) };
+		default:
+			throw new Error("unsupported stream event type");
+	}
+}
+
+function handleStream(
+	frame: Record<string, unknown>,
+	connection: AuthenticatedConnection,
+	context: HandlerContext,
+): void {
+	if (!frame.input || typeof frame.input !== "object" || Array.isArray(frame.input)) {
+		throw new Error("invalid stream input");
+	}
+	const input = frame.input as Record<string, unknown>;
+	const id = validateIdentifier(String(input.id ?? ""), "message id");
+	const recipient = validateIdentifier(String(input.recipient ?? ""), "endpoint id");
+	const conversationId = validateIdentifier(String(input.conversationId ?? ""), "conversation id");
+	const replyTo =
+		input.replyTo === undefined
+			? undefined
+			: validateIdentifier(String(input.replyTo), "message id");
+	const event = parseStreamEvent(input.event);
+	if (
+		!connection.credential.send.includes("*") &&
+		!connection.credential.send.includes(recipient)
+	) {
+		throw new RelayProtocolError("route_forbidden", "route is not authorized");
+	}
+	// Previews are ephemeral: forwarded to a currently connected recipient
+	// only, never stored, never spooled, never acknowledged. Log structural
+	// fields only — never event text.
+	const target = context.connections.get(recipient);
+	context.log({
+		event: "stream_forwarded",
+		endpoint: connection.endpoint,
+		recipient,
+		messageId: id,
+		conversationId,
+		streamEvent: event.type,
+		delivered: Boolean(target),
+	});
+	if (!target) return;
+	target.socket.send({
+		type: "stream",
+		id,
+		conversationId,
+		sender: connection.endpoint,
+		recipient,
+		...(replyTo ? { replyTo } : {}),
+		event,
+	} satisfies RelayServerFrame);
 }
 
 function handleSessionQuery(
@@ -641,6 +738,12 @@ function validateServerConfig(config: RelayServerConfig): void {
 	requireConfiguredInteger(config.maintenanceMs, "maintenance interval", 100, 24 * 60 * 60 * 1_000);
 	requireConfiguredInteger(config.maxConnections, "connection limit", 1, 100_000);
 	requireConfiguredInteger(config.maxFramesPerWindow, "frame rate limit", 1, 1_000_000);
+	requireConfiguredInteger(
+		config.maxStreamFramesPerWindow,
+		"stream frame rate limit",
+		1,
+		10_000_000,
+	);
 	requireConfiguredInteger(config.rateWindowMs, "rate window", 100, 60 * 60 * 1_000);
 	const tokens = new Set<string>();
 	const endpointOwners = new Map<string, string>();
@@ -753,6 +856,7 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 			: undefined;
 	const maxConnections = optionalIntegerEnv("AGENT_RELAY_MAX_CONNECTIONS");
 	const maxFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_FRAMES_PER_WINDOW");
+	const maxStreamFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW");
 	const rateWindowMs = optionalIntegerEnv("AGENT_RELAY_RATE_WINDOW_MS");
 	return {
 		host,
@@ -763,6 +867,7 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 		allowInsecureLoopback: process.env.AGENT_RELAY_ALLOW_INSECURE === "1",
 		...(maxConnections === undefined ? {} : { maxConnections }),
 		...(maxFramesPerWindow === undefined ? {} : { maxFramesPerWindow }),
+		...(maxStreamFramesPerWindow === undefined ? {} : { maxStreamFramesPerWindow }),
 		...(rateWindowMs === undefined ? {} : { rateWindowMs }),
 	};
 }
