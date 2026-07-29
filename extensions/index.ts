@@ -80,6 +80,13 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return configure(m.githubConfigFromEnv, m.createGithubSource);
 		},
 	},
+	forgejo: {
+		configured: () => Boolean(process.env.FORGEJO_TOKEN),
+		async load() {
+			const m = await import("./sources/forgejo.ts");
+			return configure(m.forgejoConfigFromEnv, m.createForgejoSource);
+		},
+	},
 	slack: {
 		configured: () => Boolean(process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN),
 		async load() {
