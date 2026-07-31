@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 import type { ForgejoConfig } from "../extensions/sources/forgejo.ts";
-import { createForgejoSource, forgejoConfigFromEnv } from "../extensions/sources/forgejo.ts";
+import {
+	backoffDelayMs,
+	createForgejoSource,
+	forgejoConfigFromEnv,
+} from "../extensions/sources/forgejo.ts";
 
 const BASE = "https://forge.example";
 const API = `${BASE}/api/v1`;
@@ -9,6 +13,7 @@ const API = `${BASE}/api/v1`;
 interface Route {
 	body: unknown;
 	status?: number;
+	headers?: Record<string, string>;
 }
 
 /**
@@ -30,7 +35,7 @@ function stubFetch(routes: Record<string, Route | (() => Route)>): {
 		const route = typeof entry === "function" ? entry() : entry;
 		return new Response(JSON.stringify(route.body), {
 			status: route.status ?? 200,
-			headers: { date: "Tue, 28 Jul 2026 12:00:00 GMT" },
+			headers: { date: "Tue, 28 Jul 2026 12:00:00 GMT", ...route.headers },
 		});
 	}) as typeof fetch;
 	return {
@@ -41,14 +46,19 @@ function stubFetch(routes: Record<string, Route | (() => Route)>): {
 	};
 }
 
+// The first tick only seeds the cursor from the forge's clock, so every test
+// that expects an emission must reach at least the second tick — hence the
+// tiny poll interval and the `settle()` waits below.
 const config: ForgejoConfig = {
 	url: BASE,
 	token: "t",
 	user: "drago",
 	filters: new Set(["review_requested", "assigned_issue", "assigned_pr"]),
-	pollMs: 10_000,
+	pollMs: 5,
 	markRead: false,
 };
+
+const settle = async (ms = 60) => await new Promise((r) => setTimeout(r, ms));
 
 function thread(id: number, type: string, n = 1) {
 	return {
@@ -74,7 +84,7 @@ test("wakes on a review request and reports a trusted reason, not the title", as
 	});
 	const events: { channel: string; summary: string }[] = [];
 	const stop = await createForgejoSource(config).start((e) => events.push(e));
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	restore();
 
@@ -95,7 +105,7 @@ test("distinguishes an assigned pull request from an assigned issue", async () =
 		});
 		const events: { summary: string }[] = [];
 		const stop = await createForgejoSource(config).start((e) => events.push(e));
-		await new Promise((r) => setTimeout(r, 20));
+		await settle();
 		await stop();
 		restore();
 		assert.deepEqual(
@@ -116,7 +126,7 @@ test("stays silent for activity that does not involve this account", async () =>
 	});
 	const events: unknown[] = [];
 	const stop = await createForgejoSource(config).start((e) => events.push(e));
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	restore();
 	assert.deepEqual(events, []);
@@ -133,7 +143,7 @@ test("honors the filter set", async () => {
 	const events: unknown[] = [];
 	const source = createForgejoSource({ ...config, filters: new Set(["review_requested"]) });
 	const stop = await source.start((e) => events.push(e));
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	restore();
 	assert.deepEqual(events, [], "assigned_pr filtered out");
@@ -145,7 +155,7 @@ test("skips the thread list entirely when nothing is unread", async () => {
 		[`${API}/notifications?`]: { body: [thread(5, "Pull")] },
 	});
 	const stop = await createForgejoSource(config).start(() => {});
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	restore();
 	assert.ok(
@@ -165,7 +175,7 @@ test("resolves its own login from the API when FORGEJO_USER is unset", async () 
 	const stop = await createForgejoSource({ ...config, user: undefined }).start((e) =>
 		events.push(e),
 	);
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	restore();
 	assert.ok(
@@ -187,14 +197,14 @@ test("marks a matched thread read only when configured to", async () => {
 	};
 	const off = stubFetch(routes);
 	let stop = await createForgejoSource(config).start(() => {});
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	off.restore();
 	assert.ok(!off.calls.some((c) => c.method === "PATCH"), "marked read while disabled");
 
 	const on = stubFetch(routes);
 	stop = await createForgejoSource({ ...config, markRead: true }).start(() => {});
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	on.restore();
 	assert.ok(
@@ -247,7 +257,7 @@ test("never fetches a host named by a notification payload", async () => {
 	});
 	const events: { channel: string; summary: string }[] = [];
 	const stop = await createForgejoSource(config).start((e) => events.push(e));
-	await new Promise((r) => setTimeout(r, 20));
+	await settle();
 	await stop();
 	restore();
 
@@ -257,4 +267,84 @@ test("never fetches a host named by a notification payload", async () => {
 	);
 	// The path is still honoured, so the thread classifies as it should.
 	assert.deepEqual(events, [{ channel: "forgejo", summary: "review_requested" }]);
+});
+
+test("first tick only anchors the cursor to the forge clock; no list, no events", async () => {
+	const { calls, restore } = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 1 } },
+		[`${API}/notifications?`]: { body: [thread(8, "Pull")] },
+		[`${API}/repos/o/r/pulls/1`]: { body: { requested_reviewers: [{ login: "drago" }] } },
+	});
+	const events: unknown[] = [];
+	// A long poll interval keeps this to exactly one tick.
+	const stop = await createForgejoSource({ ...config, pollMs: 60_000 }).start((e) =>
+		events.push(e),
+	);
+	await settle(20);
+	await stop();
+	restore();
+	assert.deepEqual(events, [], "emitted history from before start-up");
+	assert.ok(
+		!calls.some((c) => c.url.includes("/notifications?")),
+		"listed threads on the seeding tick",
+	);
+});
+
+test("the next cursor comes from the probe, which precedes the listing query", async () => {
+	// Distinct Date headers per response: the probe says 12:00:00, the list —
+	// stamped after the forge evaluated the query — says 12:00:07. A thread
+	// updated in that gap is in neither window unless the cursor stays at the
+	// probe's clock.
+	const { calls, restore } = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 1 } },
+		[`${API}/notifications?`]: {
+			body: [thread(9, "Pull")],
+			headers: { date: "Tue, 28 Jul 2026 12:00:07 GMT" },
+		},
+		[`${API}/repos/o/r/pulls/1`]: { body: { requested_reviewers: [{ login: "drago" }] } },
+	});
+	const stop = await createForgejoSource(config).start(() => {});
+	await settle();
+	await stop();
+	restore();
+	const listed = calls.filter((c) => c.url.includes("/notifications?"));
+	assert.ok(listed.length >= 2, "needs at least two listing ticks");
+	for (const c of listed) {
+		assert.ok(
+			c.url.includes(encodeURIComponent("2026-07-28T12:00:00.000Z")),
+			`cursor drifted to the list response's clock: ${c.url}`,
+		);
+	}
+});
+
+test("a failed subject lookup retries the thread without re-waking for delivered ones", async () => {
+	let issueLookups = 0;
+	const { restore } = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 2 } },
+		[`${API}/notifications?`]: { body: [thread(10, "Pull"), thread(11, "Issue", 2)] },
+		[`${API}/repos/o/r/pulls/1`]: { body: { requested_reviewers: [{ login: "drago" }] } },
+		[`${API}/repos/o/r/issues/2`]: () => {
+			issueLookups += 1;
+			// The first lookup fails server-side; the retry succeeds.
+			return issueLookups === 1
+				? { body: {}, status: 500 }
+				: { body: { assignees: [{ login: "drago" }] } };
+		},
+	});
+	const events: { summary: string }[] = [];
+	const stop = await createForgejoSource(config).start((e) => events.push(e));
+	await settle(150);
+	await stop();
+	restore();
+	// The pull request wakes exactly once even though its window is re-listed,
+	// and the issue is retried rather than lost or repeated.
+	assert.deepEqual(events.map((e) => e.summary).sort(), ["assigned_issue", "review_requested"]);
+});
+
+test("backoffDelayMs doubles per consecutive failure and caps", () => {
+	assert.equal(backoffDelayMs(1_000, 0), 1_000);
+	assert.equal(backoffDelayMs(1_000, 1), 2_000);
+	assert.equal(backoffDelayMs(1_000, 3), 8_000);
+	assert.equal(backoffDelayMs(1_000, 30, 60_000), 60_000, "caps at maxMs");
+	assert.equal(backoffDelayMs(120_000, 5, 60_000), 120_000, "never drops below the poll floor");
 });
