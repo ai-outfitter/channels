@@ -115,14 +115,20 @@ GitHub has no push transport, so this channel **polls your notifications** and
 wakes you **only when one matches your filters**. Pair with `gh`/a GitHub skill to
 act on them.
 
-- **Prerequisites:** a token that can read your notifications (a classic PAT with
-  the `notifications` scope, or a fine-grained token with *Notifications: read*).
+- **Prerequisites:** a **classic** PAT with the `notifications` scope.
+  `GET /notifications` accepts classic PATs only — a fine-grained PAT and a
+  GitHub App installation token are both rejected, so neither can drive this
+  channel. Keep it separate from whatever the agent's `gh` uses:
+  `GITHUB_NOTIFY_TOKEN` is read first, so repository work can hold the narrower
+  credential in `GITHUB_TOKEN`.
 - **Configure:**
 
   ```bash
-  export GITHUB_TOKEN="ghp_…"
-  export GITHUB_NOTIFY_FILTERS="review_requested,assigned_issue"   # optional; this is the default
-  export GITHUB_NOTIFY_POLL_MS="60000"                             # optional; default 60s
+  export GITHUB_NOTIFY_TOKEN="ghp_…"   # classic PAT; falls back to GITHUB_TOKEN
+  export GITHUB_NOTIFY_FILTERS="review_requested,assigned_issue,assigned_pr,author"  # optional; this is the default
+  export GITHUB_NOTIFY_POLL_MS="60000" # optional; a floor — GitHub's X-Poll-Interval may raise it
+  export GITHUB_API_URL="https://api.github.com"  # optional; for GHES, or derived from GITHUB_SERVER_URL
+  export GITHUB_NOTIFY_MARK_READ="0"   # optional; default off — see below
   ```
 
   | Filter | Wakes on |
@@ -130,7 +136,20 @@ act on them.
   | `review_requested` | a PR review requested from you |
   | `assigned_issue` | an issue assigned to you |
   | `assigned_pr` | a PR assigned to you |
+  | `author` | activity on a thread you opened — this is what tells you a review landed on **your own** PR |
   | `mention` | you were @-mentioned |
+  | `comment`, `subscribed`, `state_change`, `ci_activity` | as named |
+
+  > **Leave `GITHUB_NOTIFY_MARK_READ` off if the agent reads its own
+  > notifications.** Marking a thread read in the same poll that emits the wake
+  > removes the item the woken agent then goes looking for, and it concludes it
+  > has no work. Let the agent mark the thread read after it acts.
+
+  A wake from this channel carries **no locator**: it reports only *that* work
+  exists, never *what*, because issue and PR titles are attacker-controlled text.
+  Find the work by querying your own assignments (`gh search issues --assignee
+  @me --state open`), not by reading the notification list — a thread that was
+  already marked read is invisible there, but the assignment is not.
 
 ### Slack — `slack`
 
