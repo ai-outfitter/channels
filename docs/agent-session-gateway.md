@@ -4,7 +4,10 @@ The Agent Session Gateway is the umbrella system for authenticated chat,
 observation, control, and hosted-agent lifecycle. These capabilities share
 identity and authorization, but they are separate protocols and streams. This
 document defines the first implemented slice: the native **agent channel** for
-agent-to-agent and authorized operator-to-agent chat.
+agent-to-agent and authorized operator-to-agent chat. The end-to-end use
+cases, the observation/control plane schemas, and the cross-repo follow-up
+split are defined in
+[`agent-session-gateway-use-cases.md`](./agent-session-gateway-use-cases.md).
 
 The layers are deliberately named:
 
