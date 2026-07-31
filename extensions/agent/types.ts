@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import type { RelayStreamEvent } from "../relay/protocol.ts";
 
 export const AGENT_PROTOCOL_VERSION = 1 as const;
 export const AGENT_MAX_BODY_BYTES = 40_000;
@@ -70,6 +71,12 @@ export interface AgentTransport {
 	send(input: AgentSendInput): Promise<AgentSendResult>;
 	read(messageId: string): Promise<AgentReadResult>;
 	respond(messageId: string, response: string): Promise<AgentRespondResult>;
+	/**
+	 * Optional ephemeral streaming preview of an in-progress reply to
+	 * `messageId`, using Pi's text event vocabulary. Best-effort only: never
+	 * journaled, never acknowledged, dropped when unsupported or offline.
+	 */
+	stream?(messageId: string, event: RelayStreamEvent): Promise<void>;
 	subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>>;
 	close(): Promise<void>;
 }

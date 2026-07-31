@@ -1,3 +1,4 @@
+import type { MessageUpdateEvent } from "@earendil-works/pi-coding-agent";
 import type {
 	AgentEndpoint,
 	AgentMessageState,
@@ -141,6 +142,55 @@ export interface RelayDeliverFrame {
 	readonly message: AgentMessageV1;
 }
 
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * Streamable assistant events reuse Pi's own `AssistantMessageEvent`
+ * vocabulary (via `MessageUpdateEvent["assistantMessageEvent"]`) restricted
+ * to visible text: `text_start`, `text_delta`, and `text_end`. Thinking and
+ * tool-call events never cross the relay, and the heavyweight `partial`
+ * assistant message is stripped — only the event's own fields travel.
+ */
+export type RelayStreamEvent = DistributiveOmit<
+	Extract<
+		MessageUpdateEvent["assistantMessageEvent"],
+		{ type: "text_start" | "text_delta" | "text_end" }
+	>,
+	"partial"
+>;
+
+/**
+ * Ephemeral chat-plane streaming preview. While producing a durable reply, a
+ * sender may push incremental Pi text events under a stable preview id
+ * derived from the message being answered. The relay forwards previews to
+ * currently connected recipients only: previews are never stored, never
+ * spooled, never acknowledged, and never appear in history. The durable
+ * reply still arrives as an ordinary send/deliver and supersedes any preview
+ * via `replyTo`. Ordering relies on the WebSocket transport.
+ */
+export interface RelayStreamInput {
+	readonly id: string;
+	readonly recipient: string;
+	readonly conversationId: string;
+	readonly replyTo?: string;
+	readonly event: RelayStreamEvent;
+}
+
+export interface RelayStreamFrame {
+	readonly type: "stream";
+	readonly input: RelayStreamInput;
+}
+
+export interface RelayStreamDeliverFrame {
+	readonly type: "stream";
+	readonly id: string;
+	readonly conversationId: string;
+	readonly sender: string;
+	readonly recipient: string;
+	readonly replyTo?: string;
+	readonly event: RelayStreamEvent;
+}
+
 export interface RelayAckFrame {
 	readonly type: "ack";
 	readonly cursor: number;
@@ -170,6 +220,7 @@ export type RelayClientFrame =
 	| RelayReadHistoryFrame
 	| RelaySendFrame
 	| RelaySessionResultFrame
+	| RelayStreamFrame
 	| RelayAckFrame
 	| RelayPongFrame;
 
@@ -180,6 +231,7 @@ export type RelayServerFrame =
 	| RelayHistoryFrame
 	| RelayAcceptedFrame
 	| RelayDeliverFrame
+	| RelayStreamDeliverFrame
 	| RelaySessionQueryFrame
 	| RelayPingFrame
 	| RelayErrorFrame;

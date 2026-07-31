@@ -139,6 +139,36 @@ Heartbeats expire stale registrations. A replacement connection for the same
 endpoint is duplicate-safe and closes the old connection. HTTPS `/healthz`
 reports liveness; `/readyz` reports whether durable delivery storage is writable.
 
+### Singleton conversations
+
+An assistant-style endpoint can be configured to hold **one running
+conversation across all channels and peers**
+(`AGENT_RELAY_SINGLETON_ENDPOINTS`, a comma/space list of endpoint ids). The
+relay folds every accepted message and streaming preview to or from a listed
+endpoint into that endpoint's own conversation — the endpoint id doubles as
+the conversation id — regardless of the conversation id the sender supplied.
+Replies and history follow automatically because the agent journals the
+canonical id. Consequence, by design: every peer authorized to converse with
+the endpoint sees the endpoint's whole thread; the privacy boundary is the
+relay credential route, not the conversation.
+
+### Ephemeral streaming previews
+
+While producing a durable reply, a sender may push chat-plane streaming
+previews: `stream` frames whose payload reuses Pi's assistant text event
+vocabulary (`text_start`, `text_delta`, `text_end` with `contentIndex`) under
+a stable preview id derived from the message being answered, correlated to it
+by `replyTo`. Previews are strictly ephemeral and at-most-once: the relay
+authorizes them on the same send route, forwards them only to currently
+connected recipients, and never stores, spools, acknowledges, journals, or
+replays them. Thinking and tool-call events never cross the relay, and log
+records carry structural fields only. Body limits apply per event. Preview
+frames draw from their own rate budget
+(`AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW`, default 1200 per window). The
+durable reply always arrives as an ordinary send/deliver and supersedes any
+preview; a consumer that never implements previews sees identical durable
+behavior.
+
 The relay never owns or answers transcript history. `list_conversations` and
 `read_history` are correlated queries routed to the connected target agent.
 That agent answers from its Pi custom entries and restricts results to

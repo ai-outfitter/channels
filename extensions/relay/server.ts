@@ -7,8 +7,15 @@ import {
 } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { type AgentEndpoint, type AgentSendInput, validateIdentifier } from "../agent/types.ts";
+import {
+	type AgentEndpoint,
+	type AgentSendInput,
+	validateBody,
+	validateIdentifier,
+} from "../agent/types.ts";
 import {
 	parseRelayFrame,
 	RELAY_MAX_FRAME_BYTES,
@@ -16,6 +23,7 @@ import {
 	type RelayErrorFrame,
 	type RelayServerFrame,
 	type RelaySessionQueryRequest,
+	type RelayStreamEvent,
 } from "./protocol.ts";
 import { RelayStore } from "./store.ts";
 import { ServerWebSocket, websocketAccept } from "./websocket.ts";
@@ -39,6 +47,16 @@ export interface RelayServerConfig {
 	readonly maintenanceMs?: number;
 	readonly maxConnections?: number;
 	readonly maxFramesPerWindow?: number;
+	readonly maxStreamFramesPerWindow?: number;
+	/**
+	 * Endpoints that hold one running conversation across all channels and
+	 * peers. Every message to or from a listed endpoint is folded into that
+	 * endpoint's own conversation (its id doubles as the conversation id),
+	 * regardless of the conversation id the sender supplied. Consequence:
+	 * every peer authorized to converse with the endpoint sees its whole
+	 * thread — the boundary is the credential route, not the conversation.
+	 */
+	readonly singletonEndpoints?: readonly string[];
 	readonly rateWindowMs?: number;
 	readonly logger?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -123,20 +141,13 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 		);
 		let connection: AuthenticatedConnection | undefined;
 		let handling = Promise.resolve();
-		let rateWindowStartedAt = Date.now();
-		let framesInWindow = 0;
+		const withinRateBudget = createFrameRateLimiter(config);
 		let websocket: ServerWebSocket;
 		websocket = new ServerWebSocket(
 			socket,
 			head,
 			(text) => {
-				const now = Date.now();
-				if (now - rateWindowStartedAt >= (config.rateWindowMs ?? 60_000)) {
-					rateWindowStartedAt = now;
-					framesInWindow = 0;
-				}
-				framesInWindow += 1;
-				if (framesInWindow > (config.maxFramesPerWindow ?? 120)) {
+				if (!withinRateBudget(text)) {
 					log({
 						event: "request_rejected",
 						code: "rate_limited",
@@ -227,6 +238,42 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 	};
 }
 
+/**
+ * Per-connection frame budget. Ephemeral stream previews arrive far more
+ * often than control frames, so they draw from their own budget. Detection
+ * peeks at the serialized prefix; a mismatch only mis-buckets the frame.
+ */
+function createFrameRateLimiter(config: RelayServerConfig): (text: string) => boolean {
+	let windowStartedAt = Date.now();
+	let framesInWindow = 0;
+	let streamFramesInWindow = 0;
+	return (text) => {
+		const now = Date.now();
+		if (now - windowStartedAt >= (config.rateWindowMs ?? 60_000)) {
+			windowStartedAt = now;
+			framesInWindow = 0;
+			streamFramesInWindow = 0;
+		}
+		// Classify by parsing, not by a prefix. JSON resolves duplicate keys
+		// last-wins, so `{"type":"stream","type":"send",…}` starts with the stream
+		// prefix and parses as `send` — which would buy the larger stream budget
+		// for durable writes, each one a disk write, at ten times the intended
+		// rate. Anything unparseable falls to the smaller control budget.
+		let type: unknown;
+		try {
+			type = (JSON.parse(text) as { type?: unknown }).type;
+		} catch {
+			type = undefined;
+		}
+		if (type === "stream") {
+			streamFramesInWindow += 1;
+			return streamFramesInWindow <= (config.maxStreamFramesPerWindow ?? 1_200);
+		}
+		framesInWindow += 1;
+		return framesInWindow <= (config.maxFramesPerWindow ?? 120);
+	};
+}
+
 interface HandlerContext {
 	readonly config: RelayServerConfig;
 	readonly store: RelayStore;
@@ -266,6 +313,9 @@ async function handleText(
 				break;
 			case "send":
 				await handleSend(frame, socket, connection, context);
+				break;
+			case "stream":
+				handleStream(frame, connection, context);
 				break;
 			case "list_conversations":
 				handleSessionQuery(frame, connection, context);
@@ -392,6 +442,24 @@ function handleList(
 	socket.send({ type: "endpoints", requestId, endpoints } satisfies RelayServerFrame);
 }
 
+/**
+ * The singleton conversation for a message between `sender` and `recipient`,
+ * or undefined when neither side is configured as a singleton endpoint. The
+ * recipient wins when both are listed so a message lands in the thread of
+ * the endpoint being addressed.
+ */
+function singletonConversationFor(
+	config: RelayServerConfig,
+	sender: string,
+	recipient: string,
+): string | undefined {
+	const endpoints = config.singletonEndpoints;
+	if (!endpoints || endpoints.length === 0) return undefined;
+	if (endpoints.includes(recipient)) return recipient;
+	if (endpoints.includes(sender)) return sender;
+	return undefined;
+}
+
 async function handleSend(
 	frame: Record<string, unknown>,
 	socket: ServerWebSocket,
@@ -402,13 +470,15 @@ async function handleSend(
 	if (!frame.input || typeof frame.input !== "object" || Array.isArray(frame.input)) {
 		throw new Error("invalid send input");
 	}
-	const input = frame.input as unknown as AgentSendInput;
+	let input = frame.input as unknown as AgentSendInput;
 	if (
 		!connection.credential.send.includes("*") &&
 		!connection.credential.send.includes(input.recipient)
 	) {
 		throw new RelayProtocolError("route_forbidden", "route is not authorized");
 	}
+	const singleton = singletonConversationFor(context.config, connection.endpoint, input.recipient);
+	if (singleton) input = { ...input, conversationId: singleton };
 	const accepted = await context.store.accept(connection.endpoint, input);
 	socket.send({
 		type: "accepted",
@@ -436,6 +506,79 @@ async function handleSend(
 		} satisfies RelayServerFrame);
 		recipient.lastIssuedCursor = Math.max(recipient.lastIssuedCursor, accepted.cursor);
 	}
+}
+
+function parseStreamEvent(value: unknown): RelayStreamEvent {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("invalid stream event");
+	}
+	const event = value as Record<string, unknown>;
+	const contentIndex = event.contentIndex;
+	if (typeof contentIndex !== "number" || !Number.isInteger(contentIndex) || contentIndex < 0) {
+		throw new Error("invalid stream event content index");
+	}
+	switch (event.type) {
+		case "text_start":
+			return { type: "text_start", contentIndex };
+		case "text_delta":
+			return { type: "text_delta", contentIndex, delta: validateBody(String(event.delta ?? "")) };
+		case "text_end":
+			return { type: "text_end", contentIndex, content: validateBody(String(event.content ?? "")) };
+		default:
+			throw new Error("unsupported stream event type");
+	}
+}
+
+function handleStream(
+	frame: Record<string, unknown>,
+	connection: AuthenticatedConnection,
+	context: HandlerContext,
+): void {
+	if (!frame.input || typeof frame.input !== "object" || Array.isArray(frame.input)) {
+		throw new Error("invalid stream input");
+	}
+	const input = frame.input as Record<string, unknown>;
+	// These are preview ids, not durable message ids — say so, or a rejected
+	// preview sends whoever is debugging it looking for the wrong record.
+	const id = validateIdentifier(String(input.id ?? ""), "preview id");
+	const recipient = validateIdentifier(String(input.recipient ?? ""), "endpoint id");
+	const conversationId =
+		singletonConversationFor(context.config, connection.endpoint, recipient) ??
+		validateIdentifier(String(input.conversationId ?? ""), "conversation id");
+	const replyTo =
+		input.replyTo === undefined
+			? undefined
+			: validateIdentifier(String(input.replyTo), "preview replyTo id");
+	const event = parseStreamEvent(input.event);
+	if (
+		!connection.credential.send.includes("*") &&
+		!connection.credential.send.includes(recipient)
+	) {
+		throw new RelayProtocolError("route_forbidden", "route is not authorized");
+	}
+	// Previews are ephemeral: forwarded to a currently connected recipient
+	// only, never stored, never spooled, never acknowledged. Log structural
+	// fields only — never event text.
+	const target = context.connections.get(recipient);
+	context.log({
+		event: "stream_forwarded",
+		endpoint: connection.endpoint,
+		recipient,
+		messageId: id,
+		conversationId,
+		streamEvent: event.type,
+		delivered: Boolean(target),
+	});
+	if (!target) return;
+	target.socket.send({
+		type: "stream",
+		id,
+		conversationId,
+		sender: connection.endpoint,
+		recipient,
+		...(replyTo ? { replyTo } : {}),
+		event,
+	} satisfies RelayServerFrame);
 }
 
 function handleSessionQuery(
@@ -641,6 +784,15 @@ function validateServerConfig(config: RelayServerConfig): void {
 	requireConfiguredInteger(config.maintenanceMs, "maintenance interval", 100, 24 * 60 * 60 * 1_000);
 	requireConfiguredInteger(config.maxConnections, "connection limit", 1, 100_000);
 	requireConfiguredInteger(config.maxFramesPerWindow, "frame rate limit", 1, 1_000_000);
+	for (const endpoint of config.singletonEndpoints ?? []) {
+		validateIdentifier(endpoint, "singleton endpoint id");
+	}
+	requireConfiguredInteger(
+		config.maxStreamFramesPerWindow,
+		"stream frame rate limit",
+		1,
+		10_000_000,
+	);
 	requireConfiguredInteger(config.rateWindowMs, "rate window", 100, 60 * 60 * 1_000);
 	const tokens = new Set<string>();
 	const endpointOwners = new Map<string, string>();
@@ -732,11 +884,16 @@ function formatHost(host: string): string {
 }
 
 export async function configFromEnv(): Promise<RelayServerConfig> {
-	const host = process.env.AGENT_RELAY_HOST?.trim() || "127.0.0.1";
+	// Defaults assume the common deployment: the relay hosted inside an
+	// agent's pi process, so only AGENT_RELAY_SERVER=1 plus the credential
+	// and TLS paths need configuring. TLS remains fail-closed: a non-loopback
+	// host without cert/key still refuses to start.
+	const host = process.env.AGENT_RELAY_HOST?.trim() || "0.0.0.0";
 	const port = Number(process.env.AGENT_RELAY_PORT ?? "8787");
-	const storePath = process.env.AGENT_RELAY_STORE_PATH?.trim();
+	const storePath =
+		process.env.AGENT_RELAY_STORE_PATH?.trim() ||
+		join(homedir(), ".channels", "relay", "store.json");
 	const credentialsPath = process.env.AGENT_RELAY_CREDENTIALS_PATH?.trim();
-	if (!storePath) throw new Error("AGENT_RELAY_STORE_PATH is required");
 	if (!credentialsPath) throw new Error("AGENT_RELAY_CREDENTIALS_PATH is required");
 	const credentialsDocument = JSON.parse(await readFile(credentialsPath, "utf8")) as {
 		credentials?: RelayCredential[];
@@ -753,7 +910,17 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 			: undefined;
 	const maxConnections = optionalIntegerEnv("AGENT_RELAY_MAX_CONNECTIONS");
 	const maxFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_FRAMES_PER_WINDOW");
+	const maxStreamFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW");
 	const rateWindowMs = optionalIntegerEnv("AGENT_RELAY_RATE_WINDOW_MS");
+	// A relay hosted inside an agent is that agent's relay: default the
+	// singleton conversation to the hosting endpoint. Explicit env overrides;
+	// an empty value opts out.
+	const singletonSource =
+		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS ?? process.env.AGENT_ENDPOINT_ID ?? "";
+	const singletonEndpoints = singletonSource
+		.split(/[\s,]+/)
+		.map((value) => value.trim())
+		.filter(Boolean);
 	return {
 		host,
 		port,
@@ -763,6 +930,8 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 		allowInsecureLoopback: process.env.AGENT_RELAY_ALLOW_INSECURE === "1",
 		...(maxConnections === undefined ? {} : { maxConnections }),
 		...(maxFramesPerWindow === undefined ? {} : { maxFramesPerWindow }),
+		...(maxStreamFramesPerWindow === undefined ? {} : { maxStreamFramesPerWindow }),
+		...(singletonEndpoints.length > 0 ? { singletonEndpoints } : {}),
 		...(rateWindowMs === undefined ? {} : { rateWindowMs }),
 	};
 }

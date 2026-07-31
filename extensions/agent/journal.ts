@@ -166,12 +166,29 @@ export class AgentSessionJournal {
 		return this.#messages.get(validateIdentifier(messageId, "message id"))?.stored;
 	}
 
+	/**
+	 * The conversation around one message, as the model will read it.
+	 *
+	 * Filters on the two peers of the target message, not on the conversation
+	 * alone. A relay configured with singleton conversations folds every peer's
+	 * messages under one conversation id, so a conversation-only filter hands the
+	 * model another principal's message body on a turn that principal never
+	 * started — both a cross-principal disclosure and a hole in the rule that
+	 * attacker-controlled text never enters the session unbidden. `history()`
+	 * already filters this way; this is the same rule.
+	 */
 	context(messageId: string): readonly StoredAgentMessage[] {
 		const target = this.message(messageId);
 		if (!target) throw new Error("agent message is not present in this Pi session");
+		const peers = new Set([target.message.sender, target.message.recipient]);
 		const messages = [...this.#messages.values()]
 			.map((item) => item.stored)
-			.filter((item) => item.message.conversationId === target.message.conversationId)
+			.filter(
+				(item) =>
+					item.message.conversationId === target.message.conversationId &&
+					peers.has(item.message.sender) &&
+					peers.has(item.message.recipient),
+			)
 			.sort(compareMessages);
 		return boundedContext(messages, target.message.id);
 	}

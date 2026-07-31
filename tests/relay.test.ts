@@ -415,3 +415,203 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Pr
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
+
+test("relay forwards ephemeral stream previews without persisting them", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-stream-test-"));
+	const logs: Array<Readonly<Record<string, unknown>>> = [];
+	const storePath = join(root, "relay.json");
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath,
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		logger: (record) => logs.push(record),
+	});
+	try {
+		const alice = await TestClient.open(relay.url);
+		const bob = await TestClient.open(relay.url);
+		assert.equal(
+			(await alice.authenticate("alice-secret", "alice-web", "operator:alice")).type,
+			"authenticated",
+		);
+		assert.equal(
+			(await bob.authenticate("bob-secret", "bob-agent", "agent:bob")).type,
+			"authenticated",
+		);
+
+		// Preview events reuse Pi's text event vocabulary and pass through.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				replyTo: "message-1",
+				event: { type: "text_start", contentIndex: 0 },
+			},
+		});
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				replyTo: "message-1",
+				event: { type: "text_delta", contentIndex: 0, delta: "Hello, wor" },
+			},
+		});
+		const started = await alice.next((frame) => frame.type === "stream");
+		assert.deepEqual(started, {
+			type: "stream",
+			id: "preview-1",
+			conversationId: "conversation-1",
+			sender: "bob-agent",
+			recipient: "alice-web",
+			replyTo: "message-1",
+			event: { type: "text_start", contentIndex: 0 },
+		});
+		const delta = await alice.next((frame) => frame.type === "stream");
+		assert.deepEqual(delta.event, {
+			type: "text_delta",
+			contentIndex: 0,
+			delta: "Hello, wor",
+		});
+
+		// Unauthorized routes are refused.
+		alice.send({
+			type: "stream",
+			input: {
+				id: "preview-2",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "text_start", contentIndex: 0 },
+			},
+		});
+		const forbidden = await alice.next((frame) => frame.type === "error");
+		assert.equal(forbidden.code, "route_forbidden");
+
+		// A preview is forwarded live to a connected recipient and is never stored
+		// or spooled — the durable message that follows is the only record.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "text_end", contentIndex: 0, content: "Hello, world" },
+			},
+		});
+		await alice.next((frame) => frame.type === "stream");
+		const persisted = await readFile(storePath, "utf8").catch(() => "");
+		assert.ok(!persisted.includes("Hello"), "previews must never be persisted");
+		assert.ok(!persisted.includes("preview-1"), "preview ids must never be persisted");
+
+		// Structural logging only: no preview text in log records.
+		const serialized = JSON.stringify(logs);
+		assert.ok(!serialized.includes("Hello"), "log records must not contain preview text");
+		assert.ok(serialized.includes("stream_forwarded"));
+
+		alice.close();
+		bob.close();
+	} finally {
+		await relay.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("singleton endpoints fold every peer and channel into one conversation", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-singleton-test-"));
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath: join(root, "relay.json"),
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		singletonEndpoints: ["bob-agent"],
+		logger: () => {},
+	});
+	try {
+		const alice = await TestClient.open(relay.url);
+		const bob = await TestClient.open(relay.url);
+		await alice.authenticate("alice-secret", "alice-web", "operator:alice");
+		await bob.authenticate("bob-secret", "bob-agent", "agent:bob");
+
+		// Sender-supplied conversation ids are overridden on the way in.
+		alice.send({
+			type: "send",
+			requestId: "send-1",
+			input: { recipient: "bob-agent", conversationId: "made-up-1", body: "first" },
+		});
+		const first = await alice.next((frame) => frame.type === "accepted");
+		assert.equal((first.message as { conversationId: string }).conversationId, "bob-agent");
+
+		alice.send({
+			type: "send",
+			requestId: "send-2",
+			input: { recipient: "bob-agent", conversationId: "made-up-2", body: "second" },
+		});
+		const second = await alice.next((frame) => frame.type === "accepted");
+		assert.equal((second.message as { conversationId: string }).conversationId, "bob-agent");
+
+		// The agent's outbound reply lands in its own thread too.
+		const delivered1 = await bob.next((frame) => frame.type === "deliver");
+		bob.send({ type: "ack", cursor: delivered1.cursor });
+		bob.send({
+			type: "send",
+			requestId: "reply-1",
+			input: { recipient: "alice-web", conversationId: "agent-chose-this", body: "reply" },
+		});
+		const reply = await bob.next((frame) => frame.type === "accepted");
+		assert.equal((reply.message as { conversationId: string }).conversationId, "bob-agent");
+
+		// Streaming previews are folded the same way.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "another-made-up",
+				event: { type: "text_start", contentIndex: 0 },
+			},
+		});
+		const preview = await alice.next((frame) => frame.type === "stream");
+		assert.equal(preview.conversationId, "bob-agent");
+
+		alice.close();
+		bob.close();
+	} finally {
+		await relay.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("configFromEnv defaults the singleton endpoint to the hosting agent", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-env-test-"));
+	const credentialsPath = join(root, "credentials.json");
+	const { writeFile } = await import("node:fs/promises");
+	await writeFile(credentialsPath, JSON.stringify({ credentials: CREDENTIALS }));
+	const saved = { ...process.env };
+	try {
+		process.env.AGENT_RELAY_CREDENTIALS_PATH = credentialsPath;
+		process.env.AGENT_ENDPOINT_ID = "link:vega";
+		delete process.env.AGENT_RELAY_SINGLETON_ENDPOINTS;
+		delete process.env.AGENT_RELAY_HOST;
+		delete process.env.AGENT_RELAY_STORE_PATH;
+		delete process.env.AGENT_RELAY_TLS_KEY_PATH;
+		delete process.env.AGENT_RELAY_TLS_CERT_PATH;
+		const { configFromEnv } = await import("../extensions/relay/server.ts");
+		const config = await configFromEnv();
+		assert.deepEqual(config.singletonEndpoints, ["link:vega"]);
+		assert.equal(config.host, "0.0.0.0");
+		assert.ok(config.storePath.endsWith("/.channels/relay/store.json"));
+
+		// Explicit empty opts out of the singleton default.
+		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS = "";
+		const optedOut = await configFromEnv();
+		assert.equal(optedOut.singletonEndpoints, undefined);
+	} finally {
+		process.env = saved;
+		await rm(root, { recursive: true, force: true });
+	}
+});
