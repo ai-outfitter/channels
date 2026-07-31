@@ -178,6 +178,14 @@ whenever that state changes. It reads no message bodies; the `mail` skill (via
   export XIN_BASIC_PASS="app-password"
   ```
 
+#### Give an agent a real internet address
+
+To put an agent on a deliverable public address without buying it a mailbox,
+follow the
+[agent mailbox runbook](docs/runbooks/agent-mailbox-google-workspace.md): Google
+Workspace fronts a dedicated agent subdomain for spam filtering and outbound
+relay, while the mailboxes themselves stay on a mail server you run.
+
 ### Signal — `signal`
 
 Spawns `signal-cli … jsonRpc` and wakes on each incoming Signal message. The
