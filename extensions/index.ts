@@ -128,6 +128,53 @@ const SOURCES: Record<string, SourceRegistration> = {
 			return config ? m.createAgentStreamForwarder(config, undefined, journal) : undefined;
 		},
 	},
+	chatto: {
+		configured: () =>
+			Boolean(
+				process.env.CHATTO_BASE_URL || process.env.CHATTO_TOKEN || process.env.CHATTO_ROOM_IDS,
+			),
+		async load() {
+			const m = await import("./sources/chatto.ts");
+			return configure(m.chattoConfigFromEnv, m.createChattoSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/chatto.ts");
+			return configure(m.chattoConfigFromEnv, m.createChattoActions);
+		},
+	},
+	mattermost: {
+		configured: () =>
+			Boolean(
+				process.env.MATTERMOST_BASE_URL ||
+					process.env.MATTERMOST_BOT_TOKEN ||
+					process.env.MATTERMOST_CHANNEL_IDS,
+			),
+		async load() {
+			const m = await import("./sources/mattermost.ts");
+			return configure(m.mattermostConfigFromEnv, m.createMattermostSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/mattermost.ts");
+			return configure(m.mattermostConfigFromEnv, m.createMattermostActions);
+		},
+	},
+	zulip: {
+		configured: () =>
+			Boolean(
+				process.env.ZULIP_ORGANIZATION_URL ||
+					process.env.ZULIP_BOT_EMAIL ||
+					process.env.ZULIP_API_KEY ||
+					process.env.ZULIP_CHANNEL_IDS,
+			),
+		async load() {
+			const m = await import("./sources/zulip.ts");
+			return configure(m.zulipConfigFromEnv, m.createZulipSource);
+		},
+		async loadActions() {
+			const m = await import("./sources/zulip.ts");
+			return configure(m.zulipConfigFromEnv, m.createZulipActions);
+		},
+	},
 };
 
 export default function channelEventsExtension(
@@ -238,18 +285,19 @@ export default function channelEventsExtension(
 		log(`waking agent for: ${[...new Set(events.map((event) => event.channel))].join(", ")}`);
 	};
 
-	const onEvent = (event: ChannelEvent): void => {
-		if (stopped) return; // ignore late callbacks from a source torn down mid-flight
+	const onEvent = (event: ChannelEvent): boolean => {
+		if (stopped) return false; // ignore late callbacks from a source torn down mid-flight
 		const key = channelEventKey(event);
 		if (!pending.has(key) && pending.size >= MAX_PENDING_EVENTS) {
 			if (!overflowLogged) {
 				overflowLogged = true;
 				log(`notification queue is full (${MAX_PENDING_EVENTS}); dropping new events`);
 			}
-			return;
+			return false;
 		}
 		pending.set(key, event);
 		maybeWake();
+		return true;
 	};
 
 	// Resolve and start one channel; returns its stop handle, or undefined when

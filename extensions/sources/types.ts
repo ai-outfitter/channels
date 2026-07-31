@@ -8,9 +8,11 @@
 export interface ChannelSource {
 	/**
 	 * Open the push connection and invoke `onEvent` once per received signal.
+	 * The sink returns false when its bounded queue cannot accept an event, so
+	 * sources with replayable streams can retry it.
 	 * Returns an idempotent stop handle that closes the connection.
 	 */
-	start(onEvent: (event: ChannelEvent) => void): Promise<() => Promise<void>>;
+	start(onEvent: (event: ChannelEvent) => unknown): Promise<() => Promise<void>>;
 }
 
 /**

@@ -2,8 +2,8 @@
 
 Channel sources wake the agent when work arrives, avoiding model-driven polling
 on every loop tick. Sources may use push connections, a local daemon, or
-lightweight polling. Slack exact items use the extension's channel-neutral tools
-after the wake.
+lightweight polling. Exact items from Slack, Chatto, Mattermost, and Zulip use
+the extension's channel-neutral tools after the wake.
 
 ## Why
 
@@ -45,10 +45,11 @@ This extension uses **inference-free lifecycle hooks** for the connection and
 - **Trust boundary:** the wake prompt is trusted and body-free. For located
   items, the model passes the opaque locator to `channel_read`; fetched content
   appears only inside explicit untrusted-content markers.
-- **Reliability:** each source owns recovery. JMAP, Signal, and Slack use the
-  shared supervisor (Slack only until its SDK owns reconnection), and GitHub
-  schedules its own polls. A separately configured model-polling loop
-  can provide an application-level backstop, but it does not restart sources.
+- **Reliability:** each source owns recovery. JMAP, Signal, Chatto, Mattermost,
+  and Zulip use the shared supervisor. Slack uses it for authentication and the
+  initial connection; its SDK handles reconnection once connected. GitHub
+  schedules its own polls. A separately configured model-polling loop can
+  provide an application-level backstop, but it does not restart sources.
 
 ## Multiple channels at once
 
@@ -77,6 +78,9 @@ profile can supply its secret without additional source-selection configuration.
 | `GITHUB_API_URL` / `GITHUB_SERVER_URL` | `github` source REST base (GHES). Every request is built from this base — a URL taken from a notification payload is never fetched. |
 | `GITHUB_NOTIFY_MARK_READ` | `github` source; **off by default**. Marking a thread read in the poll that emits the wake hides it from the agent just woken. |
 | `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` | `slack` source and action adapter. |
+| `CHATTO_BASE_URL` / `CHATTO_TOKEN` / optional `CHATTO_ROOM_IDS` | `chatto` source and action adapter. |
+| `MATTERMOST_BASE_URL` / `MATTERMOST_BOT_TOKEN` / optional `MATTERMOST_CHANNEL_IDS` | `mattermost` source and action adapter. |
+| `ZULIP_ORGANIZATION_URL` / `ZULIP_BOT_EMAIL` / `ZULIP_API_KEY` / optional `ZULIP_CHANNEL_IDS` | `zulip` source and action adapter. |
 
 ## Sources
 
@@ -100,14 +104,29 @@ hooks, queue, and trust boundary remain unchanged.
   containing only validated opaque locators. Its `@slack/web-api` action adapter implements
   `channel_read` and `channel_respond`, including bounded thread context,
   threaded replies, and handled reactions.
+- **`chatto`** (`extensions/sources/chatto.ts`) — connects to Chatto's
+  protocol-v2 realtime projection, resumes from cursors, and turns created
+  mention notifications into opaque locators. The action adapter validates
+  notification state, reads bounded room/thread context, posts in the correct
+  thread, and dismisses the exact notification. The generated ConnectRPC schema
+  is pinned because Chatto remains pre-1.0.
+- **`mattermost`** (`extensions/sources/mattermost.ts`) — authenticates a
+  Mattermost WebSocket and accepts only `posted` events whose recipient-scoped
+  mention list includes the bot. REST actions read bounded channel/thread
+  context, reply at the correct root, and add the handled reaction.
+- **`zulip`** (`extensions/sources/zulip.ts`) — registers and long-polls a
+  message event queue, recreating expired queues and attempting to delete the
+  active queue on shutdown. Channel mentions honor an optional numeric channel
+  allowlist while direct messages remain eligible. REST actions retain topic/DM
+  addressing and use a reaction as handled state.
 
 Source modules follow the dynamic-import convention in
 [architecture.md](architecture.md): the core registry probes environment
 variables without importing a source, then imports only selected, configured
 channel implementations at session startup.
 
-The agent-facing contract and its evaluation against Slack, JMAP, Signal,
-GitHub, and WhatsApp are documented in
+The agent-facing contract and its evaluation against Slack, Chatto, Mattermost,
+Zulip, JMAP, Signal, GitHub, and WhatsApp are documented in
 [architecture.md](architecture.md#agent-facing-tools).
 
 ## Composition — publish channels as outfitter profiles
