@@ -148,3 +148,33 @@ Wait one interval. Confirm that no new `waking agent` line appears.
 
 No row in this table produces an error or a stack trace. If the channel is
 quiet, examine your configuration first. Examine GitHub second.
+
+## Deploy this channel to a resident agent
+
+The round trip above proves the source. Four things change when the same
+channel runs as a deployed agent instead of a workstation process.
+
+**Give the agent a shell.** This is the most common way a deployment of this
+channel fails. A Slack or mail agent can run with its tools restricted to
+`channel_read,channel_respond`, because its channel delivers a message and its
+adapter sends the reply. This channel delivers no message and has no adapter:
+`channel_read` throws for it. An agent restricted that way starts cleanly,
+receives every wake, and can do nothing with any of them. A GitHub agent needs
+the tools that run `gh` and edit files.
+
+**Use two tokens.** The poller needs a classic personal access token, which is
+a broad credential. Repository work should use the narrowest token that does
+the job. Put the classic token in `GITHUB_NOTIFY_TOKEN` and the working token
+in `GITHUB_TOKEN`. The source reads the first and falls back to the second;
+`gh` reads the second. Deliver both as secrets, never in an image or a manifest.
+
+**Expect a restart to lose pending work.** The poller reports only threads
+updated after it started. A deployment restarts the pod, so anything assigned
+during the restart never produces a wake. Two consequences: do not deploy while
+an agent is mid-task, and instruct the agent to query its open assignments at
+session start, which recovers the work that the wake did not report.
+
+**Keep the account assignable.** Wakes for `assigned_issue` and `assigned_pr`
+arrive only if the forge can assign an issue to this account. A GitHub App
+cannot be an assignee, so the account must be a machine user, and it must have
+access to the repositories the agent works in.
