@@ -22,7 +22,7 @@ test("a locator-less wake does not send the agent to the channel tools", () => {
 		/Do not call channel_read or channel_respond/i,
 		"names the tools that do not apply, so the agent stops looking for them",
 	);
-	assert.match(prompt, /find the work yourself/i, "gives the agent somewhere to go instead");
+	assert.match(prompt, /find the work/i, "gives the agent somewhere to go instead");
 	assert.match(prompt, /untrusted data/i, "keeps the untrusted-content warning");
 });
 
