@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test, { mock } from "node:test";
+import test from "node:test";
 import type { GithubConfig } from "../extensions/sources/github.ts";
 import {
 	createGithubSource,
@@ -111,9 +111,12 @@ test("splits the single `assign` reason on subject type", async () => {
 		const matching = await run({ ...config, filters: new Set([filter]) }, routes);
 		await matching.stop();
 		matching.restore();
+		// The summary is the normalised filter name, not GitHub's raw `assign`.
+		// Every forge source must emit the same word for the same event, because
+		// the agent reads this string.
 		assert.deepEqual(
 			matching.events,
-			[{ channel: "github", summary: "assign" }],
+			[{ channel: "github", summary: filter }],
 			`${type} should match ${filter}`,
 		);
 
@@ -231,6 +234,36 @@ test("a 304 emits nothing", async () => {
 	assert.deepEqual(events, []);
 });
 
+test("sends If-Modified-Since on the poll after a Last-Modified", async () => {
+	// Regression: an earlier version built this header and then discarded it by
+	// spreading the auth headers over the caller's. Every poll was unconditional
+	// and billed, and no test noticed because the 304 case stubbed the response
+	// directly rather than checking the request.
+	const modified = "Tue, 28 Jul 2026 11:59:00 GMT";
+	const { calls, stop, restore } = await run(
+		{ ...config, pollMs: 10 },
+		{
+			[`${API}/user`]: { body: { login: "bot" } },
+			[`${API}/notifications`]: { body: [], headers: { "last-modified": modified } },
+		},
+	);
+	await stop();
+	restore();
+	const polls = calls.filter((c) => c.url.includes("/notifications?"));
+	assert.ok(polls.length >= 2, `expected a second poll, got ${polls.length}`);
+	assert.equal(
+		polls[0]?.headers["If-Modified-Since"],
+		undefined,
+		"the first poll has no cursor yet",
+	);
+	assert.equal(
+		polls[1]?.headers["If-Modified-Since"],
+		modified,
+		"the second poll must send the cursor GitHub gave us",
+	);
+	assert.equal(polls[1]?.headers.Authorization, "Bearer t", "auth headers survive the merge");
+});
+
 test("an identity-check failure does not stop the poller", async () => {
 	const { events, stop, restore } = await run(config, {
 		[`${API}/user`]: { body: {}, status: 401 },
@@ -253,7 +286,6 @@ test("config: token precedence, API base derivation, and safe defaults", () => {
 	const env = { ...process.env };
 	const restore = () => {
 		process.env = { ...env };
-		mock.reset();
 	};
 	try {
 		for (const key of [

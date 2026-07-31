@@ -16,6 +16,29 @@ export function parseList(raw: string | undefined): string[] {
 	return raw ? raw.split(/[\s,]+/).filter(Boolean) : [];
 }
 
+/**
+ * The message of a thrown value. `(err as Error).message` yields `undefined`
+ * when something rejects with a string, which is when the log matters most.
+ */
+export function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** Normalise a configured base URL so a caller can concatenate a path onto it. */
+export function trimTrailingSlash(raw: string): string {
+	return raw.replace(/\/+$/, "");
+}
+
+/**
+ * Anchor a polling cursor to the server's clock (the response `Date` header),
+ * never the local one. A source whose host clock drifts would otherwise skip or
+ * repeat a window on every poll.
+ */
+export function sinceFrom(res: Response): string {
+	const date = res.headers.get("date");
+	return date ? new Date(date).toISOString() : new Date().toISOString();
+}
+
 /** How long a source waits before re-establishing a dropped push connection. */
 export const RECONNECT_DELAY_MS = 5000;
 /** Maximum time shutdown waits for a source attempt to honor its abort signal. */

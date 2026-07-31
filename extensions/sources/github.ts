@@ -23,7 +23,7 @@
  * wake into a silent no-op.
  */
 import type { ChannelSource } from "./types.ts";
-import { parseList, scopedLog } from "./util.ts";
+import { errorMessage, parseList, scopedLog, sinceFrom, trimTrailingSlash } from "./util.ts";
 
 const log = scopedLog("github");
 
@@ -47,19 +47,12 @@ const KNOWN_FILTERS = new Set([
 	"state_change",
 	"ci_activity",
 ]);
-/**
- * Poll unconditionally every Nth tick. Conditional requests are an optimisation;
- * if `If-Modified-Since` ever interacts badly with the moving `since` window, an
- * unconditional sweep bounds the damage to a few intervals of delay instead of a
- * permanent silent stall.
- */
-const UNCONDITIONAL_EVERY = 10;
 
 /** Derive the REST base: github.com uses api.github.com, GHES uses /api/v3. */
 function apiFromEnv(): string {
-	const explicit = process.env.GITHUB_API_URL?.replace(/\/+$/, "");
-	if (explicit) return explicit;
-	const server = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+	const explicit = process.env.GITHUB_NOTIFY_API_URL || process.env.GITHUB_API_URL;
+	if (explicit) return trimTrailingSlash(explicit);
+	const server = trimTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com");
 	return /^https?:\/\/(www\.)?github\.com$/.test(server)
 		? "https://api.github.com"
 		: `${server}/api/v3`;
@@ -95,6 +88,14 @@ interface Notification {
 	repository?: { full_name?: string };
 }
 
+/** Per-request extras, merged onto the source's auth headers. */
+interface RequestOptions {
+	method?: string;
+	headers?: Record<string, string>;
+}
+/** An authenticated request against the configured API base. */
+type Request_ = (path: string, options?: RequestOptions) => Promise<Response>;
+
 /** Raise the configured floor to whatever pace GitHub asks for. */
 export function nextIntervalMs(floorMs: number, res: Response): number {
 	const asked = Number(res.headers.get("x-poll-interval") ?? 0) * 1000;
@@ -113,10 +114,14 @@ export function createGithubSource(cfg: GithubConfig): ChannelSource {
 			const controller = new AbortController();
 			let timer: ReturnType<typeof setTimeout> | undefined;
 
-			const request = async (path: string, init?: RequestInit): Promise<Response> =>
+			// Per-request headers merge *onto* the auth headers rather than being
+			// replaced by them. Spreading an init object and then assigning `headers`
+			// silently discards the caller's, which is how a conditional request can
+			// look correct and never be sent.
+			const request: Request_ = async (path, options) =>
 				await fetch(`${cfg.api}${path}`, {
-					...init,
-					headers,
+					method: options?.method ?? "GET",
+					headers: { ...headers, ...options?.headers },
 					signal: AbortSignal.any([controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
 				});
 
@@ -128,15 +133,13 @@ export function createGithubSource(cfg: GithubConfig): ChannelSource {
 				// clock (the response Date header), never the local one.
 				since: new Date().toISOString(),
 				intervalMs: cfg.pollMs,
-				announcedInterval: false,
-				ticks: 0,
 			};
 			const tick = async (): Promise<void> => {
 				try {
-					await pollOnce(cfg, state, headers, controller.signal, onEvent, request);
+					await pollOnce({ cfg, signal: controller.signal, onEvent, request }, state);
 				} catch (err) {
 					if (controller.signal.aborted) return;
-					log(`poll error: ${(err as Error).message}`);
+					log(`poll error: ${errorMessage(err)}`);
 				}
 			};
 
@@ -148,8 +151,10 @@ export function createGithubSource(cfg: GithubConfig): ChannelSource {
 					if (!controller.signal.aborted) schedule();
 				}, state.intervalMs);
 			};
+			// Diagnostics must not gate the first poll: a hung /user would delay the
+			// first wake by the request timeout.
+			void announceIdentity(cfg, request);
 			void (async () => {
-				await announceIdentity(cfg, request);
 				await tick();
 				if (!controller.signal.aborted) schedule();
 			})();
@@ -168,34 +173,33 @@ interface PollState {
 	since: string;
 	lastModified?: string | undefined;
 	intervalMs: number;
-	announcedInterval: boolean;
-	ticks: number;
+}
+
+/** Everything one poll needs that does not change between polls. */
+interface PollDeps {
+	cfg: GithubConfig;
+	signal: AbortSignal;
+	onEvent: (event: { channel: string; summary: string }) => void;
+	request: Request_;
 }
 
 /** One poll: fetch, pace, emit. Mutates `state` in place. */
-async function pollOnce(
-	cfg: GithubConfig,
-	state: PollState,
-	headers: Record<string, string>,
-	signal: AbortSignal,
-	onEvent: (event: { channel: string; summary: string }) => void,
-	request: (path: string, init?: RequestInit) => Promise<Response>,
-): Promise<void> {
-	// Conditional requests are free (a 304 costs no rate limit), but every
-	// failure here is silent, so drop the header periodically to self-heal.
-	const conditional =
-		state.lastModified && state.ticks % UNCONDITIONAL_EVERY !== 0
-			? { headers: { ...headers, "If-Modified-Since": state.lastModified } }
-			: undefined;
-	state.ticks += 1;
+async function pollOnce(deps: PollDeps, state: PollState): Promise<void> {
+	const { cfg, request } = deps;
+	// A 304 costs no rate limit, so ask for one whenever we have a cursor.
+	const conditional = state.lastModified
+		? { headers: { "If-Modified-Since": state.lastModified } }
+		: undefined;
 	const res = await request(
 		`/notifications?all=false&since=${encodeURIComponent(state.since)}`,
 		conditional,
 	);
-	state.intervalMs = nextIntervalMs(cfg.pollMs, res);
-	if (!state.announcedInterval && state.intervalMs > cfg.pollMs) {
-		state.announcedInterval = true;
-		log(`GitHub asked for a ${state.intervalMs}ms poll interval; using it over ${cfg.pollMs}ms`);
+	const interval = nextIntervalMs(cfg.pollMs, res);
+	if (interval !== state.intervalMs) {
+		// Log on change rather than once: a later change is what an operator
+		// debugging pacing needs to see, and a latch would hide it.
+		log(`poll interval is now ${interval}ms (configured floor ${cfg.pollMs}ms)`);
+		state.intervalMs = interval;
 	}
 	// 304 means nothing changed.
 	if (res.status === 304) return;
@@ -206,7 +210,7 @@ async function pollOnce(
 	}
 	state.lastModified = res.headers.get("last-modified") ?? state.lastModified;
 	const list = (await res.json()) as Notification[];
-	state.seen = emitNew(list, state.seen, cfg, signal, onEvent, request);
+	state.seen = await emitNew(list, state.seen, deps);
 	state.since = sinceFrom(res);
 }
 
@@ -216,78 +220,72 @@ async function pollOnce(
  * and an agent that is simply never woken. An identity lookup that fails must not
  * stop the poller: GitHub supplies the reason, so this source never needs a login.
  */
-async function announceIdentity(
-	cfg: GithubConfig,
-	request: (path: string, init?: RequestInit) => Promise<Response>,
-): Promise<void> {
-	const settings = `filters=[${[...cfg.filters].join(",")}] interval=${cfg.pollMs}ms api=${cfg.api} markRead=${cfg.markRead}`;
-	try {
-		const res = await request("/user");
-		if (res.status !== 200) {
-			log(`identity check returned HTTP ${res.status}; polling anyway — ${settings}`);
-			return;
-		}
-		const user = (await res.json()) as { login?: string };
-		log(`watching notifications as ${user.login ?? "unknown"}; ${settings}`);
-	} catch (err) {
-		log(`identity check failed: ${(err as Error).message}; polling anyway — ${settings}`);
-	}
+async function announceIdentity(cfg: GithubConfig, request: Request_): Promise<void> {
+	const who = await request("/user")
+		.then(async (res) =>
+			res.status === 200 ? ((await res.json()) as { login?: string }).login : undefined,
+		)
+		.catch(() => undefined);
+	log(
+		`watching notifications as ${who ?? "unknown (identity check failed)"}; ` +
+			`filters=[${[...cfg.filters].join(",")}] interval=${cfg.pollMs}ms ` +
+			`api=${cfg.api} markRead=${cfg.markRead}`,
+	);
 }
 
 /**
  * Emit an event for each not-yet-seen, matching notification; return the keys
- * seen in this batch (the next poll's dedup set). `summary` stays trusted —
- * `reason` is a fixed GitHub enum, never the attacker-controlled issue/PR title.
+ * seen in this batch (the next poll's dedup set). `summary` stays trusted — it
+ * is a `Reason` this source chose, never the attacker-controlled issue/PR title.
  */
-function emitNew(
+async function emitNew(
 	list: Notification[],
 	seen: Set<string>,
-	cfg: GithubConfig,
-	signal: AbortSignal,
-	onEvent: (event: { channel: string; summary: string }) => void,
-	request: (path: string, init?: RequestInit) => Promise<Response>,
-): Set<string> {
+	deps: PollDeps,
+): Promise<Set<string>> {
+	const { cfg, signal, onEvent, request } = deps;
 	const batch = new Set<string>();
+	const handled: Notification[] = [];
 	for (const n of list) {
 		const key = `${n.id}@${n.updated_at}`;
 		batch.add(key);
-		if (!seen.has(key) && !signal.aborted && matches(n, cfg.filters)) {
-			onEvent({ channel: "github", summary: n.reason });
-			if (cfg.markRead) void markRead(n, request);
-		}
+		if (seen.has(key) || signal.aborted) continue;
+		const reason = classify(n);
+		if (!reason || !cfg.filters.has(reason)) continue;
+		onEvent({ channel: "github", summary: reason });
+		handled.push(n);
+	}
+	// Drain serially. One poll can return up to 50 threads, and GitHub's
+	// secondary rate limit rejects concurrent writes to the same endpoint — a
+	// burst of unawaited PATCHes 403s, loses every mark, and re-fetches the same
+	// threads next poll. The poll loop is already serialised, so waiting is free.
+	if (cfg.markRead) {
+		for (const n of handled) await markRead(n, request);
 	}
 	return batch;
 }
 
 /** Best-effort: a failed mark-read must not drop the event already emitted. */
-async function markRead(
-	n: Notification,
-	request: (path: string, init?: RequestInit) => Promise<Response>,
-): Promise<void> {
+async function markRead(n: Notification, request: Request_): Promise<void> {
 	try {
 		const res = await request(`/notifications/threads/${n.id}`, { method: "PATCH" });
 		if (res.status >= 400) log(`mark-read returned HTTP ${res.status}`);
 	} catch (err) {
-		log(`mark-read failed: ${(err as Error).message}`);
+		log(`mark-read failed: ${errorMessage(err)}`);
 	}
-}
-
-/** Anchor `since` to GitHub's clock (response Date), falling back to local. */
-function sinceFrom(res: Response): string {
-	const date = res.headers.get("date");
-	return date ? new Date(date).toISOString() : new Date().toISOString();
 }
 
 /**
- * A filter name matches its reason of the same name. `assign` is the exception:
- * GitHub uses one reason for issues and pull requests, split here on subject type.
+ * Derive why this account was notified, in the vocabulary the operator
+ * configured and the agent reads. GitHub supplies a `reason` already, so unlike
+ * a forge that omits it, no extra request is needed — but the names still have
+ * to be normalised: GitHub sends one `assign` reason for both issues and pull
+ * requests, and every forge source must emit the same word for the same event.
  */
-function matches(n: Notification, filters: Set<string>): boolean {
-	if (n.reason === "assign") {
-		const type = n.subject?.type; // "PullRequest" | "Issue"
-		if (type === "Issue") return filters.has("assigned_issue");
-		if (type === "PullRequest") return filters.has("assigned_pr");
-		return false;
-	}
-	return filters.has(n.reason);
+function classify(n: Notification): string | undefined {
+	if (n.reason !== "assign") return n.reason;
+	const type = n.subject?.type; // "PullRequest" | "Issue"
+	if (type === "Issue") return "assigned_issue";
+	if (type === "PullRequest") return "assigned_pr";
+	return undefined;
 }
