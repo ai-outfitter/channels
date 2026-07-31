@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
 	createServer as createHttpServer,
@@ -7,13 +7,11 @@ import {
 } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+	AGENT_MAX_BODY_BYTES,
 	type AgentEndpoint,
 	type AgentSendInput,
-	validateBody,
 	validateIdentifier,
 } from "../agent/types.ts";
 import {
@@ -142,6 +140,7 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 		let connection: AuthenticatedConnection | undefined;
 		let handling = Promise.resolve();
 		const withinRateBudget = createFrameRateLimiter(config);
+		let closed = false;
 		let websocket: ServerWebSocket;
 		websocket = new ServerWebSocket(
 			socket,
@@ -176,6 +175,7 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 					});
 			},
 			() => {
+				closed = true;
 				websockets.delete(websocket);
 				if (connection) cancelQueriesFor(connection, pendingQueries);
 				if (connection && connections.get(connection.endpoint) === connection) {
@@ -184,6 +184,12 @@ export async function startRelayServer(config: RelayServerConfig): Promise<Runni
 				}
 			},
 		);
+		// The constructor consumes `head` synchronously, so a malformed frame
+		// there has already run the close callback while `websocket` was still
+		// unassigned — its delete was a no-op. Adding the dead socket now would
+		// leak a connection slot that only a restart reclaims, and the limit
+		// check above runs before authentication.
+		if (closed) return;
 		websockets.add(websocket);
 	});
 
@@ -508,6 +514,17 @@ async function handleSend(
 	}
 }
 
+/**
+ * Preview text is bounded like a message body but, unlike one, may be empty:
+ * Pi legitimately emits `text_end` with `""` when a block produced no text.
+ */
+function validatePreviewText(value: string): string {
+	if (Buffer.byteLength(value) > AGENT_MAX_BODY_BYTES) {
+		throw new Error(`preview text exceeds ${AGENT_MAX_BODY_BYTES} UTF-8 bytes`);
+	}
+	return value;
+}
+
 function parseStreamEvent(value: unknown): RelayStreamEvent {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new Error("invalid stream event");
@@ -521,9 +538,17 @@ function parseStreamEvent(value: unknown): RelayStreamEvent {
 		case "text_start":
 			return { type: "text_start", contentIndex };
 		case "text_delta":
-			return { type: "text_delta", contentIndex, delta: validateBody(String(event.delta ?? "")) };
+			return {
+				type: "text_delta",
+				contentIndex,
+				delta: validatePreviewText(String(event.delta ?? "")),
+			};
 		case "text_end":
-			return { type: "text_end", contentIndex, content: validateBody(String(event.content ?? "")) };
+			return {
+				type: "text_end",
+				contentIndex,
+				content: validatePreviewText(String(event.content ?? "")),
+			};
 		default:
 			throw new Error("unsupported stream event type");
 	}
@@ -761,11 +786,12 @@ function findCredential(
 	credentials: readonly RelayCredential[],
 	token: string,
 ): RelayCredential | undefined {
-	const candidate = Buffer.from(token);
-	return credentials.find((credential) => {
-		const expected = Buffer.from(credential.token);
-		return expected.length === candidate.length && timingSafeEqual(expected, candidate);
-	});
+	// Compare fixed-size digests, not the tokens themselves: a raw comparison
+	// needs a length short-circuit before timingSafeEqual, and that short-circuit
+	// leaks each configured token's length to an unauthenticated prober.
+	const digest = (value: string) => createHash("sha256").update(value).digest();
+	const candidate = digest(token);
+	return credentials.find((credential) => timingSafeEqual(digest(credential.token), candidate));
 }
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup validation enumerates independent fail-closed checks
@@ -884,15 +910,15 @@ function formatHost(host: string): string {
 }
 
 export async function configFromEnv(): Promise<RelayServerConfig> {
-	// Defaults assume the common deployment: the relay hosted inside an
-	// agent's pi process, so only AGENT_RELAY_SERVER=1 plus the credential
-	// and TLS paths need configuring. TLS remains fail-closed: a non-loopback
-	// host without cert/key still refuses to start.
-	const host = process.env.AGENT_RELAY_HOST?.trim() || "0.0.0.0";
+	// The broker's whole config surface is AGENT_RELAY_*; it never reads the
+	// client transport's AGENT_* variables. Reachability defaults to loopback —
+	// a deployment that serves other hosts opts into a wider bind explicitly —
+	// and the store path is required so a misconfigured relay refuses to start
+	// instead of silently opening an empty store somewhere else.
+	const host = process.env.AGENT_RELAY_HOST?.trim() || "127.0.0.1";
 	const port = Number(process.env.AGENT_RELAY_PORT ?? "8787");
-	const storePath =
-		process.env.AGENT_RELAY_STORE_PATH?.trim() ||
-		join(homedir(), ".channels", "relay", "store.json");
+	const storePath = process.env.AGENT_RELAY_STORE_PATH?.trim();
+	if (!storePath) throw new Error("AGENT_RELAY_STORE_PATH is required");
 	const credentialsPath = process.env.AGENT_RELAY_CREDENTIALS_PATH?.trim();
 	if (!credentialsPath) throw new Error("AGENT_RELAY_CREDENTIALS_PATH is required");
 	const credentialsDocument = JSON.parse(await readFile(credentialsPath, "utf8")) as {
@@ -912,12 +938,10 @@ export async function configFromEnv(): Promise<RelayServerConfig> {
 	const maxFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_FRAMES_PER_WINDOW");
 	const maxStreamFramesPerWindow = optionalIntegerEnv("AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW");
 	const rateWindowMs = optionalIntegerEnv("AGENT_RELAY_RATE_WINDOW_MS");
-	// A relay hosted inside an agent is that agent's relay: default the
-	// singleton conversation to the hosting endpoint. Explicit env overrides;
-	// an empty value opts out.
-	const singletonSource =
-		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS ?? process.env.AGENT_ENDPOINT_ID ?? "";
-	const singletonEndpoints = singletonSource
+	// Conversation folding is a cross-tenant routing policy, so it is only ever
+	// enabled by its own explicit variable — never inherited from the hosting
+	// agent's client-scope AGENT_ENDPOINT_ID.
+	const singletonEndpoints = (process.env.AGENT_RELAY_SINGLETON_ENDPOINTS ?? "")
 		.split(/[\s,]+/)
 		.map((value) => value.trim())
 		.filter(Boolean);
@@ -950,7 +974,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 			console.error(JSON.stringify({ event: "relay_started", url: running.url }));
 		})
 		.catch((error) => {
-			console.error(JSON.stringify({ event: "relay_failed", error: safeMessage(error) }));
+			// This is the operator's own stderr, not a protocol frame — redacting
+			// here turns "bad TLS key" into an unactionable "request was rejected".
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(JSON.stringify({ event: "relay_failed", error: message }));
 			process.exitCode = 1;
 		});
 }

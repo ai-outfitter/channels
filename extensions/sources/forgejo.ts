@@ -39,6 +39,27 @@ export interface ForgejoConfig {
 const DEFAULT_FILTERS = ["review_requested", "assigned_issue", "assigned_pr"];
 const DEFAULT_POLL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_BACKOFF_MS = 15 * 60_000;
+
+/**
+ * The delay before the next poll: the configured interval after a clean tick,
+ * doubling per consecutive failure up to `maxMs`. A revoked token or an outage
+ * otherwise hammers the forge at full pace forever, one identical log line per
+ * tick.
+ */
+export function backoffDelayMs(pollMs: number, failures: number, maxMs = MAX_BACKOFF_MS): number {
+	if (failures <= 0) return pollMs;
+	return Math.min(pollMs * 2 ** Math.min(failures, 20), Math.max(pollMs, maxMs));
+}
+
+/**
+ * Read and discard a response body that will not be parsed. Node's fetch keeps
+ * the connection out of the pool until the body is consumed, so skipping this
+ * on every error path stalls the pool across a long outage.
+ */
+function drain(res: Response): void {
+	void res.text().catch(() => {});
+}
 
 export function forgejoConfigFromEnv(): ForgejoConfig | undefined {
 	const token = process.env.FORGEJO_TOKEN;
@@ -84,12 +105,18 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 			const controller = new AbortController();
 			// Keys seen in the previous poll only — `since` already excludes
 			// anything older, so this just dedups threads sharing the
-			// `since`-boundary second.
+			// `since`-boundary second. While a tick is failing part-way it also
+			// accumulates the threads already emitted, so a retried window never
+			// wakes the agent twice for the same thread.
 			let seen = new Set<string>();
 			// Only notify on threads updated after start-up, anchored to the
-			// forge's clock (the response Date header), never the local one.
-			let since = new Date().toISOString();
+			// forge's clock — seeded from the first probe's Date header, never
+			// the local one. A local seed ahead of the forge silently filters
+			// out every notification in the drift window; behind, the first tick
+			// re-emits history.
+			let since: string | undefined;
 			let login = cfg.user;
+			let failures = 0;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 
 			const request: Request_ = async (url, init) =>
@@ -105,6 +132,7 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 				if (login) return login;
 				const res = await get(`${api}/user`);
 				if (res.status !== 200) {
+					drain(res);
 					log(`identity lookup returned HTTP ${res.status}`);
 					return undefined;
 				}
@@ -114,25 +142,45 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 				return login;
 			};
 
+			/** One poll. Returns false when it should count toward backoff. */
+			const poll = async (): Promise<boolean> => {
+				const me = await resolveLogin();
+				if (!me) return false;
+				const polled = await pollThreads(api, get, since);
+				if (!polled) return false;
+				if (since === undefined) {
+					// First contact: anchor the cursor to the forge's clock and emit
+					// nothing — everything currently listed predates start-up.
+					since = polled.since;
+					return true;
+				}
+				const { batch, complete } = await emitNew(
+					polled.list,
+					seen,
+					me,
+					cfg,
+					api,
+					request,
+					controller.signal,
+					onEvent,
+				);
+				// Advance the cursor only after every thread in the window was
+				// classified. A failed subject lookup keeps the old cursor so the
+				// thread is retried; the ones already emitted were added to `seen`
+				// as they fired, so the retry cannot repeat them.
+				if (complete) {
+					seen = batch;
+					since = polled.since;
+				}
+				return complete;
+			};
+
 			const tick = async (): Promise<void> => {
 				try {
-					const me = await resolveLogin();
-					if (!me) return;
-					const polled = await pollThreads(api, get, since);
-					if (!polled) return;
-					seen = await emitNew(
-						polled.list,
-						seen,
-						me,
-						cfg,
-						api,
-						request,
-						controller.signal,
-						onEvent,
-					);
-					since = polled.since;
+					failures = (await poll()) ? 0 : failures + 1;
 				} catch (err) {
 					if (controller.signal.aborted) return;
+					failures += 1;
 					log(`poll error: ${errorMessage(err)}`);
 				}
 			};
@@ -140,10 +188,13 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 			// Self-schedule the next poll only after this one settles, so a slow or
 			// hung request can never overlap and race `seen`/`since`.
 			const schedule = (): void => {
-				timer = setTimeout(async () => {
-					await tick();
-					if (!controller.signal.aborted) schedule();
-				}, cfg.pollMs);
+				timer = setTimeout(
+					async () => {
+						await tick();
+						if (!controller.signal.aborted) schedule();
+					},
+					backoffDelayMs(cfg.pollMs, failures),
+				);
 			};
 			void (async () => {
 				await tick();
@@ -163,33 +214,48 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
  * so the list call is skipped entirely when there is nothing new. Returns the
  * threads plus the `since` to use next, or `undefined` when the forge could not
  * be read — in which case `since` must not advance or the missed window is lost.
+ *
+ * The next cursor always comes from the **probe** response: the probe precedes
+ * the listing query, so a thread updated between the two lands after the cursor
+ * and is picked up next tick. Taking it from the list response — stamped after
+ * the forge evaluated the query — leaves a gap that belongs to neither window.
+ * On the very first call `since` is still unset; the caller seeds it from the
+ * probe and skips the listing entirely.
  */
 async function pollThreads(
 	api: string,
 	get: (url: string) => Promise<Response>,
-	since: string,
+	since: string | undefined,
 ): Promise<{ list: Thread[]; since: string } | undefined> {
 	const probe = await get(`${api}/notifications/new`);
 	if (probe.status !== 200) {
+		drain(probe);
 		log(`unread probe returned HTTP ${probe.status}`);
 		return undefined;
 	}
 	const { new: unread } = (await probe.json()) as { new?: number };
-	if (!unread) return { list: [], since: sinceFrom(probe) };
+	const cursor = sinceFrom(probe);
+	if (!unread || since === undefined) return { list: [], since: cursor };
 
 	const res = await get(
 		`${api}/notifications?status-types=unread&since=${encodeURIComponent(since)}`,
 	);
 	if (res.status !== 200) {
+		drain(res);
 		log(`poll returned HTTP ${res.status}`);
 		return undefined;
 	}
-	return { list: (await res.json()) as Thread[], since: sinceFrom(res) };
+	return { list: (await res.json()) as Thread[], since: cursor };
 }
 
 /**
  * Emit an event for each not-yet-seen thread whose derived reason matches;
- * return the keys seen in this batch (the next poll's dedup set).
+ * return the keys seen in this batch (the next poll's dedup set) and whether
+ * every thread was classified. A thrown or 5xx subject lookup marks the batch
+ * incomplete — that thread is left out of the dedup sets so the caller holds
+ * the cursor and retries it, while each thread that *was* processed is added
+ * to `seen` immediately so the retried window cannot wake the agent for it
+ * again.
  *
  * `summary` is one of our own `Reason` values — deliberately never the issue or
  * pull-request title, which is attacker-controlled text.
@@ -203,26 +269,38 @@ async function emitNew(
 	request: Request_,
 	signal: AbortSignal,
 	onEvent: (event: { channel: string; summary: string }) => void,
-): Promise<Set<string>> {
+): Promise<{ batch: Set<string>; complete: boolean }> {
 	const batch = new Set<string>();
+	let complete = true;
 	for (const thread of list) {
 		const key = `${thread.id}@${thread.updated_at}`;
+		if (seen.has(key) || signal.aborted) {
+			batch.add(key);
+			continue;
+		}
+		try {
+			const reason = await classify(thread, login, api, request);
+			if (reason && cfg.filters.has(reason)) {
+				onEvent({ channel: "forgejo", summary: reason });
+				if (cfg.markRead) await markRead(thread, api, request);
+			}
+		} catch (err) {
+			if (signal.aborted) return { batch, complete: false };
+			complete = false;
+			log(`subject lookup failed for thread ${thread.id}: ${errorMessage(err)}`);
+			continue;
+		}
 		batch.add(key);
-		if (seen.has(key) || signal.aborted) continue;
-
-		const reason = await classify(thread, login, api, request);
-		if (!reason || !cfg.filters.has(reason)) continue;
-
-		onEvent({ channel: "forgejo", summary: reason });
-		if (cfg.markRead) await markRead(thread, api, request);
+		seen.add(key);
 	}
-	return batch;
+	return { batch, complete };
 }
 
 /**
  * Derive why this account was notified. Forgejo threads carry no `reason`, so
- * the subject is fetched and inspected; an unreachable or unrecognized subject
- * yields no reason rather than a guess.
+ * the subject is fetched and inspected; an unrecognized subject yields no
+ * reason rather than a guess, and a transient lookup failure throws so the
+ * thread is retried rather than silently lost.
  */
 async function classify(
 	thread: Thread,
@@ -243,6 +321,13 @@ async function classify(
 
 	const res = await request(`${api}${path}`);
 	if (res.status !== 200) {
+		drain(res);
+		// A server-side failure is transient: throw so the caller retries the
+		// thread instead of dropping the notification. Anything else (404 for a
+		// deleted subject, 403) will not improve on retry — drop it.
+		if (res.status >= 500 || res.status === 429) {
+			throw new Error(`subject lookup returned HTTP ${res.status}`);
+		}
 		log(`subject lookup returned HTTP ${res.status}`);
 		return undefined;
 	}
@@ -295,6 +380,7 @@ async function markRead(thread: Thread, api: string, request: Request_): Promise
 		const res = await request(`${api}/notifications/threads/${thread.id}?to-status=read`, {
 			method: "PATCH",
 		});
+		drain(res);
 		if (res.status >= 400) log(`mark-read returned HTTP ${res.status}`);
 	} catch (err) {
 		log(`mark-read failed: ${errorMessage(err)}`);

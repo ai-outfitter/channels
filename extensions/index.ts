@@ -42,10 +42,11 @@ export interface SourceRegistration {
 	/** Load the native agent channel's discovery/send actions, when supported. */
 	loadAgentActions?(journal?: AgentSessionJournal): Promise<AgentChannelActions | undefined>;
 	/** Load a forwarder that streams Pi assistant text events as previews. */
-	loadStreamForwarder?(
-		journal?: AgentSessionJournal,
-	): Promise<((event: MessageUpdateEvent) => void) | undefined>;
+	loadStreamForwarder?(journal?: AgentSessionJournal): Promise<StreamForwarder | undefined>;
 }
+
+/** A message-update forwarder; `stop` latches it off at session shutdown. */
+export type StreamForwarder = ((event: MessageUpdateEvent) => void) & { stop?(): void };
 
 /** Run a source module's env-config probe and construct it when configured. */
 function configure<C, T>(fromEnv: () => C | undefined, create: (cfg: C) => T): T | undefined {
@@ -312,17 +313,17 @@ export default function channelEventsExtension(
 	// reply is in flight. Loaded lazily on the first assistant token; failures
 	// disable streaming for the session rather than affecting the turn.
 	const agentRegistration = sources.agent;
+	let forwarder: StreamForwarder | null | undefined;
+	let forwarderLoading: Promise<void> | undefined;
 	if (wanted.includes("agent") && agentRegistration?.loadStreamForwarder) {
-		let forwarder: ((event: MessageUpdateEvent) => void) | null | undefined;
-		let loading: Promise<void> | undefined;
 		pi.on("message_update", (event) => {
-			if (forwarder === null) return;
+			if (stopped || forwarder === null) return;
 			if (forwarder) {
 				forwarder(event as MessageUpdateEvent);
 				return;
 			}
-			if (loading) return;
-			loading = agentRegistration
+			if (forwarderLoading) return;
+			forwarderLoading = agentRegistration
 				.loadStreamForwarder?.(agentJournal)
 				.then((loaded) => {
 					forwarder = loaded ?? null;
@@ -337,6 +338,12 @@ export default function channelEventsExtension(
 
 	pi.on("session_shutdown", async () => {
 		stopped = true;
+		// Stop the forwarder before releasing transports: a pending flush after
+		// the shared transport is released must be dropped, not given a chance
+		// to open a fresh connection nothing will ever close.
+		forwarder?.stop?.();
+		forwarder = undefined;
+		forwarderLoading = undefined;
 		const all = stops.splice(0);
 		await Promise.all(all.map((stop) => stop().catch(() => {})));
 	});

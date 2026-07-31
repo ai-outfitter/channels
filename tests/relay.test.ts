@@ -503,6 +503,22 @@ test("relay forwards ephemeral stream previews without persisting them", async (
 			},
 		});
 		await alice.next((frame) => frame.type === "stream");
+
+		// Pi legitimately ends a text block that produced nothing: an empty
+		// `text_end` must pass validation and forward, not be rejected as an
+		// invalid body.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "text_end", contentIndex: 1, content: "" },
+			},
+		});
+		const emptyEnd = await alice.next((frame) => frame.type === "stream");
+		assert.deepEqual(emptyEnd.event, { type: "text_end", contentIndex: 1, content: "" });
+
 		const persisted = await readFile(storePath, "utf8").catch(() => "");
 		assert.ok(!persisted.includes("Hello"), "previews must never be persisted");
 		assert.ok(!persisted.includes("preview-1"), "preview ids must never be persisted");
@@ -586,7 +602,7 @@ test("singleton endpoints fold every peer and channel into one conversation", as
 	}
 });
 
-test("configFromEnv defaults the singleton endpoint to the hosting agent", async () => {
+test("configFromEnv keeps broker policy on AGENT_RELAY_* variables only", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-relay-env-test-"));
 	const credentialsPath = join(root, "credentials.json");
 	const { writeFile } = await import("node:fs/promises");
@@ -594,24 +610,83 @@ test("configFromEnv defaults the singleton endpoint to the hosting agent", async
 	const saved = { ...process.env };
 	try {
 		process.env.AGENT_RELAY_CREDENTIALS_PATH = credentialsPath;
+		process.env.AGENT_RELAY_STORE_PATH = join(root, "store.json");
+		// The client transport's identity variable must never leak into broker
+		// policy: no singleton fallback, no wide bind, just because it is set.
 		process.env.AGENT_ENDPOINT_ID = "link:vega";
 		delete process.env.AGENT_RELAY_SINGLETON_ENDPOINTS;
 		delete process.env.AGENT_RELAY_HOST;
-		delete process.env.AGENT_RELAY_STORE_PATH;
 		delete process.env.AGENT_RELAY_TLS_KEY_PATH;
 		delete process.env.AGENT_RELAY_TLS_CERT_PATH;
 		const { configFromEnv } = await import("../extensions/relay/server.ts");
 		const config = await configFromEnv();
-		assert.deepEqual(config.singletonEndpoints, ["link:vega"]);
-		assert.equal(config.host, "0.0.0.0");
-		assert.ok(config.storePath.endsWith("/.channels/relay/store.json"));
+		assert.equal(config.singletonEndpoints, undefined);
+		assert.equal(config.host, "127.0.0.1");
 
-		// Explicit empty opts out of the singleton default.
-		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS = "";
-		const optedOut = await configFromEnv();
-		assert.equal(optedOut.singletonEndpoints, undefined);
+		// Folding is enabled only by its own explicit variable.
+		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS = "link:vega link:rigel";
+		const explicit = await configFromEnv();
+		assert.deepEqual(explicit.singletonEndpoints, ["link:vega", "link:rigel"]);
+
+		// A missing store path refuses to start rather than opening an empty
+		// store somewhere the operator did not choose.
+		delete process.env.AGENT_RELAY_STORE_PATH;
+		await assert.rejects(configFromEnv(), /AGENT_RELAY_STORE_PATH is required/);
 	} finally {
 		process.env = saved;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("a connection killed while parsing the upgrade head does not leak its slot", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-slot-test-"));
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath: join(root, "relay.json"),
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		maxConnections: 1,
+	});
+	try {
+		const { connect } = await import("node:net");
+		const port = Number(new URL(relay.url.replace(/^ws/, "http")).port);
+		// The upgrade request and a malformed websocket frame (FIN=0) in one
+		// segment: the frame is consumed synchronously inside the ServerWebSocket
+		// constructor and kills the connection before it is tracked. Do it a few
+		// times — with the leak, one dead socket already exhausts maxConnections=1.
+		const upgrade = Buffer.from(
+			[
+				"GET /v1/connect HTTP/1.1",
+				"Host: 127.0.0.1",
+				"Upgrade: websocket",
+				"Connection: Upgrade",
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+				"Sec-WebSocket-Version: 13",
+				"",
+				"",
+			].join("\r\n"),
+		);
+		const badFrame = Buffer.from([0x01, 0x80, 0x00, 0x00, 0x00, 0x00]);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			await new Promise<void>((resolve) => {
+				const socket = connect(port, "127.0.0.1", () => {
+					socket.write(Buffer.concat([upgrade, badFrame]));
+				});
+				// Keep the readable side flowing: a paused socket never surfaces the
+				// server's FIN, and this promise waits forever.
+				socket.resume();
+				socket.on("close", () => resolve());
+				socket.on("error", () => resolve());
+			});
+		}
+		// Every slot must still be free for a real client.
+		const client = await TestClient.open(relay.url);
+		const auth = await client.authenticate("alice-secret", "alice-web", "operator:alice");
+		assert.equal(auth.type, "authenticated");
+		client.close();
+	} finally {
+		await relay.close();
 		await rm(root, { recursive: true, force: true });
 	}
 });

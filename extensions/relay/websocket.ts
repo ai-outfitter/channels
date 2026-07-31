@@ -4,6 +4,13 @@ import { RELAY_MAX_FRAME_BYTES } from "./protocol.ts";
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/**
+ * How much a recipient may leave unread before it is disconnected. A stalled
+ * TCP peer otherwise buffers every frame in this process without bound; the
+ * durable queue redelivers on reconnect, so closing loses nothing durable.
+ */
+export const MAX_BUFFERED_BYTES = 16 * RELAY_MAX_FRAME_BYTES;
+
 export function websocketAccept(key: string): string {
 	return createHash("sha1").update(`${key}${WEBSOCKET_GUID}`).digest("base64");
 }
@@ -36,7 +43,12 @@ export class ServerWebSocket {
 	}
 
 	send(value: unknown): void {
-		if (!this.#closed) this.#socket.write(encodeTextFrame(JSON.stringify(value)));
+		if (this.#closed) return;
+		if (this.#socket.writableLength > MAX_BUFFERED_BYTES) {
+			this.close(1008);
+			return;
+		}
+		this.#socket.write(encodeTextFrame(JSON.stringify(value)));
 	}
 
 	close(code = 1000): void {

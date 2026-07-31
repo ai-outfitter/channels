@@ -243,19 +243,25 @@ export function extractJsonStringValue(source: string, key: string): string | un
 
 /**
  * Forward the in-progress reply as ephemeral relay previews while it is
- * being produced. Two sources feed the preview, both reusing Pi's text
- * event vocabulary on the wire:
- *
- * - assistant text events pass through as-is;
- * - `channel_respond` tool-call argument deltas are decoded incrementally
- *   and re-emitted as synthesized text events, because the durable reply
- *   body is that tool call's `response` parameter, not assistant prose.
+ * being produced. Only `channel_respond` tool-call argument deltas feed the
+ * preview: they are decoded incrementally and re-emitted as synthesized Pi
+ * text events, because the durable reply body is that tool call's `response`
+ * parameter, not assistant prose. Attribution is exact — the call's locator
+ * argument names the target message, so no guessing from journal state.
  *
  * Deltas are coalesced and flushed at most every `flushMs` so relay frame
- * budgets hold. Previews are only sent while exactly one
- * delivered-but-unreplied agent message exists — with several open targets
- * the attribution would be a guess, so we skip.
+ * budgets hold.
  */
+export interface AgentStreamForwarder {
+	(event: MessageUpdateEvent): void;
+	/**
+	 * Latch the forwarder off and drop anything still buffered. Called at
+	 * session shutdown so a pending flush or a late event can never construct
+	 * a fresh transport after the shared one was released.
+	 */
+	stop(): void;
+}
+
 export function createAgentStreamForwarder(
 	config: AgentChannelConfig,
 	createTransport: (
@@ -264,11 +270,12 @@ export function createAgentStreamForwarder(
 	) => AgentTransport = sharedAgentTransport,
 	journal = new AgentSessionJournal(),
 	flushMs = STREAM_FLUSH_MS,
-): (event: MessageUpdateEvent) => void {
+): AgentStreamForwarder {
 	let bufferedDelta = "";
 	let bufferedIndex = 0;
 	let bufferedTarget: string | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+	let stopped = false;
 	const toolArgs = new Map<number, string>();
 	const toolEmitted = new Map<number, number>();
 
@@ -288,10 +295,21 @@ export function createAgentStreamForwarder(
 		}
 	};
 
+	// Emitting must never *construct* a transport: after session shutdown the
+	// shared one is released, and creating a fresh one here would open a new
+	// WebSocket with its own reconnect loop that nothing ever closes. Look up
+	// the live shared transport, or fall back to the injected factory (which
+	// tests use to hand in a fake).
+	const sharedKey = JSON.stringify(config);
+	const lookupTransport = (): AgentTransport | undefined =>
+		createTransport === sharedAgentTransport
+			? sharedTransports.get(sharedKey)?.transport
+			: createTransport(config, journal);
+
 	const emit = (targetId: string | undefined, event: RelayStreamEvent): void => {
-		if (!targetId) return;
-		const transport = createTransport(config, journal);
-		void transport.stream?.(targetId, event).catch(() => {});
+		if (!targetId || stopped) return;
+		const transport = lookupTransport();
+		void transport?.stream?.(targetId, event).catch(() => {});
 	};
 
 	const flushDeltas = (): void => {
@@ -325,7 +343,8 @@ export function createAgentStreamForwarder(
 	};
 
 	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: one event dispatcher keeps the preview pipeline's state together
-	return (event) => {
+	const forward = (event: MessageUpdateEvent): void => {
+		if (stopped) return;
 		const assistant = event.assistantMessageEvent;
 		switch (assistant.type) {
 			case "toolcall_start":
@@ -381,6 +400,18 @@ export function createAgentStreamForwarder(
 				break;
 		}
 	};
+	return Object.assign(forward, {
+		stop(): void {
+			stopped = true;
+			if (flushTimer) {
+				clearTimeout(flushTimer);
+				flushTimer = undefined;
+			}
+			bufferedDelta = "";
+			toolArgs.clear();
+			toolEmitted.clear();
+		},
+	});
 }
 
 export function createAgentActions(
