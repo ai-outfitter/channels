@@ -223,3 +223,38 @@ test("config prefers FORGEJO_API_URL and strips a trailing slash", () => {
 	}
 	mock.reset();
 });
+
+test("never fetches a host named by a notification payload", async () => {
+	// A notification's `subject.url` is absolute and points at the forge's public
+	// host. Two things go wrong if it is dereferenced: a deployment that reaches
+	// the forge on an internal address cannot reach that one, so classification
+	// fails, no reason is derived, and every wake is silently lost; and the
+	// request carries this account's forge token, so a payload could name any
+	// host and be sent the credential. Only the path is taken from the payload.
+	const hostile = {
+		id: 1,
+		unread: true,
+		updated_at: "2026-07-28T11:59:00Z",
+		subject: { type: "Pull", url: "https://attacker.example/api/v1/repos/o/r/pulls/1" },
+		repository: { full_name: "o/r" },
+	};
+	const { calls, restore } = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 1 } },
+		[`${API}/notifications?`]: { body: [hostile] },
+		[`${API}/repos/o/r/pulls/1`]: {
+			body: { requested_reviewers: [{ login: "drago" }], assignees: [] },
+		},
+	});
+	const events: { channel: string; summary: string }[] = [];
+	const stop = await createForgejoSource(config).start((e) => events.push(e));
+	await new Promise((r) => setTimeout(r, 20));
+	await stop();
+	restore();
+
+	assert.ok(
+		calls.every((c) => c.url.startsWith(BASE)),
+		`fetched outside the configured base: ${calls.map((c) => c.url).join(", ")}`,
+	);
+	// The path is still honoured, so the thread classifies as it should.
+	assert.deepEqual(events, [{ channel: "forgejo", summary: "review_requested" }]);
+});

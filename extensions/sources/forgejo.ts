@@ -20,7 +20,7 @@
  * - `assigned_pr`      — a pull request assigned to you.
  */
 import type { ChannelSource } from "./types.ts";
-import { parseList, scopedLog } from "./util.ts";
+import { errorMessage, parseList, scopedLog, sinceFrom, trimTrailingSlash } from "./util.ts";
 
 const log = scopedLog("forgejo");
 
@@ -44,7 +44,7 @@ export function forgejoConfigFromEnv(): ForgejoConfig | undefined {
 	const token = process.env.FORGEJO_TOKEN;
 	// FORGEJO_API_URL exists so a deployment can point the poller at an
 	// in-cluster address while FORGEJO_URL stays the public one used in links.
-	const url = (process.env.FORGEJO_API_URL || process.env.FORGEJO_URL || "").replace(/\/+$/, "");
+	const url = trimTrailingSlash(process.env.FORGEJO_API_URL || process.env.FORGEJO_URL || "");
 	if (!token || !url) return undefined;
 	const raw = parseList(process.env.FORGEJO_NOTIFY_FILTERS);
 	const filters = new Set(raw.length > 0 ? raw : DEFAULT_FILTERS);
@@ -133,7 +133,7 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 					since = polled.since;
 				} catch (err) {
 					if (controller.signal.aborted) return;
-					log(`poll error: ${(err as Error).message}`);
+					log(`poll error: ${errorMessage(err)}`);
 				}
 			};
 
@@ -210,7 +210,7 @@ async function emitNew(
 		batch.add(key);
 		if (seen.has(key) || signal.aborted) continue;
 
-		const reason = await classify(thread, login, request);
+		const reason = await classify(thread, login, api, request);
 		if (!reason || !cfg.filters.has(reason)) continue;
 
 		onEvent({ channel: "forgejo", summary: reason });
@@ -227,13 +227,21 @@ async function emitNew(
 async function classify(
 	thread: Thread,
 	login: string,
+	api: string,
 	request: Request_,
 ): Promise<Reason | undefined> {
-	const url = thread.subject?.url;
 	const type = thread.subject?.type; // "Pull" | "Issue" | "Commit" | "Repository"
-	if (!url || (type !== "Pull" && type !== "Issue")) return undefined;
+	if (type !== "Pull" && type !== "Issue") return undefined;
+	// Re-root the subject onto the configured API base rather than fetching the
+	// URL the payload carries. A notification's `subject.url` is absolute and
+	// points at the forge's public host; a deployment that reaches the forge on
+	// an internal address cannot necessarily reach that one, and the request
+	// fails in a way that yields no reason and therefore no wake — every
+	// notification silently lost. Only the path is taken from the payload.
+	const path = subjectPath(thread.subject?.url);
+	if (!path) return undefined;
 
-	const res = await request(url);
+	const res = await request(`${api}${path}`);
 	if (res.status !== 200) {
 		log(`subject lookup returned HTTP ${res.status}`);
 		return undefined;
@@ -247,6 +255,25 @@ async function classify(
 		return type === "Pull" ? "assigned_pr" : "assigned_issue";
 	}
 	return undefined;
+}
+
+/**
+ * The API path of a notification subject, e.g. `/repos/o/r/issues/3`. Returns
+ * undefined when the payload carries no usable path, so an unparseable or
+ * hostile value is dropped rather than fetched.
+ */
+export function subjectPath(raw: string | undefined): string | undefined {
+	if (!raw) return undefined;
+	let pathname: string;
+	try {
+		pathname = new URL(raw).pathname;
+	} catch {
+		return undefined;
+	}
+	const marker = "/api/v1/";
+	const at = pathname.indexOf(marker);
+	if (at === -1) return undefined;
+	return pathname.slice(at + marker.length - 1);
 }
 
 function includesLogin(
@@ -264,12 +291,6 @@ async function markRead(thread: Thread, api: string, request: Request_): Promise
 		});
 		if (res.status >= 400) log(`mark-read returned HTTP ${res.status}`);
 	} catch (err) {
-		log(`mark-read failed: ${(err as Error).message}`);
+		log(`mark-read failed: ${errorMessage(err)}`);
 	}
-}
-
-/** Anchor `since` to the forge's clock (response Date), falling back to local. */
-function sinceFrom(res: Response): string {
-	const date = res.headers.get("date");
-	return date ? new Date(date).toISOString() : new Date().toISOString();
 }
