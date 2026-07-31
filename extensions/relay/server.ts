@@ -538,7 +538,9 @@ function handleStream(
 		throw new Error("invalid stream input");
 	}
 	const input = frame.input as Record<string, unknown>;
-	const id = validateIdentifier(String(input.id ?? ""), "message id");
+	// These are preview ids, not durable message ids — say so, or a rejected
+	// preview sends whoever is debugging it looking for the wrong record.
+	const id = validateIdentifier(String(input.id ?? ""), "preview id");
 	const recipient = validateIdentifier(String(input.recipient ?? ""), "endpoint id");
 	const conversationId =
 		singletonConversationFor(context.config, connection.endpoint, recipient) ??
@@ -546,7 +548,7 @@ function handleStream(
 	const replyTo =
 		input.replyTo === undefined
 			? undefined
-			: validateIdentifier(String(input.replyTo), "message id");
+			: validateIdentifier(String(input.replyTo), "preview replyTo id");
 	const event = parseStreamEvent(input.event);
 	if (
 		!connection.credential.send.includes("*") &&

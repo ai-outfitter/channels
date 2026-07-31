@@ -491,7 +491,8 @@ test("relay forwards ephemeral stream previews without persisting them", async (
 		const forbidden = await alice.next((frame) => frame.type === "error");
 		assert.equal(forbidden.code, "route_forbidden");
 
-		// Previews to offline recipients vanish; nothing is stored or spooled.
+		// A preview is forwarded live to a connected recipient and is never stored
+		// or spooled — the durable message that follows is the only record.
 		bob.send({
 			type: "stream",
 			input: {
