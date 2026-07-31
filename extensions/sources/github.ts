@@ -14,7 +14,13 @@
  * - `author`           — activity on a thread you opened. This is what wakes a
  *                        PR author when someone reviews their own pull request.
  * - `mention`          — you were @-mentioned.
- * - `comment`, `subscribed`, `state_change`, `ci_activity` — as named.
+ * - every other GitHub notification reason, by its own name: `comment`,
+ *   `subscribed`, `state_change`, `ci_activity`, `team_mention`, `manual`,
+ *   `approval_requested`, `invitation`, `security_alert`,
+ *   `security_advisory_credit`, `member_feature_requested`.
+ *
+ * `assign` is not a filter name. GitHub sends it for both issues and pull
+ * requests, so this source splits it into `assigned_issue` and `assigned_pr`.
  *
  * Security invariant: every request URL is built from the configured API base.
  * A URL taken from a notification payload is **never** fetched. A payload URL
@@ -38,14 +44,29 @@ export interface GithubConfig {
 const DEFAULT_FILTERS = ["review_requested", "assigned_issue", "assigned_pr", "author"];
 const DEFAULT_POLL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 30_000;
-/** Reasons this source understands. Anything else is ignored. */
+/**
+ * Every filter name this source can ever match: GitHub's own notification
+ * reasons, minus `assign` — which is split by subject type — plus the two names
+ * that split produces. `classify` returns only a value from this set, so a name
+ * outside it is unmatchable rather than merely unusual.
+ */
 const KNOWN_FILTERS = new Set([
-	...DEFAULT_FILTERS,
-	"mention",
-	"comment",
-	"subscribed",
-	"state_change",
+	"assigned_issue",
+	"assigned_pr",
+	"approval_requested",
+	"author",
 	"ci_activity",
+	"comment",
+	"invitation",
+	"manual",
+	"member_feature_requested",
+	"mention",
+	"review_requested",
+	"security_advisory_credit",
+	"security_alert",
+	"state_change",
+	"subscribed",
+	"team_mention",
 ]);
 
 /** Derive the REST base: github.com uses api.github.com, GHES uses /api/v3. */
@@ -66,9 +87,15 @@ export function githubConfigFromEnv(): GithubConfig | undefined {
 	if (!token) return undefined;
 	const raw = parseList(process.env.GITHUB_NOTIFY_FILTERS);
 	const filters = new Set(raw.length > 0 ? raw : DEFAULT_FILTERS);
+	// An unmatchable name is left in the set — nothing needs removing, because
+	// `classify` never returns one — but it is called out, since the symptom is
+	// otherwise a source that starts cleanly and never wakes.
 	for (const name of filters) {
-		// A typo here yields a source that starts cleanly and never wakes.
-		if (!KNOWN_FILTERS.has(name)) log(`ignoring unknown filter "${name}"`);
+		if (name === "assign") {
+			log(`filter "assign" never matches; use "assigned_issue" or "assigned_pr"`);
+		} else if (!KNOWN_FILTERS.has(name)) {
+			log(`filter "${name}" is not a GitHub notification reason; it will never match`);
+		}
 	}
 	const pollMs = Number(process.env.GITHUB_NOTIFY_POLL_MS) || DEFAULT_POLL_MS;
 	// Off by default, and it must stay that way wherever the agent reads its own

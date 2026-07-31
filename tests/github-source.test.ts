@@ -274,6 +274,36 @@ test("an identity-check failure does not stop the poller", async () => {
 	assert.deepEqual(events, [{ channel: "github", summary: "review_requested" }]);
 });
 
+test("a filter name that can never match is reported, not silently kept", () => {
+	const env = { ...process.env };
+	const lines: string[] = [];
+	const original = console.error;
+	console.error = (msg: unknown) => lines.push(String(msg));
+	try {
+		process.env.GITHUB_NOTIFY_TOKEN = "t";
+		// `assign` is the likely mistake: it is a real GitHub reason, but this
+		// source splits it, so configuring it directly matches nothing.
+		process.env.GITHUB_NOTIFY_FILTERS = "assign,reviewrequested,team_mention";
+		const cfg = githubConfigFromEnv();
+		assert.ok(cfg);
+		assert.ok(
+			lines.some((l) => l.includes('"assign" never matches')),
+			`expected an assign hint, got: ${lines.join(" | ")}`,
+		);
+		assert.ok(
+			lines.some((l) => l.includes("reviewrequested") && l.includes("never match")),
+			"a typo must be reported",
+		);
+		assert.ok(
+			!lines.some((l) => l.includes("team_mention")),
+			"a real GitHub reason must not be reported as unmatchable",
+		);
+	} finally {
+		console.error = original;
+		process.env = { ...env };
+	}
+});
+
 test("nextIntervalMs raises to X-Poll-Interval but never below the floor", () => {
 	const withHeader = (v?: string) =>
 		new Response(null, { headers: v ? { "x-poll-interval": v } : {} });
