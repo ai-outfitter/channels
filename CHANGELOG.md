@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0](https://github.com/ai-outfitter/channels/compare/v1.1.0...v1.2.0) (2026-07-31)
+
+
+### Features
+
+* **sources:** GitHub notification parity, and stop locator-less wakes pointing at the channel tools ([#14](https://github.com/ai-outfitter/channels/issues/14)) ([bfe1049](https://github.com/ai-outfitter/channels/commit/bfe10491c1e245df894f5722aca22833f6dedea7))
+* stream ephemeral reply previews with Pi text events ([#13](https://github.com/ai-outfitter/channels/issues/13)) ([51d8013](https://github.com/ai-outfitter/channels/commit/51d80133f359cfa34ba84ce805a6c36210f82e26))
+
 ## [1.1.0](https://github.com/ai-outfitter/channels/compare/v1.0.0...v1.1.0) (2026-07-27)
 
 
