@@ -73,7 +73,9 @@ profile can supply its secret without additional source-selection configuration.
 | --- | --- |
 | `XIN_BASE_URL` / `XIN_BASIC_USER` / `XIN_BASIC_PASS` | `jmap` source (same creds as the `mail` skill). |
 | `SIGNAL_NUMBER` / `SIGNAL_CLI_CONFIG` | `signal` source (same creds as the `signal-responder` skill). |
-| `GITHUB_TOKEN` | `github` notification source. |
+| `GITHUB_NOTIFY_TOKEN` / `GITHUB_TOKEN` | `github` notification source. Listing notifications requires a **classic** PAT; the first variable lets the poller hold that while `gh` keeps a narrower token. |
+| `GITHUB_API_URL` / `GITHUB_SERVER_URL` | `github` source REST base (GHES). Every request is built from this base — a URL taken from a notification payload is never fetched. |
+| `GITHUB_NOTIFY_MARK_READ` | `github` source; **off by default**. Marking a thread read in the poll that emits the wake hides it from the agent just woken. |
 | `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` | `slack` source and action adapter. |
 
 ## Sources
