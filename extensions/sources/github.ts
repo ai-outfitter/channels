@@ -156,8 +156,9 @@ export function createGithubSource(cfg: GithubConfig): ChannelSource {
 				// Keys seen in the previous poll only — `since` already excludes anything
 				// older, so this just dedups threads sharing the `since`-boundary second.
 				seen: new Set<string>(),
-				// Only notify on threads updated after start-up. Anchored to GitHub's
-				// clock (the response Date header), never the local one.
+				// Only notify on threads updated after start-up. The first window opens
+				// on the local clock; every window after it is anchored to GitHub's
+				// (the response Date header), so drift cannot compound.
 				since: new Date().toISOString(),
 				intervalMs: cfg.pollMs,
 			};

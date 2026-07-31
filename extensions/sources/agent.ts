@@ -272,11 +272,6 @@ export function createAgentStreamForwarder(
 	const toolArgs = new Map<number, string>();
 	const toolEmitted = new Map<number, number>();
 
-	const soleOpenTarget = (): string | undefined => {
-		const open = journal.openTargets(config.endpointId);
-		return open.length === 1 ? open[0]?.message.id : undefined;
-	};
-
 	// Exact attribution: the channel_respond call names its target via the
 	// locator argument, which streams before (or alongside) the response.
 	// Require the closing quote so a half-streamed locator never decodes to
@@ -333,28 +328,6 @@ export function createAgentStreamForwarder(
 	return (event) => {
 		const assistant = event.assistantMessageEvent;
 		switch (assistant.type) {
-			case "text_start":
-				flushDeltas();
-				emit(soleOpenTarget(), { type: "text_start", contentIndex: assistant.contentIndex });
-				break;
-			case "text_delta": {
-				const target = soleOpenTarget();
-				if (!target) break;
-				bufferDelta(target, assistant.contentIndex, assistant.delta);
-				break;
-			}
-			case "text_end":
-				bufferedDelta = "";
-				if (flushTimer) {
-					clearTimeout(flushTimer);
-					flushTimer = undefined;
-				}
-				emit(soleOpenTarget(), {
-					type: "text_end",
-					contentIndex: assistant.contentIndex,
-					content: assistant.content,
-				});
-				break;
 			case "toolcall_start":
 				toolArgs.set(assistant.contentIndex, "");
 				toolEmitted.set(assistant.contentIndex, 0);
@@ -384,11 +357,11 @@ export function createAgentStreamForwarder(
 				toolEmitted.delete(assistant.contentIndex);
 				const call = assistant.toolCall;
 				if (call.name !== RESPOND_TOOL_NAME || emitted === 0) break;
-				bufferedDelta = "";
-				if (flushTimer) {
-					clearTimeout(flushTimer);
-					flushTimer = undefined;
-				}
+				// Flush rather than discard. The coalescing window means a reply that
+				// completes inside it has every buffered delta pending here, and
+				// dropping them makes the preview arrive all at once at the end —
+				// which is the case streaming exists for.
+				flushDeltas();
 				const locator = (call.arguments as { locator?: unknown }).locator;
 				const target =
 					typeof locator === "string"

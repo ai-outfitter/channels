@@ -254,7 +254,18 @@ function createFrameRateLimiter(config: RelayServerConfig): (text: string) => bo
 			framesInWindow = 0;
 			streamFramesInWindow = 0;
 		}
-		if (text.startsWith('{"type":"stream"')) {
+		// Classify by parsing, not by a prefix. JSON resolves duplicate keys
+		// last-wins, so `{"type":"stream","type":"send",…}` starts with the stream
+		// prefix and parses as `send` — which would buy the larger stream budget
+		// for durable writes, each one a disk write, at ten times the intended
+		// rate. Anything unparseable falls to the smaller control budget.
+		let type: unknown;
+		try {
+			type = (JSON.parse(text) as { type?: unknown }).type;
+		} catch {
+			type = undefined;
+		}
+		if (type === "stream") {
 			streamFramesInWindow += 1;
 			return streamFramesInWindow <= (config.maxStreamFramesPerWindow ?? 1_200);
 		}

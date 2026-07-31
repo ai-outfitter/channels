@@ -285,6 +285,12 @@ function includesLogin(
 
 /** Best-effort: a failed mark-read must not drop the event that was emitted. */
 async function markRead(thread: Thread, api: string, request: Request_): Promise<void> {
+	// `id` is typed as a number but arrives as unvalidated JSON; a string value
+	// would path-traverse out of this endpoint.
+	if (!Number.isSafeInteger(thread.id)) {
+		log(`ignoring a notification with a non-numeric id`);
+		return;
+	}
 	try {
 		const res = await request(`${api}/notifications/threads/${thread.id}?to-status=read`, {
 			method: "PATCH",
