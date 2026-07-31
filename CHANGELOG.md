@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/ai-outfitter/channels/compare/v1.2.0...v1.3.0) (2026-07-31)
+
+
+### Features
+
+* add Chatto, Mattermost, and Zulip mention channels ([#10](https://github.com/ai-outfitter/channels/issues/10)) ([78630a8](https://github.com/ai-outfitter/channels/commit/78630a854a8546221bf8d526f9dd4be022efaaa9))
+
+
+### Bug Fixes
+
+* resolve the PR [#13](https://github.com/ai-outfitter/channels/issues/13) review findings (relay config, slot leak, forwarder lifecycle, Forgejo poller) ([#21](https://github.com/ai-outfitter/channels/issues/21)) ([718410d](https://github.com/ai-outfitter/channels/commit/718410db7a192ac577741e16237540e59cfb6976))
+
 ## [1.2.0](https://github.com/ai-outfitter/channels/compare/v1.1.0...v1.2.0) (2026-07-31)
 
 
