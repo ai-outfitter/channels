@@ -141,6 +141,153 @@ test("forwarder stays silent for non-respond tools and ambiguous targets", async
 	assert.deepEqual(streamed, []);
 });
 
+test("forwarder emits content-free status events to open messages", async () => {
+	const journal = new AgentSessionJournal();
+	const record = (id: string, sender: string) =>
+		journal.recordMessage(
+			{
+				version: 1,
+				id,
+				conversationId: "conversation-1",
+				sender,
+				recipient: "link:vega",
+				createdAt: new Date().toISOString(),
+				body: "hello",
+			},
+			"delivered",
+		);
+	record("message-1", "vega-web");
+	record("message-2", "vega-web"); // newer message from the same sender wins
+	record("message-3", "link:drago");
+	const streamed: Array<{ messageId: string; event: RelayStreamEvent }> = [];
+	const transport = {
+		endpoint: { id: "link:vega", principal: "link:vega" },
+		async stream(messageId: string, event: RelayStreamEvent) {
+			streamed.push({ messageId, event });
+		},
+	} as unknown as AgentTransport;
+	const forward = createAgentStreamForwarder(
+		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		() => transport,
+		journal,
+		1,
+	);
+
+	forward.turnStart();
+	assert.deepEqual(
+		streamed.map((entry) => entry.messageId).sort(),
+		["message-2", "message-3"],
+		"one status per waiting sender, newest message each",
+	);
+	assert.ok(
+		streamed.every((entry) => entry.event.type === "status" && entry.event.phase === "turn_start"),
+	);
+	streamed.length = 0;
+
+	const update = (assistantMessageEvent: Record<string, unknown>) =>
+		forward({ type: "message_update", message: {}, assistantMessageEvent } as never);
+
+	// Thinking crosses as phases only — never text.
+	update({ type: "thinking_start", contentIndex: 0, partial: { content: [] } });
+	update({
+		type: "thinking_delta",
+		contentIndex: 0,
+		delta: "secret reasoning",
+		partial: { content: [] },
+	});
+	update({
+		type: "thinking_end",
+		contentIndex: 0,
+		content: "secret reasoning",
+		partial: { content: [] },
+	});
+	// A non-respond tool announces start and end with its name.
+	const toolPartial = { content: [{ type: "toolCall", name: "read_file" }] };
+	update({ type: "toolcall_start", contentIndex: 0, partial: toolPartial });
+	update({
+		type: "toolcall_end",
+		contentIndex: 0,
+		toolCall: { type: "toolCall", id: "call-1", name: "read_file", arguments: { path: "/x" } },
+		partial: toolPartial,
+	});
+	forward.turnEnd();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+
+	const phases = streamed
+		.filter((entry) => entry.messageId === "message-2")
+		.map((entry) => entry.event as { phase?: string; tool?: string });
+	assert.deepEqual(
+		phases.map((event) => [event.phase, event.tool]),
+		[
+			["thinking_start", undefined],
+			["thinking_end", undefined],
+			["tool_start", "read_file"],
+			["tool_end", "read_file"],
+			["turn_end", undefined],
+		],
+	);
+	assert.ok(
+		!JSON.stringify(streamed).includes("secret reasoning"),
+		"thinking text must never cross",
+	);
+	assert.ok(!JSON.stringify(streamed).includes("/x"), "tool arguments must never cross");
+});
+
+test("forwarder announces no status for the respond call itself", async () => {
+	const journal = new AgentSessionJournal();
+	journal.recordMessage(
+		{
+			version: 1,
+			id: "message-1",
+			conversationId: "conversation-1",
+			sender: "vega-web",
+			recipient: "link:vega",
+			createdAt: new Date().toISOString(),
+			body: "hello",
+		},
+		"delivered",
+	);
+	const streamed: RelayStreamEvent[] = [];
+	const transport = {
+		endpoint: { id: "link:vega", principal: "link:vega" },
+		async stream(_messageId: string, event: RelayStreamEvent) {
+			streamed.push(event);
+		},
+	} as unknown as AgentTransport;
+	const forward = createAgentStreamForwarder(
+		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		() => transport,
+		journal,
+		1,
+	);
+	const partial = { content: [{ type: "toolCall", name: "channel_respond" }] };
+	forward({
+		type: "message_update",
+		message: {},
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial },
+	} as never);
+	forward({
+		type: "message_update",
+		message: {},
+		assistantMessageEvent: {
+			type: "toolcall_end",
+			contentIndex: 0,
+			toolCall: {
+				type: "toolCall",
+				id: "call-1",
+				name: "channel_respond",
+				arguments: { locator: "agent:v1:bWVzc2FnZS0x", response: "hi" },
+			},
+			partial,
+		},
+	} as never);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.ok(
+		streamed.every((event) => event.type !== "status"),
+		"channel_respond is the reply preview, not announced activity",
+	);
+});
+
 test("stop() drops the pending flush and latches the forwarder off", async () => {
 	const journal = new AgentSessionJournal();
 	journal.recordMessage(

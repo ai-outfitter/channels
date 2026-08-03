@@ -145,19 +145,49 @@ export interface RelayDeliverFrame {
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
 /**
- * Streamable assistant events reuse Pi's own `AssistantMessageEvent`
+ * Streamable assistant text events reuse Pi's own `AssistantMessageEvent`
  * vocabulary (via `MessageUpdateEvent["assistantMessageEvent"]`) restricted
- * to visible text: `text_start`, `text_delta`, and `text_end`. Thinking and
- * tool-call events never cross the relay, and the heavyweight `partial`
- * assistant message is stripped — only the event's own fields travel.
+ * to visible text: `text_start`, `text_delta`, and `text_end`. The
+ * heavyweight `partial` assistant message is stripped — only the event's own
+ * fields travel.
  */
-export type RelayStreamEvent = DistributiveOmit<
+export type RelayStreamTextEvent = DistributiveOmit<
 	Extract<
 		MessageUpdateEvent["assistantMessageEvent"],
 		{ type: "text_start" | "text_delta" | "text_end" }
 	>,
 	"partial"
 >;
+
+export const RELAY_STATUS_PHASES = [
+	"turn_start",
+	"thinking_start",
+	"thinking_end",
+	"tool_start",
+	"tool_end",
+	"turn_end",
+] as const;
+
+export type RelayStatusPhase = (typeof RELAY_STATUS_PHASES)[number];
+
+export const RELAY_STATUS_MAX_TOOL_LENGTH = 128;
+
+/**
+ * Coarse turn-activity signal: the agent woke, is thinking, is running a
+ * named tool, or ended the turn. Deliberately content-free — thinking text
+ * and tool arguments never cross the relay; only the phase and, for tool
+ * phases, the tool's name travel. This is what lets a chat surface show
+ * "thinking…" or "running <tool>…" during the long silence before the reply
+ * text starts streaming.
+ */
+export interface RelayStatusEvent {
+	readonly type: "status";
+	readonly contentIndex: number;
+	readonly phase: RelayStatusPhase;
+	readonly tool?: string;
+}
+
+export type RelayStreamEvent = RelayStreamTextEvent | RelayStatusEvent;
 
 /**
  * Ephemeral chat-plane streaming preview. While producing a durable reply, a

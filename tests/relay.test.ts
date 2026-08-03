@@ -504,6 +504,38 @@ test("relay forwards ephemeral stream previews without persisting them", async (
 		});
 		await alice.next((frame) => frame.type === "stream");
 
+		// Content-free status events pass through with phase and tool name.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				replyTo: "message-1",
+				event: { type: "status", contentIndex: 0, phase: "tool_start", tool: "read_file" },
+			},
+		});
+		const status = await alice.next((frame) => frame.type === "stream");
+		assert.deepEqual(status.event, {
+			type: "status",
+			contentIndex: 0,
+			phase: "tool_start",
+			tool: "read_file",
+		});
+
+		// Unknown status phases are refused rather than forwarded blind.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "status", contentIndex: 0, phase: "exfiltrate" },
+			},
+		});
+		const badPhase = await bob.next((frame) => frame.type === "error");
+		assert.equal(badPhase.code, "invalid_request");
+
 		// Pi legitimately ends a text block that produced nothing: an empty
 		// `text_end` must pass validation and forward, not be rejected as an
 		// invalid body.

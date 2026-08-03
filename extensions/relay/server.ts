@@ -18,9 +18,12 @@ import {
 	parseRelayFrame,
 	RELAY_MAX_FRAME_BYTES,
 	RELAY_PROTOCOL_VERSION,
+	RELAY_STATUS_MAX_TOOL_LENGTH,
+	RELAY_STATUS_PHASES,
 	type RelayErrorFrame,
 	type RelayServerFrame,
 	type RelaySessionQueryRequest,
+	type RelayStatusPhase,
 	type RelayStreamEvent,
 } from "./protocol.ts";
 import { RelayStore } from "./store.ts";
@@ -549,6 +552,18 @@ function parseStreamEvent(value: unknown): RelayStreamEvent {
 				contentIndex,
 				content: validatePreviewText(String(event.content ?? "")),
 			};
+		case "status": {
+			const phase = event.phase;
+			if (typeof phase !== "string" || !RELAY_STATUS_PHASES.includes(phase as RelayStatusPhase)) {
+				throw new Error("invalid stream status phase");
+			}
+			if (event.tool === undefined)
+				return { type: "status", contentIndex, phase: phase as RelayStatusPhase };
+			if (typeof event.tool !== "string" || event.tool.length > RELAY_STATUS_MAX_TOOL_LENGTH) {
+				throw new Error("invalid stream status tool name");
+			}
+			return { type: "status", contentIndex, phase: phase as RelayStatusPhase, tool: event.tool };
+		}
 		default:
 			throw new Error("unsupported stream event type");
 	}
