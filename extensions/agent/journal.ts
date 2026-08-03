@@ -167,6 +167,25 @@ export class AgentSessionJournal {
 	}
 
 	/**
+	 * Inbound messages still awaiting a reply — state `delivered` or `read` —
+	 * newest-first, at most one per sender. This is the attribution set for
+	 * turn-level status previews: a turn has no reply locator yet, so each
+	 * waiting counterpart gets the status of the turn that may answer it.
+	 */
+	openMessages(recipient: string): readonly StoredAgentMessage[] {
+		const id = validateIdentifier(recipient, "endpoint id");
+		const bySender = new Map<string, IndexedMessage>();
+		for (const item of this.#messages.values()) {
+			const { message, state } = item.stored;
+			if (message.recipient !== id) continue;
+			if (state !== "delivered" && state !== "read") continue;
+			const existing = bySender.get(message.sender);
+			if (!existing || item.cursor > existing.cursor) bySender.set(message.sender, item);
+		}
+		return [...bySender.values()].sort((a, b) => b.cursor - a.cursor).map((item) => item.stored);
+	}
+
+	/**
 	 * The conversation around one message, as the model will read it.
 	 *
 	 * Filters on the two peers of the target message, not on the conversation

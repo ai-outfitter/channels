@@ -45,8 +45,15 @@ export interface SourceRegistration {
 	loadStreamForwarder?(journal?: AgentSessionJournal): Promise<StreamForwarder | undefined>;
 }
 
-/** A message-update forwarder; `stop` latches it off at session shutdown. */
-export type StreamForwarder = ((event: MessageUpdateEvent) => void) & { stop?(): void };
+/**
+ * A message-update forwarder; `stop` latches it off at session shutdown, and
+ * the optional turn hooks announce turn boundaries as status previews.
+ */
+export type StreamForwarder = ((event: MessageUpdateEvent) => void) & {
+	stop?(): void;
+	turnStart?(): void;
+	turnEnd?(): void;
+};
 
 /** Run a source module's env-config probe and construct it when configured. */
 function configure<C, T>(fromEnv: () => C | undefined, create: (cfg: C) => T): T | undefined {
@@ -358,16 +365,17 @@ export default function channelEventsExtension(
 	});
 
 	// Stream assistant text as ephemeral previews to the agent channel while a
-	// reply is in flight. Loaded lazily on the first assistant token; failures
-	// disable streaming for the session rather than affecting the turn.
+	// reply is in flight, and turn/thinking/tool activity as status previews.
+	// Loaded lazily on the first event; failures disable streaming for the
+	// session rather than affecting the turn.
 	const agentRegistration = sources.agent;
 	let forwarder: StreamForwarder | null | undefined;
 	let forwarderLoading: Promise<void> | undefined;
 	if (wanted.includes("agent") && agentRegistration?.loadStreamForwarder) {
-		pi.on("message_update", (event) => {
+		const withForwarder = (apply: (forwarder: StreamForwarder) => void): void => {
 			if (stopped || forwarder === null) return;
 			if (forwarder) {
-				forwarder(event as MessageUpdateEvent);
+				apply(forwarder);
 				return;
 			}
 			if (forwarderLoading) return;
@@ -375,13 +383,18 @@ export default function channelEventsExtension(
 				.loadStreamForwarder?.(agentJournal)
 				.then((loaded) => {
 					forwarder = loaded ?? null;
-					forwarder?.(event as MessageUpdateEvent);
+					if (forwarder) apply(forwarder);
 				})
 				.catch((err) => {
 					forwarder = null;
 					log(`stream previews disabled: ${(err as Error).message}`);
 				});
+		};
+		pi.on("message_update", (event) => {
+			withForwarder((loaded) => loaded(event as MessageUpdateEvent));
 		});
+		pi.on("agent_start", () => withForwarder((loaded) => loaded.turnStart?.()));
+		pi.on("agent_end", () => withForwarder((loaded) => loaded.turnEnd?.()));
 	}
 
 	pi.on("session_shutdown", async () => {

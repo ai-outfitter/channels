@@ -73,8 +73,10 @@ export interface AgentTransport {
 	respond(messageId: string, response: string): Promise<AgentRespondResult>;
 	/**
 	 * Optional ephemeral streaming preview of an in-progress reply to
-	 * `messageId`, using Pi's text event vocabulary. Best-effort only: never
-	 * journaled, never acknowledged, dropped when unsupported or offline.
+	 * `messageId` — Pi's text event vocabulary for the reply body, plus
+	 * content-free turn status events (thinking, tool activity). Best-effort
+	 * only: never journaled, never acknowledged, dropped when unsupported or
+	 * offline.
 	 */
 	stream?(messageId: string, event: RelayStreamEvent): Promise<void>;
 	subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>>;

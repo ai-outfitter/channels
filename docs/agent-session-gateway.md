@@ -164,7 +164,16 @@ a stable preview id derived from the message being answered, correlated to it
 by `replyTo`. Previews are strictly ephemeral and at-most-once: the relay
 authorizes them on the same send route, forwards them only to currently
 connected recipients, and never stores, spools, acknowledges, journals, or
-replays them. Thinking and tool-call events never cross the relay, and log
+replays them.
+
+Alongside reply text, a sender may push content-free `status` events carrying
+a turn phase (`turn_start`, `thinking_start`, `thinking_end`, `tool_start`,
+`tool_end`, `turn_end`) and, for tool phases, the tool's name. These let a
+chat surface show "thinking…" or "running a tool…" during the long silence
+before reply text starts streaming. Status events fire before any reply
+locator exists, so the sending agent attributes them to its open (still
+unreplied) inbound messages — each waiting counterpart sees the turn that may
+answer it. Thinking text and tool arguments never cross the relay, and log
 records carry structural fields only. Body limits apply per event. Preview
 frames draw from their own rate budget
 (`AGENT_RELAY_MAX_STREAM_FRAMES_PER_WINDOW`, default 1200 per window). The

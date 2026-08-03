@@ -10,7 +10,12 @@ import {
 	agentLocator,
 	decodeAgentLocator,
 } from "../agent/types.ts";
-import type { RelayStreamEvent } from "../relay/protocol.ts";
+import type {
+	RelayStatusEvent,
+	RelayStatusToolPhase,
+	RelayStatusTurnPhase,
+	RelayStreamEvent,
+} from "../relay/protocol.ts";
 import type {
 	ChannelActions,
 	ChannelReadResult,
@@ -188,6 +193,13 @@ export function createAgentSource(
 
 export const STREAM_FLUSH_MS = 250;
 export const RESPOND_TOOL_NAME = "channel_respond";
+/**
+ * How many waiting counterparts receive turn-status previews. Status events
+ * fire before any reply locator exists, so they fan out to the open (still
+ * unreplied) inbound messages; the cap bounds relay frames when a queue has
+ * piled up.
+ */
+export const MAX_STATUS_TARGETS = 8;
 
 /**
  * Incrementally read a JSON string value out of a partial JSON document.
@@ -260,6 +272,10 @@ export interface AgentStreamForwarder {
 	 * a fresh transport after the shared one was released.
 	 */
 	stop(): void;
+	/** Announce a turn beginning to every waiting counterpart. */
+	turnStart(): void;
+	/** Announce a turn ending, so a status indicator never hangs. */
+	turnEnd(): void;
 }
 
 export function createAgentStreamForwarder(
@@ -312,6 +328,37 @@ export function createAgentStreamForwarder(
 		void transport?.stream?.(targetId, event).catch(() => {});
 	};
 
+	// Turn-status events fire before any channel_respond locator exists, so
+	// they cannot be attributed the way text previews are. Instead every open
+	// (still unreplied) inbound message gets the status — its sender is
+	// waiting on this turn, and the durable reply or turn_end supersedes the
+	// indicator. Content-free by design: phase and, for tool phases, the
+	// tool's name only.
+	const fanOutStatus = (event: RelayStatusEvent): void => {
+		if (stopped) return;
+		for (const open of journal.openMessages(config.endpointId).slice(0, MAX_STATUS_TARGETS)) {
+			emit(open.message.id, event);
+		}
+	};
+	const emitStatus = (phase: RelayStatusTurnPhase, contentIndex: number): void => {
+		fanOutStatus({ type: "status", contentIndex, phase });
+	};
+	const emitToolStatus = (
+		phase: RelayStatusToolPhase,
+		contentIndex: number,
+		tool: string,
+	): void => {
+		fanOutStatus({ type: "status", contentIndex, phase, tool });
+	};
+
+	const toolNameAt = (
+		partial: { content: ReadonlyArray<{ type?: string; name?: string }> },
+		contentIndex: number,
+	): string | undefined => {
+		const block = partial.content[contentIndex];
+		return block?.type === "toolCall" ? block.name : undefined;
+	};
+
 	const flushDeltas = (): void => {
 		if (flushTimer) {
 			clearTimeout(flushTimer);
@@ -347,10 +394,27 @@ export function createAgentStreamForwarder(
 		if (stopped) return;
 		const assistant = event.assistantMessageEvent;
 		switch (assistant.type) {
-			case "toolcall_start":
+			case "thinking_start":
+				emitStatus("thinking_start", assistant.contentIndex);
+				break;
+			case "thinking_end":
+				// Only the phase crosses — never the thinking text.
+				emitStatus("thinking_end", assistant.contentIndex);
+				break;
+			case "toolcall_start": {
 				toolArgs.set(assistant.contentIndex, "");
 				toolEmitted.set(assistant.contentIndex, 0);
+				// The reply call itself is not activity worth announcing: its
+				// argument text already streams as the reply preview. A start
+				// whose name has not streamed yet is skipped too — tool phases
+				// must carry the name, and the definitive toolcall_end still
+				// announces the call.
+				const name = toolNameAt(assistant.partial, assistant.contentIndex);
+				if (name !== undefined && name !== RESPOND_TOOL_NAME) {
+					emitToolStatus("tool_start", assistant.contentIndex, name);
+				}
 				break;
+			}
 			case "toolcall_delta": {
 				const args = (toolArgs.get(assistant.contentIndex) ?? "") + assistant.delta;
 				toolArgs.set(assistant.contentIndex, args);
@@ -375,7 +439,11 @@ export function createAgentStreamForwarder(
 				const emitted = toolEmitted.get(assistant.contentIndex) ?? 0;
 				toolEmitted.delete(assistant.contentIndex);
 				const call = assistant.toolCall;
-				if (call.name !== RESPOND_TOOL_NAME || emitted === 0) break;
+				if (call.name !== RESPOND_TOOL_NAME) {
+					emitToolStatus("tool_end", assistant.contentIndex, call.name);
+					break;
+				}
+				if (emitted === 0) break;
 				// Flush rather than discard. The coalescing window means a reply that
 				// completes inside it has every buffered delta pending here, and
 				// dropping them makes the preview arrive all at once at the end —
@@ -410,6 +478,12 @@ export function createAgentStreamForwarder(
 			bufferedDelta = "";
 			toolArgs.clear();
 			toolEmitted.clear();
+		},
+		turnStart(): void {
+			emitStatus("turn_start", 0);
+		},
+		turnEnd(): void {
+			emitStatus("turn_end", 0);
 		},
 	});
 }
