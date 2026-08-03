@@ -531,6 +531,38 @@ function validatePreviewText(value: string): string {
 	return value;
 }
 
+/**
+ * Status is the one event type with shape rules of its own: the phase decides
+ * whether a tool name is required or forbidden.
+ */
+function parseStatusEvent(event: Record<string, unknown>, contentIndex: number): RelayStreamEvent {
+	const phase = event.phase;
+	if (typeof phase !== "string" || !RELAY_STATUS_PHASES.includes(phase as RelayStatusPhase)) {
+		throw new Error("invalid stream status phase");
+	}
+	// Tool phases carry the tool's name and nothing else; every other
+	// phase must carry no tool at all.
+	if (RELAY_STATUS_TOOL_PHASES.includes(phase as RelayStatusToolPhase)) {
+		if (
+			typeof event.tool !== "string" ||
+			event.tool.length === 0 ||
+			event.tool.length > RELAY_STATUS_MAX_TOOL_LENGTH
+		) {
+			throw new Error("invalid stream status tool name");
+		}
+		return {
+			type: "status",
+			contentIndex,
+			phase: phase as RelayStatusToolPhase,
+			tool: event.tool,
+		};
+	}
+	if (event.tool !== undefined) {
+		throw new Error("stream status tool name is valid only for tool phases");
+	}
+	return { type: "status", contentIndex, phase: phase as RelayStatusTurnPhase };
+}
+
 function parseStreamEvent(value: unknown): RelayStreamEvent {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new Error("invalid stream event");
@@ -555,33 +587,8 @@ function parseStreamEvent(value: unknown): RelayStreamEvent {
 				contentIndex,
 				content: validatePreviewText(String(event.content ?? "")),
 			};
-		case "status": {
-			const phase = event.phase;
-			if (typeof phase !== "string" || !RELAY_STATUS_PHASES.includes(phase as RelayStatusPhase)) {
-				throw new Error("invalid stream status phase");
-			}
-			// Tool phases carry the tool's name and nothing else; every other
-			// phase must carry no tool at all.
-			if (RELAY_STATUS_TOOL_PHASES.includes(phase as RelayStatusToolPhase)) {
-				if (
-					typeof event.tool !== "string" ||
-					event.tool.length === 0 ||
-					event.tool.length > RELAY_STATUS_MAX_TOOL_LENGTH
-				) {
-					throw new Error("invalid stream status tool name");
-				}
-				return {
-					type: "status",
-					contentIndex,
-					phase: phase as RelayStatusToolPhase,
-					tool: event.tool,
-				};
-			}
-			if (event.tool !== undefined) {
-				throw new Error("stream status tool name is valid only for tool phases");
-			}
-			return { type: "status", contentIndex, phase: phase as RelayStatusTurnPhase };
-		}
+		case "status":
+			return parseStatusEvent(event, contentIndex);
 		default:
 			throw new Error("unsupported stream event type");
 	}
