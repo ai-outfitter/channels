@@ -15,8 +15,7 @@ same protocol and ConnectRPC schema. The source pin and regeneration details are
 also recorded in
 [`extensions/vendor/chatto/SCHEMA.md`](../../extensions/vendor/chatto/SCHEMA.md).
 
-As of 2026-07-25, automated adapter tests pass. A live smoke test has not run
-because this environment has no compatible server or credentials.
+As of 2026-07-25, automated adapter tests pass. A live smoke test has now run: realtime protocol v2 was negotiated with capability `chatto.realtime.projection.v1`, and a mention-to-reply round trip completed against a live server. The 0.4 release line is a separate branch without the protocol v2 commit, so no published 0.4.x release can serve this adapter; only a build from main works.
 
 ## Prerequisites and permissions
 
