@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/ai-outfitter/channels/compare/v1.3.0...v1.4.0) (2026-08-03)
+
+
+### Features
+
+* **relay:** stream content-free turn status events ([#24](https://github.com/ai-outfitter/channels/issues/24)) ([ef4c78c](https://github.com/ai-outfitter/channels/commit/ef4c78c6e1e07105a898f9a8f963cec1ea26da58))
+
+
+### Bug Fixes
+
+* **relay:** extract status parsing to satisfy the complexity budget ([#26](https://github.com/ai-outfitter/channels/issues/26)) ([da1c8fc](https://github.com/ai-outfitter/channels/commit/da1c8fc8f302764f47040dbb0565daf9832c11e1))
+
 ## [1.3.0](https://github.com/ai-outfitter/channels/compare/v1.2.0...v1.3.0) (2026-07-31)
 
 
