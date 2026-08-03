@@ -90,8 +90,42 @@ hooks, queue, and trust boundary remain unchanged.
 
 - **`jmap`** (`extensions/sources/jmap.ts`) — JMAP EventSource (SSE, RFC 8620
   §7.3) on Stalwart; watches the account's `Email` `StateChange` and emits a
-  trusted `new mail` event. Reads **no** bodies; the `mail` skill (`xin`) does the
-  fetch/reply/move.
+  trusted `new mail` event. It also wakes on JMAP `CalendarAlert` pushes when a
+  calendar event's alarm fires, allowing scheduled and recurring tasks
+  to be plain calendar events. Reads **no** mail or calendar-event bodies; the
+  `mail` skill (`xin`) does the mail fetch/reply/move. EventSource push is
+  at-most-once: an alert that fires while the source is disconnected is lost,
+  so if a missed wake means a missed task, give the event an EMAIL
+  alarm as well — that message persists in the mailbox and still fires a
+  `new mail` wake. When the `Email,CalendarAlert` subscription fails with a
+  status that means the push type itself is unacceptable (400, 404, 422, 501),
+  the source downgrades that connection attempt to mail-only wakes
+  (logged) and retries `CalendarAlert` on the next reconnect. Any other failure
+  (401, 403, 429, 5xx) throws instead, so the supervisor reconnects with the
+  full subscription rather than parking on a long-lived mail-only stream. The
+  alert's `uid` and, for a recurring event, its `recurrenceId` are the only
+  event-derived text that reaches a wake summary, and the source admits each
+  only after validating it against the same conservative charset; a uid that
+  fails leaves a bare `calendar alert` with no uid, and a recurrenceId that
+  fails is simply left out. `CalendarAlert` is outside RFC 8620 — the frame name and field
+  casing follow Stalwart's implementation. A frame captured from a live Stalwart
+  0.15.5 server is pinned as a test fixture. Routing goes by the payload: an
+  explicit `@type` is authoritative in both directions, else the `calendarAlert`
+  frame name is taken as a hint, else the payload is matched structurally — so a
+  server that names the frame differently still wakes:
+
+  ```text
+  event: calendarAlert
+  data: {"@type":"CalendarAlert","accountId":"i","calendarEventId":"b",
+         "uid":"vega-cron-probe-001","recurrenceId":null,"alertId":"a1"}
+  ```
+
+  Stalwart's `calendar-alarm.minTriggerInterval` (default one hour per account)
+  throttles alarm **emails**, not these pushes: two alerts 45 seconds apart were
+  both delivered, each within 200 ms of its trigger. Scheduling below that
+  interval is therefore possible — but an `EMAIL` fallback alarm on a
+  sub-hourly schedule is not, so the push-alert cadence and the EMAIL-alarm
+  cadence are chosen independently.
 - **`signal`** (`extensions/sources/signal.ts`) — spawns `signal-cli … jsonRpc`
   (a dissimilar transport: child-process JSON-RPC, not HTTP SSE) and emits a
   trusted `new message` event per incoming message; the `signal-responder` skill
@@ -155,5 +189,9 @@ credential auto-detection select the available channels.
 2. Idle agent + send a test email via `xin`: a wake should fire within seconds
    (not on the next tick); the model runs the `mail` skill and processes it.
 3. Send several while streaming: they coalesce into one follow-up sweep.
-4. No mail arriving → no turns fire between heartbeats.
-5. Quit/reload → the EventSource is closed by `session_shutdown` (no orphan).
+4. Create a calendar event a minute or two out with an alarm on it: when the
+   alarm fires, a wake naming `calendar alert: <uid>` should arrive within
+   seconds. (A server that refuses the `CalendarAlert` push type logs the
+   downgrade instead and keeps waking on mail.)
+5. No mail arriving → no turns fire between heartbeats.
+6. Quit/reload → the EventSource is closed by `session_shutdown` (no orphan).
