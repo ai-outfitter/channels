@@ -20,10 +20,13 @@ import {
 	RELAY_PROTOCOL_VERSION,
 	RELAY_STATUS_MAX_TOOL_LENGTH,
 	RELAY_STATUS_PHASES,
+	RELAY_STATUS_TOOL_PHASES,
 	type RelayErrorFrame,
 	type RelayServerFrame,
 	type RelaySessionQueryRequest,
 	type RelayStatusPhase,
+	type RelayStatusToolPhase,
+	type RelayStatusTurnPhase,
 	type RelayStreamEvent,
 } from "./protocol.ts";
 import { RelayStore } from "./store.ts";
@@ -557,12 +560,27 @@ function parseStreamEvent(value: unknown): RelayStreamEvent {
 			if (typeof phase !== "string" || !RELAY_STATUS_PHASES.includes(phase as RelayStatusPhase)) {
 				throw new Error("invalid stream status phase");
 			}
-			if (event.tool === undefined)
-				return { type: "status", contentIndex, phase: phase as RelayStatusPhase };
-			if (typeof event.tool !== "string" || event.tool.length > RELAY_STATUS_MAX_TOOL_LENGTH) {
-				throw new Error("invalid stream status tool name");
+			// Tool phases carry the tool's name and nothing else; every other
+			// phase must carry no tool at all.
+			if (RELAY_STATUS_TOOL_PHASES.includes(phase as RelayStatusToolPhase)) {
+				if (
+					typeof event.tool !== "string" ||
+					event.tool.length === 0 ||
+					event.tool.length > RELAY_STATUS_MAX_TOOL_LENGTH
+				) {
+					throw new Error("invalid stream status tool name");
+				}
+				return {
+					type: "status",
+					contentIndex,
+					phase: phase as RelayStatusToolPhase,
+					tool: event.tool,
+				};
 			}
-			return { type: "status", contentIndex, phase: phase as RelayStatusPhase, tool: event.tool };
+			if (event.tool !== undefined) {
+				throw new Error("stream status tool name is valid only for tool phases");
+			}
+			return { type: "status", contentIndex, phase: phase as RelayStatusTurnPhase };
 		}
 		default:
 			throw new Error("unsupported stream event type");

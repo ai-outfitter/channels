@@ -536,6 +536,30 @@ test("relay forwards ephemeral stream previews without persisting them", async (
 		const badPhase = await bob.next((frame) => frame.type === "error");
 		assert.equal(badPhase.code, "invalid_request");
 
+		// Tool phases require the tool name; other phases must not carry one.
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "status", contentIndex: 0, phase: "tool_start" },
+			},
+		});
+		const namelessTool = await bob.next((frame) => frame.type === "error");
+		assert.equal(namelessTool.code, "invalid_request");
+		bob.send({
+			type: "stream",
+			input: {
+				id: "preview-1",
+				recipient: "alice-web",
+				conversationId: "conversation-1",
+				event: { type: "status", contentIndex: 0, phase: "thinking_start", tool: "read_file" },
+			},
+		});
+		const toolOnThinking = await bob.next((frame) => frame.type === "error");
+		assert.equal(toolOnThinking.code, "invalid_request");
+
 		// Pi legitimately ends a text block that produced nothing: an empty
 		// `text_end` must pass validation and forward, not be rejected as an
 		// invalid body.

@@ -201,6 +201,9 @@ test("forwarder emits content-free status events to open messages", async () => 
 		content: "secret reasoning",
 		partial: { content: [] },
 	});
+	// A start whose tool name has not streamed yet announces nothing — tool
+	// phases must carry the name, and toolcall_end still announces the call.
+	update({ type: "toolcall_start", contentIndex: 1, partial: { content: [] } });
 	// A non-respond tool announces start and end with its name.
 	const toolPartial = { content: [{ type: "toolCall", name: "read_file" }] };
 	update({ type: "toolcall_start", contentIndex: 0, partial: toolPartial });

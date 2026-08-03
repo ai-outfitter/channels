@@ -10,7 +10,12 @@ import {
 	agentLocator,
 	decodeAgentLocator,
 } from "../agent/types.ts";
-import type { RelayStatusPhase, RelayStreamEvent } from "../relay/protocol.ts";
+import type {
+	RelayStatusEvent,
+	RelayStatusToolPhase,
+	RelayStatusTurnPhase,
+	RelayStreamEvent,
+} from "../relay/protocol.ts";
 import type {
 	ChannelActions,
 	ChannelReadResult,
@@ -327,17 +332,23 @@ export function createAgentStreamForwarder(
 	// they cannot be attributed the way text previews are. Instead every open
 	// (still unreplied) inbound message gets the status — its sender is
 	// waiting on this turn, and the durable reply or turn_end supersedes the
-	// indicator. Content-free by design: phase and tool name only.
-	const emitStatus = (phase: RelayStatusPhase, contentIndex: number, tool?: string): void => {
+	// indicator. Content-free by design: phase and, for tool phases, the
+	// tool's name only.
+	const fanOutStatus = (event: RelayStatusEvent): void => {
 		if (stopped) return;
 		for (const open of journal.openMessages(config.endpointId).slice(0, MAX_STATUS_TARGETS)) {
-			emit(open.message.id, {
-				type: "status",
-				contentIndex,
-				phase,
-				...(tool === undefined ? {} : { tool }),
-			});
+			emit(open.message.id, event);
 		}
+	};
+	const emitStatus = (phase: RelayStatusTurnPhase, contentIndex: number): void => {
+		fanOutStatus({ type: "status", contentIndex, phase });
+	};
+	const emitToolStatus = (
+		phase: RelayStatusToolPhase,
+		contentIndex: number,
+		tool: string,
+	): void => {
+		fanOutStatus({ type: "status", contentIndex, phase, tool });
 	};
 
 	const toolNameAt = (
@@ -394,10 +405,13 @@ export function createAgentStreamForwarder(
 				toolArgs.set(assistant.contentIndex, "");
 				toolEmitted.set(assistant.contentIndex, 0);
 				// The reply call itself is not activity worth announcing: its
-				// argument text already streams as the reply preview.
+				// argument text already streams as the reply preview. A start
+				// whose name has not streamed yet is skipped too — tool phases
+				// must carry the name, and the definitive toolcall_end still
+				// announces the call.
 				const name = toolNameAt(assistant.partial, assistant.contentIndex);
-				if (name !== RESPOND_TOOL_NAME) {
-					emitStatus("tool_start", assistant.contentIndex, name);
+				if (name !== undefined && name !== RESPOND_TOOL_NAME) {
+					emitToolStatus("tool_start", assistant.contentIndex, name);
 				}
 				break;
 			}
@@ -426,7 +440,7 @@ export function createAgentStreamForwarder(
 				toolEmitted.delete(assistant.contentIndex);
 				const call = assistant.toolCall;
 				if (call.name !== RESPOND_TOOL_NAME) {
-					emitStatus("tool_end", assistant.contentIndex, call.name);
+					emitToolStatus("tool_end", assistant.contentIndex, call.name);
 					break;
 				}
 				if (emitted === 0) break;
