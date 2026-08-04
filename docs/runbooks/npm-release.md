@@ -23,8 +23,21 @@ environment are part of that contract.
   `404 Not Found` on the scoped `PUT`, which reads like a missing package but
   is an authentication failure. `.node-version` pins Node 24.18.0 for this
   reason; do not lower it below Node 22.14.0 / npm 11.5.1.
-- npm must hold a trusted publisher for this package. Configure it at
-  <https://www.npmjs.com/package/@ai-outfitter/channels/access>:
+- npm must hold a trusted publisher for this package. Configure it from the
+  CLI with npm 11.5.1 or later:
+
+  ```sh
+  npm trust github @ai-outfitter/channels \
+    --repository ai-outfitter/channels \
+    --file release.yml \
+    --environment npm-publish \
+    --allow-publish
+  ```
+
+  Use `--dry-run` first. `npm trust list @ai-outfitter/channels` shows the
+  current configuration. The web form at
+  <https://www.npmjs.com/package/@ai-outfitter/channels/access> writes the same
+  record:
 
   | Field | Value |
   | --- | --- |
@@ -65,7 +78,7 @@ version with an npm account.
    npm publish --access public
    ```
 
-4. Add the trusted publisher with the table above.
+4. Add the trusted publisher with the command or the table above.
 5. Confirm the automatic path on the next release. Do not re-run the failed
    release job for a version that is already on the registry — npm refuses to
    publish over a published version.
