@@ -1,21 +1,39 @@
 /**
  * JMAP push (EventSource / SSE) channel source.
  *
- * Consumes only the JMAP `StateChange` **ping** for the account's `Email` type —
- * it never reads message bodies. The `mail` skill (via the `xin` CLI) does the
- * actual fetch/reply/move, so this stays a push *signal* listener, not a mail
- * client. Reuses the mail skill's existing `XIN_*` credentials.
+ * Consumes JMAP `StateChange` **pings** for the account's `Email` type and
+ * `CalendarAlert` pushes when calendar alarms fire. It never reads message or
+ * event bodies. The `mail` skill (via the `xin` CLI) does the actual mail work,
+ * so this stays a push *signal* listener, not a mail or calendar client. Reuses
+ * the mail skill's existing `XIN_*` credentials.
  *
  * Tested shape: Stalwart's JMAP EventSource (RFC 8620 §7.3).
  */
-import type { ChannelSource } from "./types.ts";
-import { scopedLog, supervise } from "./util.ts";
+import type { ChannelEvent, ChannelSource } from "./types.ts";
+import { RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
 
 const log = scopedLog("jmap");
 
 /** The account has ~30s ping; treat a stream silent for this long as dead. */
 const IDLE_TIMEOUT_MS = 90_000;
 const MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
+const CALENDARS_CAPABILITY = "urn:ietf:params:jmap:calendars";
+/**
+ * The uid is the only event-derived text surfaced in the trusted wake summary,
+ * so it must match this conservative charset (which also bounds its length);
+ * anything else falls back to the generic summary.
+ */
+const CALENDAR_ALERT_UID_PATTERN = /^[A-Za-z0-9._:@-]{1,128}$/;
+/**
+ * Statuses on the `Email,CalendarAlert` subscription that plausibly mean "this
+ * push type is unacceptable" — a bad request, an unknown resource, an
+ * unprocessable type list, or an unimplemented one. These are properties of the
+ * request, not of the moment, so retrying the same subscription would fail the
+ * same way; narrowing to `Email` is the only way forward. Everything else
+ * (401/403 auth, 408 timeout, 429 throttling, 5xx) is transient or a whole-
+ * connection problem, and must throw instead — see the downgrade site.
+ */
+const DOWNGRADE_STATUSES: ReadonlySet<number> = new Set([400, 404, 422, 501]);
 
 export interface JmapConfig {
 	baseUrl: string;
@@ -32,26 +50,50 @@ export function jmapConfigFromEnv(): JmapConfig | undefined {
 	return { baseUrl: baseUrl.replace(/\/+$/, ""), user, pass };
 }
 
-export function createJmapSource(cfg: JmapConfig): ChannelSource {
+export function createJmapSource(
+	cfg: JmapConfig,
+	retryMs: number = RECONNECT_DELAY_MS,
+): ChannelSource {
 	const auth = `Basic ${Buffer.from(`${cfg.user}:${cfg.pass}`).toString("base64")}`;
 
 	return {
 		async start(onEvent) {
-			return supervise(async (signal) => {
-				const session = await fetchSession(cfg.baseUrl, auth, signal);
-				log(`watching Email state for account ${session.accountId}`);
-				await streamStateChanges(session, auth, signal, () => {
-					onEvent({ channel: "jmap", summary: "new mail" });
-				});
-			}, log);
+			return supervise(
+				async (signal) => {
+					const session = await fetchSession(cfg.baseUrl, auth, signal);
+					log(`watching Email state and calendar alerts for account ${session.accountId}`);
+					await streamStateChanges(session, auth, signal, (wake) => {
+						onEvent({ channel: "jmap", ...wake });
+					});
+				},
+				log,
+				retryMs,
+			);
 		},
 	};
 }
 
+/** A trusted wake signal: the summary plus an optional queue-coalescing key. */
+type JmapWake = Pick<ChannelEvent, "summary" | "dedupeKey">;
+
+/**
+ * The accounts one connection accepts frames for. Calendar alerts may arrive on
+ * the calendars primary account, which some servers keep distinct from mail.
+ * `onUnknownAlertAccount` reports an alert dropped for an account outside the
+ * set; the connection that builds this object owns the log-once state, so a
+ * fresh connection always gets its own first log line.
+ */
+interface JmapAccounts {
+	mailAccountId: string;
+	alertAccountIds: ReadonlySet<string>;
+	onUnknownAlertAccount(accountId: unknown): void;
+}
+
 interface JmapSession {
 	accountId: string;
-	/** Absolute EventSource URL, template already filled. */
-	eventSourceUrl: string;
+	alertAccountIds: ReadonlySet<string>;
+	/** Absolute EventSource URL for the given push `{types}` list. */
+	eventSourceUrlFor: (types: string) => string;
 }
 
 async function fetchSession(
@@ -81,21 +123,38 @@ async function fetchSession(
 		);
 	if (!accountId) throw new Error("session has no mail account");
 
+	// Alerts may be pushed on the calendars primary account, which servers can
+	// keep distinct from the mail account; accept both when both are advertised.
+	// Resolved like the mail account: the primary, else the accounts that
+	// advertise the capability, else mail-only alerts. Unlike the mail account —
+	// which names the single account whose Email state is watched — this is only a
+	// membership set for the alert path, so *every* calendars-capable account is
+	// admitted: shared and delegated calendars each get their own account id, and
+	// any of them may carry an alarm meant for this user.
+	const calendarsAccountIds = body.primaryAccounts?.[CALENDARS_CAPABILITY]
+		? [body.primaryAccounts[CALENDARS_CAPABILITY]]
+		: Object.keys(body.accounts ?? {}).filter(
+				(id) => body.accounts?.[id]?.accountCapabilities?.[CALENDARS_CAPABILITY] != null,
+			);
+	const alertAccountIds = new Set([accountId, ...calendarsAccountIds]);
+
 	// Fill the RFC 8620 template and resolve against the (post-redirect) session
 	// URL, so a relative eventSourceUrl lands under the right path.
-	const filled = body.eventSourceUrl
-		.replace("{types}", "Email")
-		.replace("{closeafter}", "no")
-		.replace("{ping}", "30");
-	const eventSourceUrl = new URL(filled, res.url).toString();
-	return { accountId, eventSourceUrl };
+	const template = body.eventSourceUrl;
+	const sessionUrl = res.url;
+	const eventSourceUrlFor = (types: string) =>
+		new URL(
+			template.replace("{types}", types).replace("{closeafter}", "no").replace("{ping}", "30"),
+			sessionUrl,
+		).toString();
+	return { accountId, alertAccountIds, eventSourceUrlFor };
 }
 
 async function streamStateChanges(
 	session: JmapSession,
 	auth: string,
 	parentSignal: AbortSignal,
-	onMailChange: () => void,
+	onWake: (wake: JmapWake) => void,
 ): Promise<void> {
 	// A derived controller: aborts when the supervisor stops us OR when the
 	// stream goes idle past IDLE_TIMEOUT_MS (a half-open connection), which
@@ -111,14 +170,56 @@ async function streamStateChanges(
 
 	try {
 		if (parentSignal.aborted) return;
-		const res = await fetch(session.eventSourceUrl, {
-			headers: { Authorization: auth, Accept: "text/event-stream" },
-			signal: ac.signal,
-		});
-		if (!res.ok || !res.body) throw new Error(`eventsource ${res.status}`);
+		const open = (types: string) =>
+			fetch(session.eventSourceUrlFor(types), {
+				headers: { Authorization: auth, Accept: "text/event-stream" },
+				signal: ac.signal,
+			});
+		let res = await open("Email,CalendarAlert");
+		// Some JMAP servers reject unknown push types instead of ignoring them, so
+		// the wider subscription needs a fallback — but which failures earn one
+		// matters, because the downgraded stream is *long-lived* SSE. Once the
+		// Email-only stream opens successfully, `Email,CalendarAlert` is not
+		// re-attempted until that stream drops or goes idle past IDLE_TIMEOUT_MS,
+		// which a healthy mail stream may not do for hours. A transient 429 or 503
+		// treated as a downgrade would therefore silence calendar alarms for as
+		// long as that stream lasts, and push is at-most-once, so every alarm in
+		// that window is lost outright.
+		// So downgrade only on statuses that plausibly mean "this push type is
+		// unacceptable" and would mean it again on the next attempt; anything else
+		// throws, and `supervise` reconnects asking for the full subscription.
+		if (!res.ok && DOWNGRADE_STATUSES.has(res.status)) {
+			log(`eventsource ${res.status} for Email,CalendarAlert; subscribing to Email only`);
+			await res.body?.cancel().catch(() => {});
+			res = await open("Email");
+		}
+		if (!res.ok || !res.body) {
+			// Drain before throwing, mirroring the downgrade path above: a server
+			// stuck on 429/5xx throws on every attempt, so an unconsumed body here
+			// strands an undici socket until GC once per reconnect, forever.
+			await res.body?.cancel().catch(() => {});
+			throw new Error(`eventsource ${res.status}`);
+		}
 
 		const reader = res.body.getReader();
 		const decoder = new TextDecoder();
+		// Log-once state lives here, in the connection: the first alert dropped for
+		// an unknown account is logged (naming that accountId, so the mismatch is
+		// diagnosable) and later drops stay silent rather than logging per frame.
+		let unknownAlertAccountLogged = false;
+		const accounts: JmapAccounts = {
+			mailAccountId: session.accountId,
+			alertAccountIds: session.alertAccountIds,
+			onUnknownAlertAccount(accountId) {
+				if (unknownAlertAccountLogged) return;
+				unknownAlertAccountLogged = true;
+				// JSON.stringify escapes a hostile accountId's control characters,
+				// and the slice bounds an overlong one.
+				log(
+					`dropping calendar alert for unknown account ${(JSON.stringify(accountId) ?? "undefined").slice(0, 160)}`,
+				);
+			},
+		};
 		let buffer = "";
 		armIdle();
 		try {
@@ -129,11 +230,11 @@ async function streamStateChanges(
 				// Normalize CRLF on the whole buffer so a \r\n split across read
 				// boundaries can't hide an SSE frame separator.
 				buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
-				buffer = emitFrames(buffer, session.accountId, onMailChange);
+				buffer = emitFrames(buffer, accounts, onWake);
 			}
 			// Flush a trailing complete frame the server sent right before EOF.
 			buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
-			if (buffer.trim()) emitFrame(buffer, session.accountId, onMailChange);
+			if (buffer.trim()) emitFrame(buffer, accounts, onWake);
 		} finally {
 			await reader.cancel().catch(() => {});
 		}
@@ -144,37 +245,111 @@ async function streamStateChanges(
 }
 
 /** Consume every complete `\n\n`-terminated SSE frame; return the remainder. */
-function emitFrames(buffer: string, accountId: string, onMailChange: () => void): string {
+function emitFrames(
+	buffer: string,
+	accounts: JmapAccounts,
+	onWake: (wake: JmapWake) => void,
+): string {
 	let rest = buffer;
 	let sep = rest.indexOf("\n\n");
 	while (sep !== -1) {
-		emitFrame(rest.slice(0, sep), accountId, onMailChange);
+		emitFrame(rest.slice(0, sep), accounts, onWake);
 		rest = rest.slice(sep + 2);
 		sep = rest.indexOf("\n\n");
 	}
 	return rest;
 }
 
-function emitFrame(frame: string, accountId: string, onMailChange: () => void): void {
-	// Per SSE, a frame's `data:` lines rejoin with "\n".
-	const data = frame
-		.split("\n")
-		.filter((l) => l.startsWith("data:"))
-		.map((l) => l.slice(5).trim())
-		.join("\n");
-	if (data && isMailStateChange(data, accountId)) onMailChange();
+function emitFrame(frame: string, accounts: JmapAccounts, onWake: (wake: JmapWake) => void): void {
+	// Per SSE, the last `event:` line names the frame and `data:` lines rejoin
+	// with "\n".
+	let event: string | undefined;
+	const dataLines: string[] = [];
+	for (const line of frame.split("\n")) {
+		if (line.startsWith("event:")) event = line.slice(6).trim();
+		else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+	}
+	const data = dataLines.join("\n");
+	if (!data) return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(data);
+	} catch {
+		return;
+	}
+	if (typeof parsed !== "object" || parsed === null) return;
+	const payload = parsed as Record<string, unknown>;
+	// Route on the *payload*, the way the mail path keys on `@type: StateChange`.
+	// The frame name is only a hint: it is Stalwart's, not RFC 8620's, so a
+	// server that names the frame differently must still wake the agent.
+	if (isCalendarAlert(payload, event)) {
+		const wake = calendarAlertWake(payload, accounts);
+		if (wake) onWake(wake);
+		return;
+	}
+	if (isMailStateChange(payload, accounts.mailAccountId)) onWake({ summary: "new mail" });
+}
+
+/**
+ * A frame is a calendar alert when its payload says so. An explicit `@type` is
+ * authoritative in both directions (a `StateChange` is never an alert, whatever
+ * the frame is named); failing that, the `calendarAlert` frame name is accepted
+ * as a fast path; failing that, the payload is matched structurally — an alert
+ * carries a string `accountId` and `uid` and, unlike a StateChange, no
+ * `changed` member.
+ */
+function isCalendarAlert(payload: Record<string, unknown>, event: string | undefined): boolean {
+	const type = payload["@type"];
+	if (typeof type === "string") return type === "CalendarAlert";
+	if (event === "calendarAlert") return true;
+	return (
+		typeof payload.accountId === "string" &&
+		typeof payload.uid === "string" &&
+		!("changed" in payload)
+	);
+}
+
+function calendarAlertWake(
+	payload: Record<string, unknown>,
+	accounts: JmapAccounts,
+): JmapWake | undefined {
+	// Stalwart's PushObject::CalendarAlert serializes these exact camelCase
+	// names, captured from a live 0.15.5 server: accountId, calendarEventId,
+	// uid, alertId, and recurrenceId — the last is `null`, not absent, when the
+	// event does not recur. All but the matching account are optional here so
+	// partial/future payloads stay safe.
+	const { accountId, uid, recurrenceId } = payload;
+	if (typeof accountId !== "string" || !accounts.alertAccountIds.has(accountId)) {
+		accounts.onUnknownAlertAccount(accountId);
+		return undefined;
+	}
+	// A hostile or malformed uid (embedded newlines, overlong, non-string)
+	// must not reach the trusted wake summary — only the conservative charset
+	// passes; everything else gets the generic form.
+	if (typeof uid !== "string" || !CALENDAR_ALERT_UID_PATTERN.test(uid)) {
+		return { summary: "calendar alert", dedupeKey: "calendar-alert" };
+	}
+	// A recurring event can have two occurrences pending in one wake window;
+	// keying on the occurrence keeps them distinct. recurrenceId is
+	// server-supplied text, so it passes the same conservative charset gate
+	// as the uid or is left out of the key.
+	const recurrence =
+		typeof recurrenceId === "string" && CALENDAR_ALERT_UID_PATTERN.test(recurrenceId)
+			? recurrenceId
+			: undefined;
+	// The occurrence belongs in the summary too, not only the key: the wake prompt
+	// renders one line per *distinct summary*, so two occurrences of one uid that
+	// share a summary would collapse to a single line — spending two of the wake's
+	// bounded entries to say one thing, and pushing another channel's signal out.
+	return {
+		summary: recurrence ? `calendar alert: ${uid} (${recurrence})` : `calendar alert: ${uid}`,
+		dedupeKey: recurrence ? `calendar-alert:${uid}#${recurrence}` : `calendar-alert:${uid}`,
+	};
 }
 
 /** A StateChange whose `changed[account]` includes the Email type means new/changed mail. */
-function isMailStateChange(data: string, accountId: string): boolean {
-	try {
-		const parsed = JSON.parse(data) as {
-			"@type"?: string;
-			changed?: Record<string, Record<string, string>>;
-		};
-		if (parsed["@type"] !== "StateChange") return false;
-		return parsed.changed?.[accountId]?.Email != null;
-	} catch {
-		return false;
-	}
+function isMailStateChange(payload: Record<string, unknown>, accountId: string): boolean {
+	if (payload["@type"] !== "StateChange") return false;
+	const changed = payload.changed as Record<string, Record<string, string>> | undefined;
+	return changed?.[accountId]?.Email != null;
 }

@@ -27,6 +27,12 @@ export interface ChannelEvent {
 	/** Short trusted human summary for logs/UI, e.g. "new mail". */
 	summary: string;
 	/**
+	 * Optional trusted coalescing key for locator-less events: distinct keys keep
+	 * distinct pending entries; the same key coalesces redelivery. The source must
+	 * validate it and must never derive it from message content.
+	 */
+	dedupeKey?: string;
+	/**
 	 * Optional trusted structural locator. Values must be validated by the source
 	 * and must never contain sender-controlled message content.
 	 */

@@ -30,6 +30,14 @@ import { parseList, scopedLog } from "./sources/util.ts";
 
 const log = scopedLog("");
 export const MAX_LOCATORS_PER_WAKE = 25;
+/**
+ * How many locator-less, dedupe-keyed entries one channel may hold in the queue,
+ * and how many may ride a single wake. Deliberately its own constant rather than
+ * a second use of MAX_LOCATORS_PER_WAKE: that one bounds how many item locators
+ * a prompt names, this one bounds queue admission and per-channel fairness, and
+ * tuning either must not silently move the other.
+ */
+export const MAX_SIGNAL_ENTRIES_PER_WAKE = 25;
 export const MAX_PENDING_EVENTS = 500;
 
 export interface SourceRegistration {
@@ -254,8 +262,9 @@ export default function channelEventsExtension(
 	});
 
 	const stops: Array<() => Promise<void>> = [];
-	// The notification queue: channel-only events coalesce by channel; located
-	// events preserve each distinct item while coalescing redelivery.
+	// The notification queue: locator-less events coalesce by dedupe key (or the
+	// bare channel); located events preserve each distinct item while coalescing
+	// redelivery.
 	const pending = new Map<string, ChannelEvent>();
 	let wakeInFlight = false;
 	let starting = false;
@@ -292,9 +301,23 @@ export default function channelEventsExtension(
 		log(`waking agent for: ${[...new Set(events.map((event) => event.channel))].join(", ")}`);
 	};
 
-	const onEvent = (event: ChannelEvent): boolean => {
+	const onEvent = (incoming: ChannelEvent): boolean => {
 		if (stopped) return false; // ignore late callbacks from a source torn down mid-flight
-		const key = channelEventKey(event);
+		let event = incoming;
+		let key = channelEventKey(event);
+		// One channel's dedupe-keyed entries are bounded: a jmap alarm storm minting
+		// a fresh key per alert would otherwise fill the shared queue and evict other
+		// channels' events. Past the cap the overflow collapses onto the bare channel
+		// key — one entry saying "this channel has more work" — instead of new keys.
+		if (
+			!event.locator &&
+			event.dedupeKey &&
+			!pending.has(key) &&
+			dedupeKeyedCount(pending, event.channel) >= MAX_SIGNAL_ENTRIES_PER_WAKE
+		) {
+			event = { channel: event.channel, summary: event.summary };
+			key = event.channel;
+		}
 		if (!pending.has(key) && pending.size >= MAX_PENDING_EVENTS) {
 			if (!overflowLogged) {
 				overflowLogged = true;
@@ -417,7 +440,12 @@ export default function channelEventsExtension(
  * session as a user message.
  */
 export function channelEventKey(event: ChannelEvent): string {
-	return event.locator ? `${event.channel}:${event.locator.key}` : event.channel;
+	if (event.locator) return `${event.channel}:${event.locator.key}`;
+	// Locator-less events coalesce on the source-set dedupe key when present —
+	// e.g. jmap's per-uid calendar alerts stay distinct from "new mail" and from
+	// each other — and on the bare channel otherwise. The key is namespaced by
+	// channel, like the located branch, so two sources cannot collide on it.
+	return event.dedupeKey ? `${event.channel}:${event.dedupeKey}` : event.channel;
 }
 
 export function locatorChannel(locator: string): string {
@@ -448,8 +476,31 @@ export function wakePrompt(events: ChannelEvent[]): string {
 		);
 	}
 	if (signalOnly.length > 0) {
+		// Summaries are trusted source-authored text, never message content — the
+		// one event-derived token is jmap's calendar uid, and the source only
+		// admits it after charset validation. Only a dedupe-keyed event's summary
+		// is rendered: its key guarantees one pending entry per reason. A
+		// bare-channel-key event coalesces every reason onto one entry, keeping
+		// only the last summary, so naming it would positively claim the sole
+		// reason for work that may have had several — the bare channel name (or,
+		// beside keyed summaries, a neutral marker) stays honest. The list needs
+		// no bound of its own: pendingBatch caps the
+		// locator-less entries that can reach one wake.
+		const described = signalOnly.map((channel) => {
+			const own = events.filter((event) => !event.locator && event.channel === channel);
+			const summaries = [
+				...new Set(own.filter((event) => event.dedupeKey).map((event) => event.summary)),
+			];
+			if (summaries.length === 0) return channel;
+			// A bare-key entry co-pending with keyed ones is a second reason for
+			// work whose summary cannot be claimed. Naming only the keyed ones
+			// would let the agent service the alert and never check its mail, with
+			// nothing left to re-raise it — so mark it neutrally instead.
+			if (own.some((event) => !event.dedupeKey)) summaries.push("other activity");
+			return `${channel} (${summaries.join("; ")})`;
+		});
 		parts.push(
-			`These channels sent no item locator: ${signalOnly.join(", ")}.`,
+			`These channels sent no item locator: ${described.join(", ")}.`,
 			`Each one is a signal that work exists. It contains no message.`,
 			`Do not call channel_read or channel_respond for them.`,
 			`Use each channel's skill to find that work before you end the turn.`,
@@ -459,14 +510,33 @@ export function wakePrompt(events: ChannelEvent[]): string {
 	return parts.join(" ");
 }
 
+/** How many locator-less, dedupe-keyed entries a channel currently holds. */
+function dedupeKeyedCount(pending: ReadonlyMap<string, ChannelEvent>, channel: string): number {
+	let count = 0;
+	for (const event of pending.values()) {
+		if (!event.locator && event.dedupeKey && event.channel === channel) count += 1;
+	}
+	return count;
+}
+
 function pendingBatch(pending: ReadonlyMap<string, ChannelEvent>): Array<[string, ChannelEvent]> {
 	const batch: Array<[string, ChannelEvent]> = [];
 	let locatedEvents = 0;
+	// Locator-less entries are bounded too: an alarm storm of distinct dedupe keys
+	// must not ride into one wake as a giant summary list. Counted **per channel**,
+	// mirroring the admission bound in `onEvent` — a shared counter would let one
+	// channel's storm spend the whole allowance and defer every other channel's
+	// signal by a full wake, which is exactly the eviction the bound exists to stop.
+	const describedEvents = new Map<string, number>();
 	for (const entry of pending) {
 		const event = entry[1];
 		if (event.locator) {
 			if (locatedEvents >= MAX_LOCATORS_PER_WAKE) continue;
 			locatedEvents += 1;
+		} else {
+			const seen = describedEvents.get(event.channel) ?? 0;
+			if (seen >= MAX_SIGNAL_ENTRIES_PER_WAKE) continue;
+			describedEvents.set(event.channel, seen + 1);
 		}
 		batch.push(entry);
 	}

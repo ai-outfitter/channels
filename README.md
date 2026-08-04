@@ -168,9 +168,30 @@ Watches a JMAP mailbox's `Email` state over an EventSource (SSE) and wakes
 whenever that state changes. It reads no message bodies; the `mail` skill (via
 `xin`) determines whether actionable new mail exists.
 
+It also wakes on JMAP `CalendarAlert` pushes. When a calendar event's alarm
+fires, the server pushes an alert and the source wakes the agent. Push delivery
+is at-most-once, and a subscription that fails in a way meaning the
+`CalendarAlert` type is unacceptable downgrades that connection attempt to
+mail-only wakes — see
+[docs/channel-events.md](docs/channel-events.md) for the full caveats.
+
 - **Prerequisites:** a JMAP mailbox (e.g. [Stalwart](https://stalw.art/),
   Fastmail) and the `mail` skill enabled. *(JMAP servers only — Gmail is not JMAP;
-  use the `gmail` skill/`gam` for Google Workspace.)*
+  use the `gmail` skill/`gam` for Google Workspace.)* Calendar wakes additionally
+  need a server that speaks JMAP for Calendars. The `CalendarAlert` frame name
+  and its field casing follow Stalwart's implementation and are not part of
+  RFC 8620; they were captured from a live Stalwart 0.15.5 server, and that
+  exact frame is pinned as a test fixture. A
+  scheduled task is an RRULE calendar event with an alarm. The wake carries the
+  channel plus `calendar alert: <uid>`, and for a recurring event the occurrence
+  as `calendar alert: <uid> (<recurrenceId>)` — or a bare `calendar alert` when
+  the uid fails validation. Nothing else crosses: resolving that uid to
+  the event needs calendar tooling in the agent's profile, which the `mail` skill
+  (`xin`) does not provide. Each alert also carries a dedupe key of that uid and,
+  for a recurring event, the occurrence, so distinct alarms stay distinct in the
+  queue while a redelivered one coalesces; past 25 pending alerts for the channel
+  the overflow collapses onto a single unnamed `jmap` entry rather than evicting
+  other channels.
 - **Configure:**
 
   ```bash
