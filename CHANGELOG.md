@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/ai-outfitter/channels/compare/v1.4.0...v1.5.0) (2026-08-04)
+
+
+### Features
+
+* **jmap:** wake on CalendarAlert push for scheduled tasks ([#28](https://github.com/ai-outfitter/channels/issues/28)) ([#29](https://github.com/ai-outfitter/channels/issues/29)) ([d4c0274](https://github.com/ai-outfitter/channels/commit/d4c0274f546e02db53f7dea781258e792aeb9635))
+
 ## [1.4.0](https://github.com/ai-outfitter/channels/compare/v1.3.0...v1.4.0) (2026-08-03)
 
 
