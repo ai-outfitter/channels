@@ -405,6 +405,45 @@ describe("a2a task plane", () => {
 		assert.deepEqual(prior, { kind: "replay", outcome: { kind: "task", taskId: task.id } });
 	});
 
+	it("GET /tasks pages through every task exactly once", async () => {
+		const server = await launch(completingExecutor);
+		const created = new Set<string>();
+		for (let index = 0; index < 7; index += 1) {
+			const response = await send(server, "token-a", {
+				message: userMessage(`m-page-${index}`, `work ${index}`),
+			});
+			created.add(((await response.json()) as { task: A2aTask }).task.id);
+		}
+		const seen: string[] = [];
+		let token = "";
+		let pages = 0;
+		do {
+			const query = `pageSize=3${token ? `&pageToken=${encodeURIComponent(token)}` : ""}`;
+			const response = await fetch(`${server.url}/tasks?${query}`, {
+				headers: { authorization: "Bearer token-a" },
+			});
+			assert.equal(response.status, 200);
+			const body = (await response.json()) as { tasks: A2aTask[]; nextPageToken: string };
+			assert.ok(body.tasks.length <= 3);
+			for (const task of body.tasks) seen.push(task.id);
+			token = body.nextPageToken;
+			pages += 1;
+			assert.ok(pages < 10, "pagination did not terminate");
+		} while (token);
+		assert.equal(seen.length, created.size);
+		assert.deepEqual(new Set(seen), created);
+	});
+
+	it("a page token the server did not mint is a clean 400", async () => {
+		const server = await launch(completingExecutor);
+		const response = await fetch(`${server.url}/tasks?pageToken=not-a-cursor`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		assert.equal(response.status, 400);
+		const error = (await response.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "INVALID_ARGUMENT");
+	});
+
 	it("a principal the store cannot parse back is refused at startup, not on the next restart", async () => {
 		await assert.rejects(
 			() =>

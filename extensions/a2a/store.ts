@@ -80,6 +80,14 @@ export interface ListTasksFilter {
 	readonly pageSize?: number;
 	readonly includeArtifacts?: boolean;
 	readonly historyLength?: number;
+	/** Opaque cursor from a previous page's nextPageToken. */
+	readonly pageToken?: string;
+}
+
+export interface ListTasksPage {
+	readonly tasks: readonly A2aTask[];
+	/** Empty when this page is the last one. */
+	readonly nextPageToken: string;
 }
 
 /**
@@ -262,10 +270,19 @@ export class A2aTaskStore {
 		return this.#run(async () => this.#data.tasks[taskId]);
 	}
 
-	async listTasks(principal: string, filter: ListTasksFilter): Promise<readonly A2aTask[]> {
+	/**
+	 * One page of the principal's tasks, newest first. The order is a total
+	 * order on (updatedAt descending, id ascending): updatedAt alone ties for
+	 * tasks written in the same millisecond, and a cursor cannot resume an
+	 * order that is not total. The cursor names the last entry returned, and
+	 * the next page starts strictly after it in that same order, so no task is
+	 * repeated and none is skipped.
+	 */
+	async listTasks(principal: string, filter: ListTasksFilter): Promise<ListTasksPage> {
 		return this.#run(async () => {
 			const pageSize = Math.min(Math.max(filter.pageSize ?? 50, 1), 100);
-			return Object.values(this.#data.tasks)
+			const cursor = decodePageToken(filter.pageToken);
+			const matching = Object.values(this.#data.tasks)
 				.filter((entry) => entry.principal === principal)
 				.filter((entry) => !filter.contextId || entry.task.contextId === filter.contextId)
 				.filter((entry) => !filter.status || entry.task.status.state === filter.status)
@@ -274,11 +291,19 @@ export class A2aTaskStore {
 						!filter.statusTimestampAfter ||
 						(entry.task.status.timestamp ?? entry.updatedAt) >= filter.statusTimestampAfter,
 				)
-				.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
-				.slice(0, pageSize)
-				.map((entry) =>
+				.sort(compareListOrder)
+				.filter((entry) => !cursor || isAfterCursor(entry, cursor));
+			const page = matching.slice(0, pageSize);
+			const last = page.at(-1);
+			return {
+				tasks: page.map((entry) =>
 					trimTask(entry.task, filter.historyLength ?? 0, filter.includeArtifacts ?? false),
-				);
+				),
+				nextPageToken:
+					last && matching.length > page.length
+						? encodePageToken({ updatedAt: last.updatedAt, id: last.task.id })
+						: "",
+			};
 		});
 	}
 
@@ -391,6 +416,42 @@ export class A2aTaskStore {
 			await unlink(temporary).catch(() => {});
 			throw error;
 		}
+	}
+}
+
+interface PageCursor {
+	readonly updatedAt: string;
+	readonly id: string;
+}
+
+/** Newest first, with the task id breaking same-millisecond ties. */
+function compareListOrder(a: StoredTask, b: StoredTask): number {
+	if (a.updatedAt !== b.updatedAt) return a.updatedAt < b.updatedAt ? 1 : -1;
+	return a.task.id < b.task.id ? -1 : a.task.id > b.task.id ? 1 : 0;
+}
+
+function isAfterCursor(entry: StoredTask, cursor: PageCursor): boolean {
+	if (entry.updatedAt !== cursor.updatedAt) return entry.updatedAt < cursor.updatedAt;
+	return entry.task.id > cursor.id;
+}
+
+function encodePageToken(cursor: PageCursor): string {
+	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodePageToken(token: string | undefined): PageCursor | undefined {
+	if (!token) return undefined;
+	try {
+		const parsed = JSON.parse(Buffer.from(token, "base64url").toString("utf8")) as PageCursor;
+		if (typeof parsed?.updatedAt !== "string" || typeof parsed?.id !== "string") {
+			throw new Error("malformed cursor");
+		}
+		return parsed;
+	} catch {
+		// A cursor the server did not mint is a client error, not a silent
+		// restart from page one: a silent restart repeats tasks the caller
+		// already read and looks like duplicated work.
+		throw new A2aError(400, "INVALID_ARGUMENT", "pageToken is not a valid page cursor");
 	}
 }
 

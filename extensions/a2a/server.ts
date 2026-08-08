@@ -387,16 +387,18 @@ export async function startA2aServer(
 			const statusTimestampAfter = url.searchParams.get("statusTimestampAfter");
 			const pageSize = integerParam(url, "pageSize");
 			const historyLength = integerParam(url, "historyLength");
-			const tasks = await store.listTasks(principal, {
+			const pageToken = url.searchParams.get("pageToken");
+			const page = await store.listTasks(principal, {
 				...(contextId === null ? {} : { contextId }),
 				...(status === null ? {} : { status }),
 				...(statusTimestampAfter === null ? {} : { statusTimestampAfter }),
 				...(pageSize === undefined ? {} : { pageSize }),
 				...(historyLength === undefined ? {} : { historyLength }),
+				...(pageToken === null ? {} : { pageToken }),
 				includeArtifacts: url.searchParams.get("includeArtifacts") === "true",
 			});
 			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE });
-			response.end(JSON.stringify({ tasks, nextPageToken: "" }));
+			response.end(JSON.stringify(page));
 			return;
 		}
 		const subscribeMatch = path.match(/^\/tasks\/([^/:]+):subscribe$/);
