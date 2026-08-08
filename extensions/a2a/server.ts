@@ -244,12 +244,20 @@ export async function startA2aServer(
 				unsubscribe();
 				resolve(await store.getTask(principal, taskId));
 			}, timeoutMs);
+			const settleNow = (): void => {
+				clearTimeout(timer);
+				unsubscribe();
+				store.getTask(principal, taskId).then(resolve);
+			};
 			unsubscribe = subscribe(taskId, (event) => {
 				if ("statusUpdate" in event && isSettled(event.statusUpdate.status.state)) {
-					clearTimeout(timer);
-					unsubscribe();
-					store.getTask(principal, taskId).then(resolve);
+					settleNow();
 				}
+			});
+			// An update that landed between the snapshot read and subscribe()
+			// would otherwise sleep the full timeout; re-check the durable state.
+			store.getTask(principal, taskId).then((task) => {
+				if (isSettled(task.status.state)) settleNow();
 			});
 		});
 	};

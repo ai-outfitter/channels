@@ -321,6 +321,74 @@ describe("a2a task plane", () => {
 		);
 	});
 
+	it("message:stream forwards status and artifact updates live and ends at the terminal frame", async () => {
+		const parkingExecutor: A2aExecutor = async (context) => {
+			const controller = await context.begin();
+			await controller.status("TASK_STATE_WORKING");
+			return undefined;
+		};
+		const server = await launch(parkingExecutor);
+		const stream = await fetch(`${server.url}/message:stream`, {
+			method: "POST",
+			headers: {
+				authorization: "Bearer token-a",
+				"content-type": "application/a2a+json",
+			},
+			body: JSON.stringify({ message: userMessage("m-18", "stream this") }),
+		});
+		assert.equal(stream.status, 200);
+		assert.match(stream.headers.get("content-type") ?? "", /text\/event-stream/);
+		assert.ok(stream.body);
+		const reader = stream.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		const readUntil = async (marker: string): Promise<void> => {
+			while (!buffer.includes(marker)) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+			}
+		};
+		await readUntil('"task"');
+		const taskId = /"id":"([^"]+)"/.exec(buffer)?.[1];
+		assert.ok(taskId);
+		const controller = await server.controllerForTask(taskId);
+		assert.ok(controller);
+		await controller.artifact({ artifactId: "streamed", parts: [{ text: "chunk" }] });
+		await controller.status("TASK_STATE_COMPLETED");
+		await readUntil("TASK_STATE_COMPLETED");
+		assert.match(buffer, /artifactUpdate/);
+		assert.match(buffer, /statusUpdate/);
+	});
+
+	it("cancel settles a non-terminal task and refuses a terminal one", async () => {
+		const parkingExecutor: A2aExecutor = async (context) => {
+			const controller = await context.begin();
+			await controller.status("TASK_STATE_WORKING");
+			return undefined;
+		};
+		const server = await launch(parkingExecutor);
+		const created = await send(server, "token-a", {
+			message: userMessage("m-19", "cancel me"),
+			configuration: { returnImmediately: true },
+		});
+		const task = ((await created.json()) as { task: A2aTask }).task;
+		const canceled = await fetch(`${server.url}/tasks/${task.id}:cancel`, {
+			method: "POST",
+			headers: { authorization: "Bearer token-a" },
+		});
+		assert.equal(canceled.status, 200);
+		const canceledBody = (await canceled.json()) as A2aTask;
+		assert.equal(canceledBody.status.state, "TASK_STATE_CANCELED");
+		const again = await fetch(`${server.url}/tasks/${task.id}:cancel`, {
+			method: "POST",
+			headers: { authorization: "Bearer token-a" },
+		});
+		assert.equal(again.status, 400);
+		const error = (await again.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "TASK_NOT_CANCELABLE");
+	});
+
 	it("the store survives restart with tasks and dedupe intact", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "a2a-store-test-"));
 		cleanups.push(() => rm(directory, { recursive: true, force: true }));

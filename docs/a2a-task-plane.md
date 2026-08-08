@@ -70,6 +70,15 @@ token maps to a principal, and every task and dedupe record is scoped to it.
 - **Interrupted is not terminal.** `INPUT_REQUIRED` and `AUTH_REQUIRED`
   settle a blocking send and remain subscribable and continuable; only
   completed/failed/canceled/rejected are final.
+- **A blocking send is bounded.** At `blockingTimeoutMs` (default 60 s) the
+  send returns the task's current snapshot rather than holding the socket;
+  the client continues by polling or subscribing.
+- **Streaming shows what happens after you connect.** An executor that
+  settles the task before returning (a fast inline executor) emits its
+  updates before the `message:stream` forwarder attaches, so the client
+  receives only the final `{task}` frame — the durable state carries
+  everything regardless. The resident-agent bridge returns at `working`, so
+  its status and artifact updates stream live.
 
 ## Resident-agent bridge
 
