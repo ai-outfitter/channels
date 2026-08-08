@@ -142,15 +142,33 @@ export async function startA2aServer(
 		readonly taskId?: string;
 	}
 
-	const replayPrior = async (
+	/**
+	 * Takes the (principal, messageId) key or replays what it already holds.
+	 * The claim and the prior-outcome read are one store operation, so two
+	 * concurrent sends of the same messageId cannot both proceed to execute.
+	 */
+	const claimOrReplay = async (
 		principal: string,
 		message: A2aMessage,
 	): Promise<ExecutionOutcome | undefined> => {
-		const prior = await store.priorOutcome(principal, message);
-		if (!prior) return undefined;
-		return prior.kind === "task"
-			? { response: { task: await store.getTask(principal, prior.taskId) }, taskId: prior.taskId }
-			: { response: { message: prior.message } };
+		const claim = await store.claimOutcome(principal, message);
+		if (claim.kind === "claimed") return undefined;
+		if (claim.kind === "inProgress") {
+			// Do not wait on the in-flight send: holding the socket turns a
+			// duplicate into a second unit of work on the server's clock. The
+			// caller retries and gets the recorded outcome.
+			throw new A2aError(
+				409,
+				"DUPLICATE_MESSAGE_IN_PROGRESS",
+				`messageId "${message.messageId}" is already being processed; retry to read its outcome`,
+			);
+		}
+		return claim.outcome.kind === "task"
+			? {
+					response: { task: await store.getTask(principal, claim.outcome.taskId) },
+					taskId: claim.outcome.taskId,
+				}
+			: { response: { message: claim.outcome.message } };
 	};
 
 	const loadContinuation = async (
@@ -186,24 +204,24 @@ export async function startA2aServer(
 		request: A2aSendMessageRequest,
 	): Promise<ExecutionOutcome> => {
 		const message = validateMessage(request.message, "ROLE_USER");
-		const replay = await replayPrior(principal, message);
+		const replay = await claimOrReplay(principal, message);
 		if (replay) return replay;
-		const existing = await loadContinuation(principal, message);
 		let controller: A2aTaskController | undefined;
-		const begin = async (): Promise<A2aTaskController> => {
-			if (controller) return controller;
-			const bound = existing ?? (await mintTask(principal, message));
-			controller = controllerFor(principal, bound);
-			emit(bound.id, { task: bound });
-			return controller;
-		};
-		const context: A2aExecutorContext = {
-			principal,
-			message,
-			...(existing ? { task: existing } : {}),
-			begin,
-		};
 		try {
+			const existing = await loadContinuation(principal, message);
+			const begin = async (): Promise<A2aTaskController> => {
+				if (controller) return controller;
+				const bound = existing ?? (await mintTask(principal, message));
+				controller = controllerFor(principal, bound);
+				emit(bound.id, { task: bound });
+				return controller;
+			};
+			const context: A2aExecutorContext = {
+				principal,
+				message,
+				...(existing ? { task: existing } : {}),
+				begin,
+			};
 			const direct = await executor(context);
 			if (controller) return recordTaskOutcome(principal, message, controller.task.id);
 			if (!direct) {
@@ -217,11 +235,19 @@ export async function startA2aServer(
 			await store.recordOutcome(principal, message, { kind: "message", message: reply });
 			return { response: { message: reply } };
 		} catch (error) {
-			if (!controller || error instanceof A2aError) throw error;
-			const failed = await controller
-				.status("TASK_STATE_FAILED")
-				.catch(() => controller?.task as A2aTask);
-			return recordTaskOutcome(principal, message, failed.id);
+			if (!controller) {
+				// Nothing was minted, so there is no outcome to replay. Keeping
+				// the claim would 409 every retry of a message that never ran.
+				await store.releaseClaim(principal, message.messageId);
+				throw error;
+			}
+			// A task exists. Whatever the error kind, it must not stay
+			// non-terminal: an unsettled task is invisible to the retry, which
+			// would mint a second one. Settle it, fill in the claim so the retry
+			// replays the failure, then let the error reach the client.
+			await controller.status("TASK_STATE_FAILED").catch(() => undefined);
+			await store.recordOutcome(principal, message, { kind: "task", taskId: controller.task.id });
+			throw error;
 		}
 	};
 
