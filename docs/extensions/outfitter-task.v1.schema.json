@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ai-outfitter/channels/a2a-extensions/outfitter-task/v1",
+  "title": "outfitter-task/v1",
+  "description": "Outfitter A2A extension payload: the typed metadata A2A does not define. Carried in Message/Task metadata under the key 'outfitter-task/v1' by parties that declare the extension URI. A2A task ids and contextIds are server-scoped; cross-environment identity lives here. Flexible metadata without this versioned schema MUST NOT become a wire contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ticketRunId": {
+      "description": "The stable Outfitter identifier for cross-environment work. One Ticket Run coordinates many server-scoped A2A tasks.",
+      "type": "string",
+      "minLength": 1
+    },
+    "task": { "$ref": "#/$defs/taskLocator" },
+    "parent": { "$ref": "#/$defs/taskLocator" },
+    "retryOf": { "$ref": "#/$defs/taskLocator" },
+    "supersedes": { "$ref": "#/$defs/taskLocator" },
+    "policyDigest": {
+      "description": "Composite digest binding graph, overlay, and governance identity for the run this task serves.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "evidence": {
+      "description": "Content-addressed references to evidence records for this task's attempts.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "idempotency": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "messageId": { "type": "string", "minLength": 1 },
+        "scope": {
+          "description": "The dedupe scope: the authenticated principal the messageId is unique within.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "$defs": {
+    "taskLocator": {
+      "description": "Fully scoped task identity. Two servers may issue the same taskId; the locator is what makes that a non-collision.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentInterface", "protocolBinding", "protocolVersion", "taskId"],
+      "properties": {
+        "agentInterface": { "type": "string", "format": "uri" },
+        "protocolBinding": { "type": "string", "minLength": 1 },
+        "protocolVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "tenant": { "type": "string" },
+        "taskId": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
