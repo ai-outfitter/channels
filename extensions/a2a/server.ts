@@ -356,11 +356,16 @@ export async function startA2aServer(
 		}
 		if (request.method === "POST" && path === "/message:stream") {
 			const body = (await readJsonBody(request)) as A2aSendMessageRequest;
+			// Execute BEFORE the stream opens. Opening first commits a 200 and
+			// the SSE content type, so every error — a duplicate payload, an
+			// unknown task, an executor failure — became an empty stream that
+			// closed, which a client cannot tell apart from success. With the
+			// stream opened after, those errors take the normal HTTP error path.
+			const outcome = await executeSend(principal, body);
 			openEventStream(response);
 			const forward = (event: A2aStreamResponse): void => {
 				response.write(`data: ${JSON.stringify(event)}\n\n`);
 			};
-			const outcome = await executeSend(principal, body);
 			forward(outcome.response);
 			if (!outcome.taskId) {
 				response.end();
