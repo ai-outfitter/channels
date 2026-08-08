@@ -35,7 +35,7 @@ Two upstream inconsistencies, resolved as follows:
 | `/.well-known/agent-card.json` | GET | Public Agent Card: streaming on, push notifications off, `outfitter-task/v1` extension declared |
 | `/message:send` | POST | Send a message; blocks until the task settles unless `configuration.returnImmediately` |
 | `/message:stream` | POST | Send and stream `task` / `statusUpdate` / `artifactUpdate` frames over SSE |
-| `/tasks` | GET | List the caller's tasks, filtered by `contextId`, `status`, `statusTimestampAfter` |
+| `/tasks` | GET | List the caller's tasks, filtered by `contextId`, `status`, `statusTimestampAfter`, paged with `pageSize` and `pageToken` |
 | `/tasks/{id}` | GET | Read one task's durable state |
 | `/tasks/{id}:subscribe` | GET | SSE stream of updates for a non-terminal task |
 | `/tasks/{id}:cancel` | POST | Cancel a non-terminal task |
@@ -56,17 +56,25 @@ token maps to a principal, and every task and dedupe record is scoped to it.
   result — the created Task (a duplicate returns that Task) or the direct
   Message verbatim. Retention: 30 days, never shorter than the referenced
   task's life. A duplicate `messageId` with a different payload is an
-  explicit `409 DUPLICATE_MESSAGE_ID`, never a silent replay.
+  explicit `409 DUPLICATE_MESSAGE_ID`, never a silent replay. The key is
+  claimed before the executor runs, so a duplicate that arrives while the
+  first send is still executing gets `409 DUPLICATE_MESSAGE_IN_PROGRESS` and
+  is told to retry; it never waits and never executes a second time.
 - **Recovery uses durable state.** Streams are ephemeral; the durable Task —
   status, history, artifacts — is the record. A reconnecting client reads
   the Task, then opens a new subscription; nothing replays.
-- **Server-scoped identity.** The server mints every task id. Equal ids from
-  two servers cannot collide because identity is the locator (interface URL
-  + binding + version + tenant + taskId), carried by the `outfitter-task/v1`
-  extension ([schema](./extensions/outfitter-task.v1.schema.json)). A
-  client-supplied `contextId` attaches only when the same principal already
-  owns it; a foreign or unknown `contextId` gets a fresh context instead of
-  joining local work.
+- **Server-scoped identity.** The server mints every task id; a client never
+  supplies one. A task id resolves only on the server that minted it, so
+  equal ids from two servers cannot collide: the full identity of a task is
+  the locator (interface URL + binding + version + tenant + taskId), and this
+  server contributes the taskId component of it. This commit does not emit or
+  validate the full locator on the wire. The Agent Card declares the
+  `outfitter-task/v1` extension
+  ([schema](./extensions/outfitter-task.v1.schema.json)) as optional, and
+  populating its locator, lineage, and supersession fields on messages and
+  tasks is later work. A client-supplied `contextId` attaches only when the
+  same principal already owns it; a foreign or unknown `contextId` gets a
+  fresh context instead of joining local work.
 - **Interrupted is not terminal.** `INPUT_REQUIRED` and `AUTH_REQUIRED`
   settle a blocking send and remain subscribable and continuable; only
   completed/failed/canceled/rejected are final.
