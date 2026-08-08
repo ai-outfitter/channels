@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/ai-outfitter/channels/compare/v1.6.0...v1.6.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* **ci:** publish to npm with an npm that supports trusted publishing ([#32](https://github.com/ai-outfitter/channels/issues/32)) ([15827a6](https://github.com/ai-outfitter/channels/commit/15827a615c11a5b9c8b06c2a0a929cd2d27d9f81))
+
 ## [1.6.0](https://github.com/ai-outfitter/channels/compare/v1.5.0...v1.6.0) (2026-08-08)
 
 
