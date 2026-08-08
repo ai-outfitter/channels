@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { A2aTaskStore, trimTask } from "./store.ts";
@@ -531,7 +531,15 @@ function requireSupportedVersion(request: IncomingMessage): void {
 function authenticate(request: IncomingMessage, credentials: readonly A2aCredential[]): string {
 	const header = request.headers.authorization ?? "";
 	const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
-	const credential = token && credentials.find((entry) => entry.token === token);
+	// Compare fixed-size digests, not the tokens themselves: a raw comparison
+	// needs a length short-circuit before timingSafeEqual, and that
+	// short-circuit leaks each configured token's length to an unauthenticated
+	// prober. Same reasoning, and the same shape, as the relay server's
+	// findCredential.
+	const digest = (value: string) => createHash("sha256").update(value).digest();
+	const candidate = token ? digest(token) : undefined;
+	const credential =
+		candidate && credentials.find((entry) => timingSafeEqual(digest(entry.token), candidate));
 	if (!credential) {
 		throw new A2aError(401, "UNAUTHENTICATED", "a valid bearer token is required");
 	}
