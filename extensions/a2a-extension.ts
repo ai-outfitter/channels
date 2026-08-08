@@ -46,10 +46,17 @@ export default function a2aServerExtension(
 	let starting: Promise<void> | undefined;
 	let stopped = false;
 
+	// The task ids this session was actually woken for. The tools scope every
+	// id against this set; the HTTP surface scopes by authenticated principal,
+	// and the tools have no principal of their own, so the woken set is what
+	// keeps one caller's task out of another caller's reach.
+	const wokenTaskIds = new Set<string>();
+
 	const executor: A2aExecutor = async (context) => {
 		const controller = await context.begin();
 		await controller.status("TASK_STATE_WORKING");
 		const taskId = controller.task.id;
+		wokenTaskIds.add(taskId);
 		// Body-free wake, same rule as every channel source: an inbound A2A
 		// message is untrusted content and never rides the prompt.
 		const delivery: unknown = pi.sendUserMessage(
@@ -64,7 +71,11 @@ export default function a2aServerExtension(
 		return undefined;
 	};
 
-	registerA2aTools(pi, () => running);
+	registerA2aTools(
+		pi,
+		() => running,
+		(taskId) => wokenTaskIds.has(taskId),
+	);
 
 	pi.on("session_start", async () => {
 		if (running) return;
@@ -100,11 +111,28 @@ export default function a2aServerExtension(
 export function registerA2aTools(
 	pi: ExtensionAPI,
 	server: () => RunningA2aServer | undefined,
+	isWoken: (taskId: string) => boolean,
 ): void {
 	const requireServer = (): RunningA2aServer => {
 		const current = server();
 		if (!current) throw new Error("the a2a server is not running");
 		return current;
+	};
+
+	/**
+	 * readTask and controllerForTask look a task up without a principal — the
+	 * hosting session IS the server. So the only thing standing between one
+	 * caller's task and another caller's answer is which id the tool is given,
+	 * and that id reaches the model through content the tools themselves label
+	 * untrusted. Refuse any id this session was not woken for.
+	 */
+	const requireWoken = (taskId: string): string => {
+		if (!isWoken(taskId)) {
+			throw new Error(
+				`a2a task "${taskId}" is not one this session was woken for; only act on task ids from a [channels] a2a wake`,
+			);
+		}
+		return taskId;
 	};
 
 	pi.registerTool({
@@ -120,7 +148,7 @@ export function registerA2aTools(
 			taskId: Type.String({ minLength: 1, description: "Task id from the wake." }),
 		}),
 		async execute(_toolCallId, params) {
-			const task = await requireServer().readTask(params.taskId);
+			const task = await requireServer().readTask(requireWoken(params.taskId));
 			if (!task) throw new Error(`a2a task "${params.taskId}" was not found`);
 			return {
 				content: [{ type: "text", text: renderTask(task.status.state, task.history ?? []) }],
@@ -144,7 +172,7 @@ export function registerA2aTools(
 			}),
 		}),
 		async execute(_toolCallId, params) {
-			const controller = await requireServer().controllerForTask(params.taskId);
+			const controller = await requireServer().controllerForTask(requireWoken(params.taskId));
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
 				await controller.artifact({
@@ -174,7 +202,7 @@ export function registerA2aTools(
 			question: Type.String({ minLength: 1, maxLength: 40_000 }),
 		}),
 		async execute(_toolCallId, params) {
-			const controller = await requireServer().controllerForTask(params.taskId);
+			const controller = await requireServer().controllerForTask(requireWoken(params.taskId));
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			await controller.status("TASK_STATE_INPUT_REQUIRED", statusMessage(params.question));
 			return {
