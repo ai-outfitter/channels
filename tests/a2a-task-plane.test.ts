@@ -405,6 +405,15 @@ describe("a2a task plane", () => {
 		assert.deepEqual(prior, { kind: "replay", outcome: { kind: "task", taskId: task.id } });
 	});
 
+	it("a closed store refuses further operations instead of rebuilding itself", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-close-test-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const store = new A2aTaskStore(join(directory, "store.json"));
+		await store.initialize();
+		store.close();
+		await assert.rejects(() => store.createTask("alpha", undefined), /store is closed/);
+	});
+
 	it("a stream request that fails before the stream opens returns an HTTP error, not an empty 200 stream", async () => {
 		const server = await launch(completingExecutor);
 		const stream = (text: string): Promise<Response> =>
