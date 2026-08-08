@@ -18,6 +18,7 @@ import {
 	isSettled,
 	isTerminal,
 	OUTFITTER_TASK_EXTENSION_URI,
+	validateIdentifier,
 	validateMessage,
 } from "./types.ts";
 
@@ -89,6 +90,7 @@ export async function startA2aServer(
 	config: A2aServerConfig,
 	executor: A2aExecutor,
 ): Promise<RunningA2aServer> {
+	validateA2aServerConfig(config);
 	const store = new A2aTaskStore(config.storePath);
 	await store.initialize();
 	const subscribers = new Map<string, Set<Subscriber>>();
@@ -486,6 +488,27 @@ export async function startA2aServer(
 	};
 }
 
+/**
+ * Fail-closed startup validation, mirroring the relay server's
+ * validateServerConfig. Every principal that reaches the store must satisfy
+ * the same identifier rule the store applies when it parses its file back:
+ * a principal accepted here but rejected on parse records tasks durably and
+ * then makes the server permanently unstartable. Tokens must also be unique,
+ * or two entries silently collapse onto whichever principal is listed first.
+ */
+export function validateA2aServerConfig(config: A2aServerConfig): void {
+	if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65_535) {
+		throw new Error("a2a port is invalid");
+	}
+	const tokens = new Set<string>();
+	for (const credential of config.credentials) {
+		if (!credential.token) throw new Error("a2a credential token is required");
+		if (tokens.has(credential.token)) throw new Error("a2a credential tokens must be unique");
+		tokens.add(credential.token);
+		validateIdentifier(credential.principal, "principal");
+	}
+}
+
 function requireSupportedVersion(request: IncomingMessage): void {
 	const requested = request.headers[A2A_VERSION_HEADER];
 	const value = Array.isArray(requested) ? requested[0] : requested;
@@ -559,7 +582,7 @@ export async function configFromEnv(): Promise<A2aServerConfig> {
 	}
 	const host = process.env.A2A_HOST?.trim() || "127.0.0.1";
 	const port = Number(process.env.A2A_PORT ?? "8788");
-	return {
+	const config: A2aServerConfig = {
 		host,
 		port,
 		storePath,
@@ -571,4 +594,8 @@ export async function configFromEnv(): Promise<A2aServerConfig> {
 		publicUrl: process.env.A2A_PUBLIC_URL?.trim() || `http://${host}:${port}`,
 		agentVersion: process.env.A2A_AGENT_VERSION?.trim() || "0.0.0",
 	};
+	// Fail here as well as in startA2aServer, so a bad credentials file names
+	// itself at load time rather than at listen time.
+	validateA2aServerConfig(config);
+	return config;
 }
