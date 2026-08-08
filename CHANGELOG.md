@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/ai-outfitter/channels/compare/v1.5.0...v1.6.0) (2026-08-08)
+
+
+### Features
+
+* **a2a:** add the A2A v1 task plane ([#36](https://github.com/ai-outfitter/channels/issues/36)) ([b4f6444](https://github.com/ai-outfitter/channels/commit/b4f644406747df97876a6c7b255931cd9c79a6ba))
+
 ## [1.5.0](https://github.com/ai-outfitter/channels/compare/v1.4.0...v1.5.0) (2026-08-04)
 
 
