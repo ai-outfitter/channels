@@ -490,6 +490,7 @@ export async function startA2aServer(
 		close: () =>
 			new Promise<void>((resolve, reject) => {
 				server.closeAllConnections();
+				store.close();
 				server.close((error) => (error ? reject(error) : resolve()));
 			}),
 	};

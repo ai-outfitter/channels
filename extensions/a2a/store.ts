@@ -102,6 +102,7 @@ export class A2aTaskStore {
 	#data: TaskStoreData = { version: 1, tasks: {}, dedupe: [] };
 	#initialized: Promise<void> | undefined;
 	#operations: Promise<unknown> = Promise.resolve();
+	#closed = false;
 
 	constructor(path: string) {
 		if (!path) throw new Error("a2a store path is required");
@@ -109,6 +110,7 @@ export class A2aTaskStore {
 	}
 
 	async initialize(): Promise<void> {
+		if (this.#closed) throw new Error("a2a store is closed");
 		if (!this.#initialized) {
 			this.#initialized = (async () => {
 				await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
@@ -343,6 +345,16 @@ export class A2aTaskStore {
 			];
 			return this.#replace(stored, { ...stored.task, artifacts });
 		});
+	}
+
+	/**
+	 * Latches the store shut. Every operation goes through #run, which calls
+	 * initialize() first, so a write that arrives after the server closed
+	 * fails loudly instead of re-creating the store directory and rewriting
+	 * the file from whatever this instance still holds in memory.
+	 */
+	close(): void {
+		this.#closed = true;
 	}
 
 	async #replace(stored: StoredTask, task: A2aTask): Promise<A2aTask> {
