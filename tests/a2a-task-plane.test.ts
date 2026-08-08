@@ -405,6 +405,24 @@ describe("a2a task plane", () => {
 		assert.deepEqual(prior, { kind: "replay", outcome: { kind: "task", taskId: task.id } });
 	});
 
+	it("a stream request that fails before the stream opens returns an HTTP error, not an empty 200 stream", async () => {
+		const server = await launch(completingExecutor);
+		const stream = (text: string): Promise<Response> =>
+			fetch(`${server.url}/message:stream`, {
+				method: "POST",
+				headers: { authorization: "Bearer token-a", "content-type": "application/a2a+json" },
+				body: JSON.stringify({ message: userMessage("m-stream-dup", text) }),
+			});
+		const first = await stream("original");
+		assert.equal(first.status, 200);
+		await first.body?.cancel();
+		const mismatched = await stream("different payload");
+		assert.equal(mismatched.status, 409);
+		assert.doesNotMatch(mismatched.headers.get("content-type") ?? "", /text\/event-stream/);
+		const error = (await mismatched.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "DUPLICATE_MESSAGE_ID");
+	});
+
 	it("GET /tasks pages through every task exactly once", async () => {
 		const server = await launch(completingExecutor);
 		const created = new Set<string>();
