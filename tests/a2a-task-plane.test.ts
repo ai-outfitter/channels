@@ -405,6 +405,27 @@ describe("a2a task plane", () => {
 		assert.deepEqual(prior, { kind: "replay", outcome: { kind: "task", taskId: task.id } });
 	});
 
+	it("a principal the store cannot parse back is refused at startup, not on the next restart", async () => {
+		await assert.rejects(
+			() =>
+				launch(directExecutor, { credentials: [{ token: "t", principal: "nick@example.com" }] }),
+			/principal must match/,
+		);
+	});
+
+	it("two credentials sharing a token are refused at startup", async () => {
+		await assert.rejects(
+			() =>
+				launch(directExecutor, {
+					credentials: [
+						{ token: "same", principal: "alpha" },
+						{ token: "same", principal: "beta" },
+					],
+				}),
+			/tokens must be unique/,
+		);
+	});
+
 	it("concurrent sends of one messageId mint exactly one task", async () => {
 		let release: () => void = () => {};
 		const gate = new Promise<void>((resolve) => {
