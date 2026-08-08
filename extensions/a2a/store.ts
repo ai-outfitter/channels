@@ -22,6 +22,11 @@ import {
  * verbatim. A duplicate messageId with a different payload is an explicit
  * error, never a silent replay. This is deliberately stronger than the A2A
  * minimum, which only says sends MAY be idempotent.
+ *
+ * A "pending" outcome is a claim: the key is taken and the first send is
+ * still executing. The claim is written in the same serialized operation
+ * that checks for a prior record, so two concurrent sends can never both
+ * decide they are first.
  */
 interface DedupeRecord {
 	readonly principal: string;
@@ -29,9 +34,28 @@ interface DedupeRecord {
 	readonly payloadHash: string;
 	readonly createdAt: string;
 	readonly outcome:
+		| { readonly kind: "pending" }
 		| { readonly kind: "task"; readonly taskId: string }
 		| { readonly kind: "message"; readonly message: A2aMessage };
 }
+
+export type DedupeOutcome =
+	| { readonly kind: "task"; readonly taskId: string }
+	| { readonly kind: "message"; readonly message: A2aMessage };
+
+/**
+ * Result of claiming a (principal, messageId) key.
+ *
+ * - `claimed`: this caller is first and owns the key; it MUST later call
+ *   recordOutcome() or releaseClaim().
+ * - `replay`: a prior send finished; return its outcome verbatim.
+ * - `inProgress`: another send holds the claim right now. The caller answers
+ *   409 and does not execute; it never waits.
+ */
+export type ClaimResult =
+	| { readonly kind: "claimed" }
+	| { readonly kind: "replay"; readonly outcome: DedupeOutcome }
+	| { readonly kind: "inProgress" };
 
 export interface StoredTask {
 	readonly task: A2aTask;
@@ -87,6 +111,14 @@ export class A2aTaskStore {
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				}
+				// A pending claim is in-process state, not durable state: this
+				// store serializes every operation in one process, so a claim can
+				// only be held by an execute running in THIS process. Any claim
+				// read back from disk therefore belongs to a process that died
+				// mid-execute and can never be filled in. Clearing them at load
+				// is exact — no age bound to tune, and no window in which a live
+				// claim could be reclaimed under its owner.
+				this.#data.dedupe = this.#data.dedupe.filter((entry) => entry.outcome.kind !== "pending");
 				this.#prune(Date.now());
 				await this.#persist();
 			})();
@@ -95,46 +127,93 @@ export class A2aTaskStore {
 	}
 
 	/**
-	 * Returns the prior outcome for a duplicate (principal, messageId), or
-	 * undefined for a first send. Throws when the duplicate carries a
-	 * different payload.
+	 * Find-or-insert on (principal, messageId), in ONE serialized operation.
+	 * Reading a prior outcome and inserting the claim cannot be split: two
+	 * concurrent sends of the same messageId would otherwise both see no
+	 * record and both mint a task. The payload-hash check happens here, at
+	 * claim time, so a mismatched duplicate is rejected before any work runs.
 	 */
-	async priorOutcome(
-		principal: string,
-		message: A2aMessage,
-	): Promise<DedupeRecord["outcome"] | undefined> {
+	async claimOutcome(principal: string, message: A2aMessage): Promise<ClaimResult> {
 		return this.#run(async () => {
+			const hash = hashPayload(message);
 			const record = this.#data.dedupe.find(
 				(entry) => entry.principal === principal && entry.messageId === message.messageId,
 			);
-			if (!record) return undefined;
-			if (record.payloadHash !== hashPayload(message)) {
-				throw new A2aError(
-					409,
-					"DUPLICATE_MESSAGE_ID",
-					`messageId "${message.messageId}" was already used with a different payload`,
-				);
+			if (record) {
+				if (record.payloadHash !== hash) {
+					throw new A2aError(
+						409,
+						"DUPLICATE_MESSAGE_ID",
+						`messageId "${message.messageId}" was already used with a different payload`,
+					);
+				}
+				if (record.outcome.kind === "pending") return { kind: "inProgress" } as const;
+				return { kind: "replay", outcome: record.outcome } as const;
 			}
-			return record.outcome;
-		});
-	}
-
-	async recordOutcome(
-		principal: string,
-		message: A2aMessage,
-		outcome: DedupeRecord["outcome"],
-	): Promise<void> {
-		return this.#run(async () => {
 			this.#data.dedupe.push({
 				principal,
 				messageId: message.messageId,
-				payloadHash: hashPayload(message),
+				payloadHash: hash,
 				createdAt: new Date().toISOString(),
-				outcome,
+				outcome: { kind: "pending" },
 			});
 			if (this.#data.dedupe.length > MAX_DEDUPE_RECORDS) {
 				this.#data.dedupe.splice(0, this.#data.dedupe.length - MAX_DEDUPE_RECORDS);
 			}
+			await this.#persist();
+			return { kind: "claimed" } as const;
+		});
+	}
+
+	/**
+	 * Fills in the claim this caller holds. It updates the claim rather than
+	 * appending: an append would leave the pending record in front of the real
+	 * one, and the finder above returns the first match, so the key would stay
+	 * wedged as "in progress" forever.
+	 */
+	async recordOutcome(
+		principal: string,
+		message: A2aMessage,
+		outcome: DedupeOutcome,
+	): Promise<void> {
+		return this.#run(async () => {
+			const index = this.#data.dedupe.findIndex(
+				(entry) => entry.principal === principal && entry.messageId === message.messageId,
+			);
+			const filled: DedupeRecord = {
+				principal,
+				messageId: message.messageId,
+				payloadHash: hashPayload(message),
+				createdAt:
+					index >= 0
+						? (this.#data.dedupe[index] as DedupeRecord).createdAt
+						: new Date().toISOString(),
+				outcome,
+			};
+			if (index >= 0) this.#data.dedupe[index] = filled;
+			else this.#data.dedupe.push(filled);
+			if (this.#data.dedupe.length > MAX_DEDUPE_RECORDS) {
+				this.#data.dedupe.splice(0, this.#data.dedupe.length - MAX_DEDUPE_RECORDS);
+			}
+			await this.#persist();
+		});
+	}
+
+	/**
+	 * Drops an unfilled claim. A send that fails before it ever mints a task
+	 * has no outcome to replay, and leaving the claim in place would 409 every
+	 * retry of a message that was never executed.
+	 */
+	async releaseClaim(principal: string, messageId: string): Promise<void> {
+		return this.#run(async () => {
+			const index = this.#data.dedupe.findIndex(
+				(entry) =>
+					entry.principal === principal &&
+					entry.messageId === messageId &&
+					entry.outcome.kind === "pending",
+			);
+			if (index < 0) return;
+			this.#data.dedupe.splice(index, 1);
 			await this.#persist();
 		});
 	}
@@ -362,15 +441,19 @@ function parseStoreData(value: unknown): TaskStoreData {
 			throw new Error(`unknown task state ${entry.task.status.state}`);
 		}
 	}
-	for (const entry of parsed.dedupe) {
-		validateIdentifier(entry.principal, "principal");
-		validateIdentifier(entry.messageId, "messageId");
-		if (!/^[a-f0-9]{64}$/.test(entry.payloadHash)) throw new Error("invalid dedupe payload hash");
-		if (entry.outcome.kind === "task") {
-			validateIdentifier(entry.outcome.taskId, "dedupe taskId");
-		} else {
-			validateMessage(entry.outcome.message);
-		}
-	}
+	for (const entry of parsed.dedupe) validateDedupeRecord(entry);
 	return parsed as TaskStoreData;
+}
+
+function validateDedupeRecord(entry: DedupeRecord): void {
+	validateIdentifier(entry.principal, "principal");
+	validateIdentifier(entry.messageId, "messageId");
+	if (!/^[a-f0-9]{64}$/.test(entry.payloadHash)) throw new Error("invalid dedupe payload hash");
+	if (entry.outcome.kind === "task") {
+		validateIdentifier(entry.outcome.taskId, "dedupe taskId");
+	} else if (entry.outcome.kind === "message") {
+		validateMessage(entry.outcome.message);
+	} else if (entry.outcome.kind !== "pending") {
+		throw new Error("unknown dedupe outcome kind");
+	}
 }
