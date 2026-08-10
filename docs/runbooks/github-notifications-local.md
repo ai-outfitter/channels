@@ -59,6 +59,46 @@ that the token is the wrong type. Issue a new classic token if you get a `403`.
 This preflight tests the token only. It does not test your filters. It does not
 test that the agent acts on a wake.
 
+## Split the wake token from the work token
+
+Deploy two tokens, not one:
+
+- `GITHUB_NOTIFY_TOKEN`: a classic personal access token with the
+  `notifications` scope **only**, and no other scope.
+- `GITHUB_TOKEN`: a fine-grained personal access token whose resource owner is
+  the single organization where the agent works, with access limited to only
+  the repositories the agent works in.
+
+A fine-grained personal access token has exactly one resource owner as a
+property of the credential. An agent carrying it cannot reach another
+organization. A classic personal access token has no organization boundary.
+The scope discipline on the wake token is therefore load-bearing: if someone
+adds `repo` "to be safe," it silently becomes a cross-organization write
+credential.
+
+Verify the classic token's granted scopes from the `X-OAuth-Scopes` response
+header on any API call. This prints only the header value, never the token:
+
+```sh
+curl -sS -o /dev/null -w '%header{x-oauth-scopes}\n' \
+  -H "Authorization: Bearer $GITHUB_NOTIFY_TOKEN" \
+  https://api.github.com/notifications
+```
+
+The header lists the granted scopes, separated by commas. A correctly minted
+wake token shows `notifications` and nothing else. Any additional scope,
+especially `repo`, means the token is broader than this runbook intends. The
+header is empty for a fine-grained token, which is a further reason to check
+the wake token specifically.
+
+The `githubConfigFromEnv` function reads `GITHUB_NOTIFY_TOKEN` first and falls
+back to `GITHUB_TOKEN`. Omitting `GITHUB_NOTIFY_TOKEN` forces the one token to
+be classic so that polling works, and collapses this split.
+
+For the canonical credential ranking and rationale, see the
+[forge credential model](https://github.com/ai-outfitter/outfitter/blob/main/docs/architecture/forge-credential-model.md).
+This runbook owns the deployment mechanism.
+
 ## Watch notifications from the checkout
 
 Export the configuration, then start Pi with the extension loaded. This example
@@ -162,11 +202,8 @@ adapter sends the reply. This channel delivers no message and has no adapter:
 receives every wake, and can do nothing with any of them. A GitHub agent needs
 the tools that run `gh` and edit files.
 
-**Use two tokens.** The poller needs a classic personal access token, which is
-a broad credential. Repository work should use the narrowest token that does
-the job. Put the classic token in `GITHUB_NOTIFY_TOKEN` and the working token
-in `GITHUB_TOKEN`. The source reads the first and falls back to the second;
-`gh` reads the second. Deliver both as secrets, never in an image or a manifest.
+**Keep the tokens split.** Deliver both tokens described above as secrets,
+never in an image or a manifest.
 
 **Expect a restart to lose pending work.** The poller reports only threads
 updated after it started. A deployment restarts the pod, so anything assigned
