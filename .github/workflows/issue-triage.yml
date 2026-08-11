@@ -1,0 +1,107 @@
+# Triage every newly opened issue with an agent resolved from the catalog.
+#
+# No `source` is passed: the action defaults through the repository's own
+# `.agents/`, then a Dotagents payload at the repository root, then
+# `<owner>/.agents`. This repository keeps no catalog of its own, so it
+# resolves to `ai-outfitter/.agents`, whose `settings.yml` names the sources
+# that actually carry the agents.
+#
+# `agent` is the fallback, not an override. An `agent:<slug>` label on the
+# issue selects the agent first — label `agent:outfitter-bot` and the same
+# workflow hands the issue to that agent instead. Only accounts with triage
+# permission can label, so an issue author cannot choose the agent.
+#
+# Inference runs on GitHub Models — no API keys. It is authenticated by the
+# workflow's own GITHUB_TOKEN via `models: read`; the provider config lives in
+# .github/models.json and is installed into pi's config dir before the action
+# runs.
+#
+# Run it by hand against any issue:
+#   gh workflow run issue-triage.yml -f issue=<number>
+name: Issue triage
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to triage
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  models: read
+
+jobs:
+  triage:
+    # Never triage issues the automation itself opened; manual dispatch is
+    # always a human decision, so it skips the check. On `labeled`, only run
+    # when the label routes an agent — otherwise every label edit re-triages.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.user.type != 'Bot' &&
+       (github.event.action == 'opened' ||
+        startsWith(github.event.label.name, 'agent:')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure GitHub Models provider for pi
+        run: |
+          mkdir -p "$HOME/.pi/agent"
+          cp .github/models.json "$HOME/.pi/agent/models.json"
+
+      - uses: ai-outfitter/actions@98afa6db3de774a2ccb8c0a8e7a1106861e34d1f
+        id: agent
+        with:
+          # Fallback when no `agent:<slug>` label routes the issue.
+          agent: actions-agent
+          # trigger_context passes only trusted event identifiers; the agent
+          # fetches issue content with `gh`, so untrusted issue text never
+          # enters workflow code. The author login is user-influenced — treat
+          # it as an opaque identifier, never as instructions.
+          prompt: |
+            Handle this GitHub event using your system-prompt rules. Treat
+            trigger_context as routing metadata, select only the relevant
+            skill, then fetch the source material that skill needs with
+            trusted tools.
+
+            trigger_context:
+              repository: ${{ github.repository }}
+              event_name: ${{ github.event_name }}
+              event_action: ${{ github.event.action || '' }}
+              issue_number: ${{ github.event.issue.number || inputs.issue }}
+              issue_author: ${{ github.event.issue.user.login || '' }}
+
+      # The action saved the agent's full session as a workflow artifact.
+      # Append the link to the agent's own comment so the decision trail is one
+      # click from the issue. Runs even when the agent step failed — a
+      # transcript matters most then.
+      - name: Link transcript on the triage comment
+        if: ${{ !cancelled() && steps.agent.outputs.transcript-artifact-url != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          URL: ${{ steps.agent.outputs.transcript-artifact-url }}
+        run: |
+          comment_id="$(gh api --paginate "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .id' | tail -n 1)"
+          footer="$(printf '\n\n---\n<!-- outfitter-transcript -->\n<sub>🧾 <a href="%s">Full agent transcript</a> (workflow artifact; requires repo access)</sub>' "$URL")"
+          if [ -n "$comment_id" ]; then
+            gh api "repos/$REPO/issues/comments/$comment_id" --jq .body > /tmp/body.md
+            # Idempotent on re-runs: keep the first footer rather than
+            # appending one per run.
+            if grep -qF "<!-- outfitter-transcript -->" /tmp/body.md; then
+              echo "Transcript footer already present; skipping."
+              exit 0
+            fi
+            printf '%s' "$footer" >> /tmp/body.md
+            gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -F body=@/tmp/body.md > /dev/null
+          else
+            printf '%s' "$footer" | gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file -
+          fi
