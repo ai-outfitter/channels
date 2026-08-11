@@ -222,7 +222,9 @@ async function handleConnectorRequest(
 		await handleClaim(response, queue, a2a, worker, leaseMs);
 		return;
 	}
-	const match = url.pathname.match(/^\/v1\/tasks\/([^/:]+)(?::(renew|release|status|artifact))?$/);
+	const match = url.pathname.match(
+		/^\/v1\/tasks\/([^/:]+)(?::(renew|release|status|artifact|evidence))?$/,
+	);
 	if (!match) throw new ConnectorError(404, "not_found", "connector route was not found");
 	const leaseId = request.headers["x-a2a-relay-lease"];
 	if (typeof leaseId !== "string") {
@@ -400,6 +402,8 @@ async function handleTaskRequest(
 			return updateWorkerStatus(request, response, a2a, queue, worker, taskId, leaseId);
 		case "POST:artifact":
 			return addWorkerArtifact(request, response, a2a, taskId);
+		case "POST:evidence":
+			return addWorkerEvidence(request, response, a2a, taskId);
 		default:
 			throw new ConnectorError(405, "method_not_allowed", "connector method is not allowed");
 	}
@@ -469,6 +473,20 @@ async function addWorkerArtifact(
 	const body = await readJsonBody(request);
 	const controller = await requireController(a2a, taskId);
 	writeJson(response, 200, await controller.artifact(validateArtifact(body.artifact)));
+}
+
+async function addWorkerEvidence(
+	request: IncomingMessage,
+	response: ServerResponse,
+	a2a: RunningA2aServer,
+	taskId: string,
+): Promise<void> {
+	const controller = await requireController(a2a, taskId);
+	const body = await readJsonBody(request);
+	if (typeof body.reference !== "string") {
+		throw new ConnectorError(400, "invalid_evidence", "evidence reference is required");
+	}
+	writeJson(response, 200, await controller.evidence(body.reference));
 }
 
 async function claimRunnable(

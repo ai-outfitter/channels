@@ -11,7 +11,9 @@ import {
 	isSettled,
 	isTerminal,
 	MAX_HISTORY_MESSAGES,
+	outfitterTaskMetadata,
 	TASK_STATES,
+	taskMetadataFromTask,
 	validateIdentifier,
 	validateMessage,
 } from "./types.ts";
@@ -70,7 +72,6 @@ interface TaskStoreData {
 	dedupe: DedupeRecord[];
 }
 
-const MAX_DEDUPE_RECORDS = 10_000;
 export const DEDUPE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const TASK_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -100,14 +101,25 @@ export interface ListTasksPage {
  */
 export class A2aTaskStore {
 	readonly #path: string;
+	readonly #newTaskMetadata:
+		| ((taskId: string, principal: string, message: A2aMessage) => Record<string, unknown>)
+		| undefined;
 	#data: TaskStoreData = { version: 1, tasks: {}, dedupe: [] };
 	#initialized: Promise<void> | undefined;
 	#operations: Promise<unknown> = Promise.resolve();
 	#closed = false;
 
-	constructor(path: string) {
+	constructor(
+		path: string,
+		newTaskMetadata?: (
+			taskId: string,
+			principal: string,
+			message: A2aMessage,
+		) => Record<string, unknown>,
+	) {
 		if (!path) throw new Error("a2a store path is required");
 		this.#path = path;
+		this.#newTaskMetadata = newTaskMetadata;
 	}
 
 	async initialize(): Promise<void> {
@@ -168,9 +180,7 @@ export class A2aTaskStore {
 				createdAt: new Date().toISOString(),
 				outcome: { kind: "pending" },
 			});
-			if (this.#data.dedupe.length > MAX_DEDUPE_RECORDS) {
-				this.#data.dedupe.splice(0, this.#data.dedupe.length - MAX_DEDUPE_RECORDS);
-			}
+			this.#prune(Date.now());
 			await this.#persist();
 			return { kind: "claimed" } as const;
 		});
@@ -230,9 +240,7 @@ export class A2aTaskStore {
 			};
 			if (index >= 0) this.#data.dedupe[index] = filled;
 			else this.#data.dedupe.push(filled);
-			if (this.#data.dedupe.length > MAX_DEDUPE_RECORDS) {
-				this.#data.dedupe.splice(0, this.#data.dedupe.length - MAX_DEDUPE_RECORDS);
-			}
+			this.#prune(Date.now());
 			await this.#persist();
 		});
 	}
@@ -400,6 +408,23 @@ export class A2aTaskStore {
 		});
 	}
 
+	async addEvidenceReference(
+		principal: string,
+		taskId: string,
+		reference: string,
+	): Promise<A2aTask> {
+		return this.#run(async () => {
+			if (!reference || reference.length > 2_048) throw new Error("evidence reference is invalid");
+			const stored = this.#owned(principal, taskId);
+			const metadata = taskMetadataFromTask(stored.task);
+			const evidence = [...new Set([...metadata.evidence, reference])];
+			return this.#replace(stored, {
+				...stored.task,
+				metadata: outfitterTaskMetadata({ ...metadata, evidence }),
+			});
+		});
+	}
+
 	/**
 	 * Latches the store shut. Every operation goes through #run, which calls
 	 * initialize() first, so a write that arrives after the server closed
@@ -453,7 +478,7 @@ export class A2aTaskStore {
 		message: A2aMessage,
 		selectedTaskId: string | undefined,
 	): StoredTask {
-		if (!selectedTaskId) return this.#newTask(principal, message.contextId);
+		if (!selectedTaskId) return this.#newTask(principal, message);
 		const stored = this.#owned(principal, selectedTaskId);
 		if (isTerminal(stored.task.status.state)) {
 			throw new A2aError(
@@ -468,20 +493,24 @@ export class A2aTaskStore {
 		return stored;
 	}
 
-	#newTask(principal: string, requestedContextId: string | undefined): StoredTask {
+	#newTask(principal: string, message: A2aMessage): StoredTask {
+		const taskId = randomUUID();
 		const contextId =
-			requestedContextId && this.#principalOwnsContext(principal, requestedContextId)
-				? requestedContextId
+			message.contextId && this.#principalOwnsContext(principal, message.contextId)
+				? message.contextId
 				: randomUUID();
 		return {
 			principal,
 			updatedAt: new Date().toISOString(),
 			task: {
-				id: randomUUID(),
+				id: taskId,
 				contextId,
 				status: { state: "TASK_STATE_SUBMITTED", timestamp: new Date().toISOString() },
 				artifacts: [],
 				history: [],
+				...(this.#newTaskMetadata
+					? { metadata: this.#newTaskMetadata(taskId, principal, message) }
+					: {}),
 			},
 		};
 	}
@@ -621,6 +650,7 @@ function parseStoreData(value: unknown): TaskStoreData {
 		if (!TASK_STATES.includes(entry.task.status.state)) {
 			throw new Error(`unknown task state ${entry.task.status.state}`);
 		}
+		if (entry.task.metadata) taskMetadataFromTask(entry.task);
 	}
 	for (const entry of parsed.dedupe) validateDedupeRecord(entry);
 	return parsed as TaskStoreData;

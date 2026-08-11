@@ -452,9 +452,7 @@ function calendarWork(
 }
 
 function structuralField(value: unknown): string | undefined {
-	return typeof value === "string" && value.length > 0 && value.length <= 1_024
-		? value
-		: undefined;
+	return typeof value === "string" && value.length > 0 && value.length <= 1_024 ? value : undefined;
 }
 
 function digest(value: string): string {

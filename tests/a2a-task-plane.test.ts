@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -10,7 +11,14 @@ import {
 	startA2aServer,
 } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
-import { A2aError, type A2aSendMessageRequest, type A2aTask } from "../extensions/a2a/types.ts";
+import {
+	A2aError,
+	type A2aSendMessageRequest,
+	type A2aTask,
+	MAX_MESSAGE_BYTES,
+	taskMetadataFromTask,
+	validateMessage,
+} from "../extensions/a2a/types.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 after(async () => {
@@ -26,6 +34,7 @@ async function launch(
 		host: "127.0.0.1",
 		port: 0,
 		storePath: join(directory, "store.json"),
+		artifactStorePath: join(directory, "artifacts"),
 		credentials: [
 			{ token: "token-a", principal: "alpha" },
 			{ token: "token-b", principal: "beta" },
@@ -34,6 +43,7 @@ async function launch(
 		agentDescription: "test agent",
 		publicUrl: "https://agent.test/a2a",
 		agentVersion: "0.0.1",
+		policyDigest: `sha256:${"a".repeat(64)}`,
 		blockingTimeoutMs: 2_000,
 		...overrides,
 	};
@@ -80,6 +90,7 @@ const completingExecutor: A2aExecutor = async (context) => {
 		name: "result",
 		parts: [{ text: "done" }],
 	});
+	await controller.evidence("evidence-record-1");
 	await controller.status("TASK_STATE_COMPLETED");
 	return undefined;
 };
@@ -103,6 +114,18 @@ describe("a2a task plane", () => {
 		const first = await send(server, "token-a", { message: userMessage("m-2", "do work") });
 		const firstBody = (await first.json()) as { task: A2aTask };
 		assert.equal(firstBody.task.status.state, "TASK_STATE_COMPLETED");
+		assert.deepEqual(taskMetadataFromTask(firstBody.task), {
+			ticketRunId: taskMetadataFromTask(firstBody.task).ticketRunId,
+			task: {
+				agentInterface: "https://agent.test/a2a",
+				protocolBinding: "HTTP+JSON",
+				protocolVersion: "1.0",
+				taskId: firstBody.task.id,
+			},
+			policyDigest: `sha256:${"a".repeat(64)}`,
+			evidence: ["evidence-record-1"],
+			idempotency: { messageId: "m-2", scope: "alpha" },
+		});
 		const duplicate = await send(server, "token-a", { message: userMessage("m-2", "do work") });
 		const duplicateBody = (await duplicate.json()) as { task: A2aTask };
 		assert.equal(duplicateBody.task.id, firstBody.task.id);
@@ -312,15 +335,71 @@ describe("a2a task plane", () => {
 			capabilities: {
 				streaming: boolean;
 				pushNotifications: boolean;
-				extensions: [{ uri: string }];
+				extensions: Array<{ uri: string }>;
 			};
 			supportedInterfaces: [{ protocolBinding: string; protocolVersion: string }];
 		};
 		assert.equal(card.capabilities.streaming, true);
 		assert.equal(card.capabilities.pushNotifications, false);
-		assert.match(card.capabilities.extensions[0].uri, /outfitter-task\/v1$/);
+		assert.match(card.capabilities.extensions[0]?.uri ?? "", /outfitter-task\/v1$/);
+		assert.match(card.capabilities.extensions[1]?.uri ?? "", /outfitter-artifact\/v1$/);
 		assert.equal(card.supportedInterfaces[0].protocolBinding, "HTTP+JSON");
 		assert.equal(card.supportedInterfaces[0].protocolVersion, "1.0");
+	});
+
+	it("large artifacts use authenticated digest-bound URLs", async () => {
+		const server = await launch(completingExecutor);
+		const bytes = Buffer.alloc(300_000, 0x5a);
+		const uploaded = await fetch(`${server.url}/artifacts`, {
+			method: "POST",
+			headers: {
+				authorization: "Bearer token-a",
+				"content-type": "application/a2a+json",
+			},
+			body: JSON.stringify({
+				raw: bytes.toString("base64"),
+				mediaType: "application/octet-stream",
+				filename: "large.bin",
+			}),
+		});
+		assert.equal(uploaded.status, 201);
+		const artifact = (await uploaded.json()) as {
+			artifact: {
+				extensions: string[];
+				parts: [{ url: string; metadata: { "outfitter-artifact/v1": { digest: string } } }];
+			};
+		};
+		const digest = artifact.artifact.parts[0].metadata["outfitter-artifact/v1"].digest;
+		assert.match(digest, /^sha256:[0-9a-f]{64}$/);
+		assert.match(artifact.artifact.parts[0].url, new RegExp(digest.slice(7)));
+		const path = `/artifacts/${digest.slice(7)}`;
+		assert.equal((await fetch(`${server.url}${path}`)).status, 401);
+		const downloaded = await fetch(`${server.url}${path}`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		assert.equal(downloaded.status, 200);
+		assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), bytes);
+	});
+
+	it("malformed artifact base64 is an invalid client argument", async () => {
+		const server = await launch(completingExecutor);
+		const response = await fetch(`${server.url}/artifacts`, {
+			method: "POST",
+			headers: {
+				authorization: "Bearer token-a",
+				"content-type": "application/a2a+json",
+			},
+			body: JSON.stringify({ raw: "!!!!", mediaType: "application/octet-stream" }),
+		});
+		assert.equal(response.status, 400);
+		const body = (await response.json()) as { details: [{ reason: string }] };
+		assert.equal(body.details[0].reason, "INVALID_ARGUMENT");
+	});
+
+	it("message size limits count UTF-8 bytes", () => {
+		const message = userMessage("multibyte-message", "界".repeat(MAX_MESSAGE_BYTES / 2));
+		assert.ok(JSON.stringify(message).length < MAX_MESSAGE_BYTES);
+		assert.throws(() => validateMessage(message, "ROLE_USER"), /message exceeds/);
 	});
 
 	it("listTasks filters by contextId and status within the authenticated principal", async () => {
@@ -455,6 +534,70 @@ describe("a2a task plane", () => {
 			(await second.listTasks("alpha", {})).tasks.map((entry) => entry.id),
 			[task.id],
 		);
+	});
+
+	it("dedupe retention does not evict a live task record at the former size cap", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-dedupe-cap-test-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const path = join(directory, "store.json");
+		const createdAt = new Date().toISOString();
+		const firstMessage = userMessage("m-retained-task", "retained");
+		const task: A2aTask = {
+			id: "task-retained",
+			contextId: "context-retained",
+			status: { state: "TASK_STATE_WORKING", timestamp: createdAt },
+			artifacts: [],
+			history: [firstMessage],
+		};
+		const hash = (message: ReturnType<typeof userMessage>): string =>
+			createHash("sha256")
+				.update(
+					JSON.stringify({
+						contextId: "",
+						taskId: "",
+						role: message.role,
+						parts: message.parts,
+						referenceTaskIds: [],
+					}),
+				)
+				.digest("hex");
+		const directMessage = userMessage("direct-result", "done");
+		const dedupe = [
+			{
+				principal: "alpha",
+				messageId: firstMessage.messageId,
+				payloadHash: hash(firstMessage),
+				createdAt,
+				outcome: { kind: "task", taskId: task.id },
+			},
+			...Array.from({ length: 9_999 }, (_, index) => {
+				const message = userMessage(`m-retained-${index}`, "same payload");
+				return {
+					principal: "alpha",
+					messageId: message.messageId,
+					payloadHash: hash(message),
+					createdAt,
+					outcome: { kind: "message", message: directMessage },
+				};
+			}),
+		];
+		await writeFile(
+			path,
+			`${JSON.stringify({
+				version: 1,
+				tasks: { [task.id]: { task, principal: "alpha", updatedAt: createdAt } },
+				dedupe,
+			})}\n`,
+		);
+		const store = new A2aTaskStore(path);
+		assert.deepEqual(await store.claimOutcome("alpha", userMessage("m-over-cap", "new")), {
+			kind: "claimed",
+		});
+		assert.deepEqual(await store.claimOutcome("alpha", firstMessage), {
+			kind: "replay",
+			outcome: { kind: "task", taskId: task.id },
+		});
+		store.close();
 	});
 
 	it("a closed store refuses further operations instead of rebuilding itself", async () => {

@@ -8,6 +8,7 @@ import type {
 	A2aRelayRuntimeConfig,
 } from "../extensions/a2a-relay-extension.ts";
 import a2aRelayExtension from "../extensions/a2a-relay-extension.ts";
+import type { TaskEvidence } from "../extensions/evidence/runtime.ts";
 
 interface RegisteredTool {
 	readonly name: string;
@@ -15,6 +16,19 @@ interface RegisteredTool {
 }
 
 type Handler = (event?: { readonly prompt?: string }) => Promise<void> | void;
+
+const EVIDENCE = {
+	policyDigest: `sha256:${"a".repeat(64)}`,
+	async initialize() {},
+	async activate() {},
+	async beforeTool() {},
+	async afterTool() {},
+	async finalize() {},
+	references() {
+		return [];
+	},
+	async close() {},
+} as unknown as TaskEvidence;
 
 function fakePi() {
 	const handlers = new Map<string, Handler>();
@@ -60,6 +74,7 @@ class FakeRelayClient implements A2aRelayRuntimeClient {
 	readonly tasks = new Map<string, A2aTask>();
 	readonly states: A2aTaskState[] = [];
 	readonly artifacts: A2aArtifact[] = [];
+	readonly evidence: string[] = [];
 	readonly released: string[] = [];
 
 	constructor(...claims: A2aRelayClaim[]) {
@@ -109,11 +124,16 @@ class FakeRelayClient implements A2aRelayRuntimeClient {
 		this.tasks.set(taskId, task);
 		return task;
 	}
+
+	async addEvidence(taskId: string, _leaseId: string, reference: string): Promise<A2aTask> {
+		this.evidence.push(reference);
+		return this.tasks.get(taskId) as A2aTask;
+	}
 }
 
 async function setup(client: FakeRelayClient) {
 	const { handlers, tools, wakes, pi } = fakePi();
-	const config: A2aRelayRuntimeConfig = { client, pollMs: 1 };
+	const config: A2aRelayRuntimeConfig = { client, pollMs: 1, evidence: EVIDENCE };
 	a2aRelayExtension(pi, {
 		configPath: () => "/run/secrets/a2a-relay.json",
 		loadConfig: async () => config,
@@ -195,7 +215,7 @@ test("session shutdown waits for an in-flight claim and releases it", async () =
 	const { handlers, pi } = fakePi();
 	a2aRelayExtension(pi, {
 		configPath: () => "/run/secrets/a2a-relay.json",
-		loadConfig: async () => ({ client, pollMs: 1 }),
+		loadConfig: async () => ({ client, pollMs: 1, evidence: EVIDENCE }),
 		log: () => {},
 	});
 	await handlers.get("session_start")?.();

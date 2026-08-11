@@ -1,6 +1,12 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+	A2aArtifactStore,
+	MAX_LARGE_ARTIFACT_BYTES,
+	OUTFITTER_ARTIFACT_EXTENSION_URI,
+	OUTFITTER_ARTIFACT_METADATA_KEY,
+} from "./artifacts.ts";
 import { A2aTaskStore, trimTask } from "./store.ts";
 import {
 	A2A_MEDIA_TYPE,
@@ -18,6 +24,7 @@ import {
 	isSettled,
 	isTerminal,
 	OUTFITTER_TASK_EXTENSION_URI,
+	outfitterTaskMetadata,
 	validateIdentifier,
 	validateMessage,
 } from "./types.ts";
@@ -37,6 +44,9 @@ export interface A2aServerConfig {
 	/** Absolute public URL of this interface, as advertised on the Agent Card. */
 	readonly publicUrl: string;
 	readonly agentVersion: string;
+	/** Immutable policy bundle selected by deployment, never by message content. */
+	readonly policyDigest: string;
+	readonly artifactStorePath: string;
 	/** Upper bound for a blocking send before it returns the current snapshot. */
 	readonly blockingTimeoutMs?: number;
 }
@@ -46,6 +56,7 @@ export interface A2aTaskController {
 	readonly task: A2aTask;
 	status(state: A2aTaskState, message?: A2aMessage): Promise<A2aTask>;
 	artifact(artifact: A2aArtifact): Promise<A2aTask>;
+	evidence(reference: string): Promise<A2aTask>;
 }
 
 export interface A2aExecutorContext {
@@ -95,7 +106,22 @@ export async function startA2aServer(
 	executor: A2aExecutor,
 ): Promise<RunningA2aServer> {
 	validateA2aServerConfig(config);
-	const store = new A2aTaskStore(config.storePath);
+	const store = new A2aTaskStore(config.storePath, (taskId, principal, message) =>
+		outfitterTaskMetadata({
+			ticketRunId: randomUUID(),
+			task: {
+				agentInterface: config.publicUrl,
+				protocolBinding: "HTTP+JSON",
+				protocolVersion: A2A_PROTOCOL_VERSION,
+				taskId,
+			},
+			policyDigest: config.policyDigest,
+			evidence: [],
+			idempotency: { messageId: message.messageId, scope: principal },
+		}),
+	);
+	const artifacts = new A2aArtifactStore(config.artifactStorePath, config.publicUrl);
+	await artifacts.initialize();
 	await store.initialize();
 	const subscribers = new Map<string, Set<Subscriber>>();
 
@@ -138,6 +164,10 @@ export async function startA2aServer(
 				emit(current.id, {
 					artifactUpdate: { taskId: current.id, contextId: current.contextId, artifact },
 				});
+				return current;
+			},
+			async evidence(reference) {
+				current = await store.addEvidenceReference(principal, current.id, reference);
 				return current;
 			},
 		};
@@ -318,6 +348,12 @@ export async function startA2aServer(
 						"Ticket Run lineage, scoped task locators, retry/supersession links, and idempotency data for Outfitter-coordinated work.",
 					required: false,
 				},
+				{
+					uri: OUTFITTER_ARTIFACT_EXTENSION_URI,
+					description:
+						"Authenticated content-addressed Artifact URLs with SHA-256 and byte-size metadata.",
+					required: false,
+				},
 			],
 		},
 		securitySchemes: { bearer: { httpAuthSecurityScheme: { scheme: "bearer" } } },
@@ -349,6 +385,57 @@ export async function startA2aServer(
 		}
 		requireSupportedVersion(request);
 		const principal = authenticate(request, config.credentials);
+		if (request.method === "POST" && path === "/artifacts") {
+			const body = (await readJsonBody(request, MAX_LARGE_ARTIFACT_BYTES * 2)) as {
+				raw?: string;
+				mediaType?: string;
+				filename?: string;
+			};
+			if (typeof body.raw !== "string" || typeof body.mediaType !== "string") {
+				throw new A2aError(400, "INVALID_ARGUMENT", "artifact raw and mediaType are required");
+			}
+			const bytes = decodeCanonicalBase64(body.raw);
+			const reference = await artifacts.put(bytes, body.mediaType, body.filename);
+			response.writeHead(201, { "content-type": A2A_MEDIA_TYPE });
+			response.end(
+				JSON.stringify({
+					artifact: {
+						artifactId: `artifact-${reference.digest.slice(7, 31)}`,
+						parts: [
+							{
+								url: reference.url,
+								mediaType: reference.mediaType,
+								...(reference.filename ? { filename: reference.filename } : {}),
+								metadata: {
+									[OUTFITTER_ARTIFACT_METADATA_KEY]: {
+										digest: reference.digest,
+										byteSize: reference.byteSize,
+									},
+								},
+							},
+						],
+						extensions: [OUTFITTER_ARTIFACT_EXTENSION_URI],
+					},
+				}),
+			);
+			return;
+		}
+		const artifactMatch = path.match(/^\/artifacts\/([0-9a-f]{64})$/);
+		if (request.method === "GET" && artifactMatch) {
+			const bytes = await artifacts.get(artifactMatch[1] as string).catch((error) => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					throw new A2aError(404, "NOT_FOUND", "artifact not found");
+				}
+				throw error;
+			});
+			response.writeHead(200, {
+				"content-type": "application/octet-stream",
+				"content-length": bytes.byteLength,
+				digest: `sha-256=${Buffer.from(artifactMatch[1] as string, "hex").toString("base64")}`,
+			});
+			response.end(bytes);
+			return;
+		}
 		if (request.method === "POST" && path === "/message:send") {
 			const body = (await readJsonBody(request)) as A2aSendMessageRequest;
 			const outcome = await executeSend(principal, body);
@@ -517,6 +604,12 @@ export function validateA2aServerConfig(config: A2aServerConfig): void {
 	if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65_535) {
 		throw new Error("a2a port is invalid");
 	}
+	if (!/^sha256:[0-9a-f]{64}$/.test(config.policyDigest)) {
+		throw new Error("a2a policyDigest must be a SHA-256 digest");
+	}
+	if (!config.artifactStorePath.startsWith("/")) {
+		throw new Error("a2a artifactStorePath must be absolute");
+	}
 	const tokens = new Set<string>();
 	for (const credential of config.credentials) {
 		if (!credential.token) throw new Error("a2a credential token is required");
@@ -575,12 +668,20 @@ function integerParam(url: URL, name: string): number | undefined {
 	return value;
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<unknown> {
+function decodeCanonicalBase64(value: string): Buffer {
+	const bytes = Buffer.from(value, "base64");
+	if (bytes.toString("base64") !== value) {
+		throw new A2aError(400, "INVALID_ARGUMENT", "artifact raw must be canonical base64");
+	}
+	return bytes;
+}
+
+async function readJsonBody(request: IncomingMessage, maximum = 1024 * 1024): Promise<unknown> {
 	const chunks: Buffer[] = [];
 	let size = 0;
 	for await (const chunk of request) {
 		size += (chunk as Buffer).length;
-		if (size > 1024 * 1024) throw new A2aError(413, "INVALID_ARGUMENT", "request body too large");
+		if (size > maximum) throw new A2aError(413, "INVALID_ARGUMENT", "request body too large");
 		chunks.push(chunk as Buffer);
 	}
 	try {
@@ -607,6 +708,10 @@ export async function configFromEnv(): Promise<A2aServerConfig> {
 	}
 	const host = process.env.A2A_HOST?.trim() || "127.0.0.1";
 	const port = Number(process.env.A2A_PORT ?? "8788");
+	const policyDigest = process.env.A2A_POLICY_BUNDLE_DIGEST?.trim();
+	if (!policyDigest) throw new Error("A2A_POLICY_BUNDLE_DIGEST is required");
+	const artifactStorePath = process.env.A2A_ARTIFACT_STORE_PATH?.trim();
+	if (!artifactStorePath) throw new Error("A2A_ARTIFACT_STORE_PATH is required");
 	const config: A2aServerConfig = {
 		host,
 		port,
@@ -618,6 +723,8 @@ export async function configFromEnv(): Promise<A2aServerConfig> {
 			"Channels-hosted agent reachable over the A2A task plane.",
 		publicUrl: process.env.A2A_PUBLIC_URL?.trim() || `http://${host}:${port}`,
 		agentVersion: process.env.A2A_AGENT_VERSION?.trim() || "0.0.0",
+		policyDigest,
+		artifactStorePath,
 	};
 	// Fail here as well as in startA2aServer, so a bad credentials file names
 	// itself at load time rather than at listen time.

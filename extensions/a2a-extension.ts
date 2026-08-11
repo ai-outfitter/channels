@@ -9,11 +9,13 @@ import {
 	startA2aServer,
 } from "./a2a/server.ts";
 import { type A2aMessage, type A2aPart, isSettled, isTerminal } from "./a2a/types.ts";
+import { loadEvidenceRuntime, type TaskEvidence } from "./evidence/runtime.ts";
 
 export interface A2aExtensionDependencies {
 	readonly enabled?: () => boolean;
 	readonly loadConfig?: () => Promise<A2aServerConfig>;
 	readonly start?: (config: A2aServerConfig, executor: A2aExecutor) => Promise<RunningA2aServer>;
+	readonly loadEvidence?: () => Promise<TaskEvidence>;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -46,6 +48,7 @@ export default function a2aServerExtension(
 	let running: RunningA2aServer | undefined;
 	let starting: Promise<void> | undefined;
 	let stopped = false;
+	let evidence: TaskEvidence | undefined;
 
 	interface TaskTurn {
 		readonly taskId: string;
@@ -85,6 +88,10 @@ export default function a2aServerExtension(
 
 	const executor: A2aExecutor = async (context) => {
 		const controller = await context.begin();
+		await evidence?.activate(controller.task, context.message);
+		for (const reference of evidence?.references(controller.task.id) ?? []) {
+			await controller.evidence(reference);
+		}
 		queueTurn(controller);
 		return undefined;
 	};
@@ -93,7 +100,43 @@ export default function a2aServerExtension(
 		pi,
 		() => running,
 		(taskId) => activeTurn?.taskId === taskId,
+		async (taskId, artifact) => {
+			await evidence?.finalize(taskId, artifact);
+			return evidence?.references(taskId) ?? [];
+		},
 	);
+
+	pi.on("tool_call", async (event) => {
+		if (!activeTurn || !evidence || event.toolName.startsWith("a2a_")) return;
+		try {
+			await evidence.beforeTool(activeTurn.taskId, event.toolCallId, event.toolName, event.input);
+			return undefined;
+		} catch (error) {
+			return {
+				block: true,
+				reason: `Required evidence capture failed: ${(error as Error).message}`,
+			};
+		}
+	});
+
+	pi.on("tool_result", async (event) => {
+		if (!activeTurn || !evidence || event.toolName.startsWith("a2a_")) return;
+		try {
+			await evidence.afterTool(activeTurn.taskId, event.toolCallId, event.toolName, {
+				content: event.content,
+				details: event.details,
+				isError: event.isError,
+			});
+			return undefined;
+		} catch (error) {
+			return {
+				isError: true,
+				content: [
+					{ type: "text", text: `Required evidence capture failed: ${(error as Error).message}` },
+				],
+			};
+		}
+	});
 
 	pi.on("before_agent_start", async (event) => {
 		if (activeTurn) return;
@@ -103,11 +146,11 @@ export default function a2aServerExtension(
 		if (!turn) return;
 		activeTurn = turn;
 		const task = await running?.readTask(turn.taskId);
-		if (!task) {
+		if (!task || isTerminal(task.status.state)) {
 			activeTurn = undefined;
 			return;
 		}
-		if (!isTerminal(task.status.state)) await turn.controller.status("TASK_STATE_WORKING");
+		await turn.controller.status("TASK_STATE_WORKING");
 	});
 
 	pi.on("agent_end", async () => {
@@ -128,13 +171,28 @@ export default function a2aServerExtension(
 		if (starting) return starting;
 		stopped = false;
 		starting = (async () => {
-			const server = await start(await loadConfig(), executor);
+			const config = await loadConfig();
+			const loadEvidence =
+				dependencies.loadEvidence ??
+				(async () => {
+					const path = process.env.A2A_EVIDENCE_CONFIG_PATH?.trim();
+					if (!path) throw new Error("A2A_EVIDENCE_CONFIG_PATH is required");
+					return loadEvidenceRuntime(path);
+				});
+			evidence = await loadEvidence();
+			if (evidence.policyDigest !== config.policyDigest) {
+				throw new Error("A2A policy digest does not match the evidence policy bundle");
+			}
+			const server = await start(config, executor);
 			if (stopped) {
 				await server.close();
 				return;
 			}
 			running = server;
-			for (const controller of await server.recoverableTaskControllers()) queueTurn(controller);
+			for (const controller of await server.recoverableTaskControllers()) {
+				await evidence.activate(controller.task);
+				queueTurn(controller);
+			}
 			log({ event: "a2a_server_started", url: server.url });
 		})();
 		try {
@@ -153,9 +211,10 @@ export default function a2aServerExtension(
 		await starting?.catch(() => {});
 		const server = running;
 		running = undefined;
-		if (!server) return;
-		await server.close();
-		log({ event: "a2a_server_stopped" });
+		if (server) await server.close();
+		await evidence?.close();
+		evidence = undefined;
+		if (server) log({ event: "a2a_server_stopped" });
 	});
 }
 
@@ -163,6 +222,7 @@ export function registerA2aTools(
 	pi: ExtensionAPI,
 	server: () => RunningA2aServer | undefined,
 	isActive: (taskId: string) => boolean,
+	finalizeEvidence: (taskId: string, artifact: unknown) => Promise<readonly string[]>,
 ): void {
 	const requireServer = (): RunningA2aServer => {
 		const current = server();
@@ -225,6 +285,12 @@ export function registerA2aTools(
 			const controller = await requireServer().controllerForTask(requireActive(params.taskId));
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
+				for (const reference of await finalizeEvidence(params.taskId, {
+					name: "response",
+					text: params.response,
+				})) {
+					await controller.evidence(reference);
+				}
 				await controller.artifact({
 					artifactId: `response-${params.taskId}`,
 					name: "response",

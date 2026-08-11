@@ -108,6 +108,7 @@ export class A2aClient {
 			`tasks/${pathIdentifier(taskId)}:subscribe`,
 			undefined,
 			signal,
+			true,
 		);
 		if (!response.body) throw new A2aRemoteError(502, "A2A subscription response has no body");
 		const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -136,20 +137,30 @@ export class A2aClient {
 		path: string,
 		body?: unknown,
 		signal?: AbortSignal,
+		connectionOnlyTimeout = false,
 	): Promise<Response> {
-		const timeout = AbortSignal.timeout(this.#timeoutMs);
+		const timeoutController = connectionOnlyTimeout ? new AbortController() : undefined;
+		const timeout = timeoutController?.signal ?? AbortSignal.timeout(this.#timeoutMs);
 		const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-		const response = await this.#fetch(new URL(`./${path}`, this.#baseUrl), {
-			method,
-			headers: {
-				authorization: `Bearer ${this.#token}`,
-				accept: A2A_MEDIA_TYPE,
-				[A2A_VERSION_HEADER]: A2A_PROTOCOL_VERSION,
-				...(body === undefined ? {} : { "content-type": A2A_MEDIA_TYPE }),
-			},
-			...(body === undefined ? {} : { body: JSON.stringify(body) }),
-			signal: combined,
-		});
+		const timer = timeoutController
+			? setTimeout(() => timeoutController.abort(), this.#timeoutMs)
+			: undefined;
+		let response: Response;
+		try {
+			response = await this.#fetch(new URL(`./${path}`, this.#baseUrl), {
+				method,
+				headers: {
+					authorization: `Bearer ${this.#token}`,
+					accept: A2A_MEDIA_TYPE,
+					[A2A_VERSION_HEADER]: A2A_PROTOCOL_VERSION,
+					...(body === undefined ? {} : { "content-type": A2A_MEDIA_TYPE }),
+				},
+				...(body === undefined ? {} : { body: JSON.stringify(body) }),
+				signal: combined,
+			});
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
 		if (response.ok) return response;
 		const text = await readBoundedText(response);
 		let error: A2aErrorBody | undefined;

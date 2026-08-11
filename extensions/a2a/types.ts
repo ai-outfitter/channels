@@ -24,6 +24,106 @@ export const AGENT_CARD_PATH = "/.well-known/agent-card.json" as const;
  */
 export const OUTFITTER_TASK_EXTENSION_URI =
 	"https://github.com/ai-outfitter/channels/a2a-extensions/outfitter-task/v1" as const;
+export const OUTFITTER_TASK_METADATA_KEY = "outfitter-task/v1" as const;
+
+export interface OutfitterTaskLocator {
+	readonly agentInterface: string;
+	readonly protocolBinding: "HTTP+JSON";
+	readonly protocolVersion: "1.0";
+	readonly tenant?: string;
+	readonly taskId: string;
+}
+
+export interface OutfitterTaskMetadata {
+	readonly ticketRunId: string;
+	readonly task: OutfitterTaskLocator;
+	readonly parent?: OutfitterTaskLocator;
+	readonly retryOf?: OutfitterTaskLocator;
+	readonly supersedes?: OutfitterTaskLocator;
+	readonly policyDigest: string;
+	readonly evidence: readonly string[];
+	readonly idempotency: { readonly messageId: string; readonly scope: string };
+}
+
+export function outfitterTaskMetadata(value: OutfitterTaskMetadata): Record<string, unknown> {
+	return { [OUTFITTER_TASK_METADATA_KEY]: validateOutfitterTaskMetadata(value) };
+}
+
+export function taskMetadataFromTask(task: A2aTask): OutfitterTaskMetadata {
+	return validateOutfitterTaskMetadata(task.metadata?.[OUTFITTER_TASK_METADATA_KEY]);
+}
+
+export function validateOutfitterTaskMetadata(value: unknown): OutfitterTaskMetadata {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("outfitter-task/v1 metadata must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	const allowed = [
+		"ticketRunId",
+		"task",
+		"parent",
+		"retryOf",
+		"supersedes",
+		"policyDigest",
+		"evidence",
+		"idempotency",
+	];
+	const unknown = Object.keys(record).filter((key) => !allowed.includes(key));
+	if (unknown.length > 0) throw new Error(`outfitter-task/v1 has unknown field "${unknown[0]}"`);
+	if (typeof record.ticketRunId !== "string" || record.ticketRunId.length === 0) {
+		throw new Error("outfitter-task/v1 ticketRunId is required");
+	}
+	if (
+		typeof record.policyDigest !== "string" ||
+		!/^sha256:[0-9a-f]{64}$/.test(record.policyDigest)
+	) {
+		throw new Error("outfitter-task/v1 policyDigest is invalid");
+	}
+	if (!Array.isArray(record.evidence) || record.evidence.some((item) => typeof item !== "string")) {
+		throw new Error("outfitter-task/v1 evidence is invalid");
+	}
+	const idempotency = record.idempotency as Record<string, unknown> | undefined;
+	if (
+		!idempotency ||
+		typeof idempotency.messageId !== "string" ||
+		typeof idempotency.scope !== "string"
+	) {
+		throw new Error("outfitter-task/v1 idempotency is invalid");
+	}
+	return {
+		ticketRunId: record.ticketRunId,
+		task: validateTaskLocator(record.task),
+		...(record.parent ? { parent: validateTaskLocator(record.parent) } : {}),
+		...(record.retryOf ? { retryOf: validateTaskLocator(record.retryOf) } : {}),
+		...(record.supersedes ? { supersedes: validateTaskLocator(record.supersedes) } : {}),
+		policyDigest: record.policyDigest,
+		evidence: record.evidence as string[],
+		idempotency: { messageId: idempotency.messageId, scope: idempotency.scope },
+	};
+}
+
+function validateTaskLocator(value: unknown): OutfitterTaskLocator {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("outfitter task locator must be an object");
+	}
+	const locator = value as Record<string, unknown>;
+	if (
+		typeof locator.agentInterface !== "string" ||
+		locator.protocolBinding !== "HTTP+JSON" ||
+		locator.protocolVersion !== A2A_PROTOCOL_VERSION ||
+		typeof locator.taskId !== "string"
+	) {
+		throw new Error("outfitter task locator is invalid");
+	}
+	new URL(locator.agentInterface);
+	return {
+		agentInterface: locator.agentInterface,
+		protocolBinding: "HTTP+JSON",
+		protocolVersion: A2A_PROTOCOL_VERSION,
+		...(typeof locator.tenant === "string" ? { tenant: locator.tenant } : {}),
+		taskId: locator.taskId,
+	};
+}
 
 export const TASK_STATES = [
 	"TASK_STATE_UNSPECIFIED",
@@ -243,7 +343,7 @@ export function validateArtifact(value: unknown): A2aArtifact {
 		throw new A2aError(400, "INVALID_ARGUMENT", "artifact must carry at least one part");
 	}
 	for (const part of artifact.parts) validatePart(part);
-	if (JSON.stringify(artifact).length > MAX_MESSAGE_BYTES) {
+	if (Buffer.byteLength(JSON.stringify(artifact)) > MAX_MESSAGE_BYTES) {
 		throw new A2aError(400, "INVALID_ARGUMENT", `artifact exceeds ${MAX_MESSAGE_BYTES} bytes`);
 	}
 	return artifact;
@@ -270,7 +370,7 @@ export function validateMessage(value: unknown, role?: A2aRole): A2aMessage {
 		}
 		for (const id of message.referenceTaskIds) validateIdentifier(id, "referenceTaskIds entry");
 	}
-	if (JSON.stringify(message).length > MAX_MESSAGE_BYTES) {
+	if (Buffer.byteLength(JSON.stringify(message)) > MAX_MESSAGE_BYTES) {
 		throw new A2aError(400, "INVALID_ARGUMENT", `message exceeds ${MAX_MESSAGE_BYTES} bytes`);
 	}
 	return message;

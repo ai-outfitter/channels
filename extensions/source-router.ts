@@ -210,6 +210,7 @@ export class SourceRouter implements RunningSourceRouter {
 	}
 
 	async #drain(): Promise<void> {
+		await this.#reportDeliveries();
 		while (!this.#closed && this.#entries.length > 0) {
 			const entry = this.#entries[0];
 			if (!entry) return;

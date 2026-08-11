@@ -9,6 +9,7 @@ import type {
 } from "../extensions/a2a/server.ts";
 import type { A2aTask } from "../extensions/a2a/types.ts";
 import a2aServerExtension from "../extensions/a2a-extension.ts";
+import type { TaskEvidence } from "../extensions/evidence/runtime.ts";
 
 type LifecycleHandler = (event?: { readonly prompt?: string }) => Promise<void> | void;
 
@@ -49,12 +50,27 @@ const CONFIG: A2aServerConfig = {
 	host: "127.0.0.1",
 	port: 0,
 	storePath: "/workspace/.channels/a2a/store.json",
+	artifactStorePath: "/workspace/.channels/a2a/artifacts",
 	credentials: [{ token: "token-a", principal: "alpha" }],
 	agentName: "test-agent",
 	agentDescription: "test agent",
 	publicUrl: "https://agent.test/a2a",
 	agentVersion: "0.0.1",
+	policyDigest: `sha256:${"a".repeat(64)}`,
 };
+
+const EVIDENCE = {
+	policyDigest: CONFIG.policyDigest,
+	async initialize() {},
+	async activate() {},
+	async beforeTool() {},
+	async afterTool() {},
+	async finalize() {},
+	references() {
+		return [];
+	},
+	async close() {},
+} as unknown as TaskEvidence;
 
 function stubTask(id: string, text: string): A2aTask {
 	return {
@@ -83,6 +99,9 @@ function stubController(task: A2aTask, tasks?: Map<string, A2aTask>): A2aTaskCon
 		async artifact(artifact) {
 			current = { ...current, artifacts: [...(current.artifacts ?? []), artifact] };
 			tasks?.set(current.id, current);
+			return current;
+		},
+		async evidence() {
 			return current;
 		},
 	};
@@ -118,6 +137,7 @@ async function startExtension(tasks: Map<string, A2aTask>): Promise<{
 	a2aServerExtension(pi, {
 		enabled: () => true,
 		loadConfig: async () => CONFIG,
+		loadEvidence: async () => EVIDENCE,
 		start: async (_config, given) => {
 			executor = given;
 			return running;
@@ -144,6 +164,7 @@ test("the a2a extension starts once and stops once", async () => {
 	a2aServerExtension(pi, {
 		enabled: () => true,
 		loadConfig: async () => CONFIG,
+		loadEvidence: async () => EVIDENCE,
 		start: async () => {
 			starts += 1;
 			return {
@@ -267,6 +288,30 @@ test("a task the session was woken for is readable", async () => {
 	assert.match(result.content[0].text, /please do the thing/);
 });
 
+test("a canceled queued task grants no authority when its wake starts", async () => {
+	const task = stubTask("task-canceled-before-turn", "do not expose this");
+	const tasks = new Map([[task.id, task]]);
+	const { handlers, tools, wakes, executor } = await startExtension(tasks);
+	await executor({
+		principal: "alpha",
+		message: { messageId: "cancel-race", role: "ROLE_USER", parts: [{ text: "work" }] },
+		begin: async () => stubController(task, tasks),
+	});
+	tasks.set(task.id, {
+		...task,
+		status: { state: "TASK_STATE_CANCELED", timestamp: new Date().toISOString() },
+	});
+	await startTaskTurn(handlers, wakes[0] as Wake);
+	await assert.rejects(
+		() =>
+			(tools.get("a2a_read_task") as RegisteredTool).execute("read-canceled", {
+				taskId: task.id,
+			}),
+		/not active in this agent turn/,
+	);
+	assert.equal(tasks.get(task.id)?.status.state, "TASK_STATE_CANCELED");
+});
+
 test("a restarted session cannot inherit task access from the prior session", async () => {
 	const task = stubTask("task-prior-session", "private work from the prior session");
 	const tasks = new Map([[task.id, task]]);
@@ -388,6 +433,7 @@ test("session startup issues a fresh scoped wake for durable unfinished work", a
 	a2aServerExtension(pi, {
 		enabled: () => true,
 		loadConfig: async () => CONFIG,
+		loadEvidence: async () => EVIDENCE,
 		start: async () => running,
 		log: () => {},
 	});

@@ -82,6 +82,10 @@ export class A2aRelayClient {
 		return this.#json("POST", `v1/tasks/${identifier(taskId)}:artifact`, leaseId, { artifact });
 	}
 
+	addEvidence(taskId: string, leaseId: string, reference: string): Promise<A2aTask> {
+		return this.#json("POST", `v1/tasks/${identifier(taskId)}:evidence`, leaseId, { reference });
+	}
+
 	async #json<T>(
 		method: "GET" | "POST",
 		path: string,

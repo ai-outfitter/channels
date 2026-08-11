@@ -38,6 +38,8 @@ Two upstream inconsistencies, resolved as follows:
 | `/tasks/{id}` | GET | Read one task's durable state |
 | `/tasks/{id}:subscribe` | GET | SSE stream of updates for a non-terminal task |
 | `/tasks/{id}:cancel` | POST | Cancel a non-terminal task |
+| `/artifacts` | POST | Store up to 32 MiB by digest and return an `outfitter-artifact/v1` URL Part |
+| `/artifacts/{sha256}` | GET | Read and verify one artifact; bearer authentication is required |
 | `/tasks/{task_id}/pushNotificationConfigs*` | * | Explicit `501` — the Card declares `pushNotifications: false` |
 
 Version negotiation: an `A2A-Version` header other than `1.0` fails
@@ -87,6 +89,23 @@ token maps to a principal, and every task and dedupe record is scoped to it.
   receives only the final `{task}` frame — the durable state carries
   everything regardless. The resident-agent bridge returns at `working`, so
   its status and artifact updates stream live.
+- **Tasks bind policy and evidence.** Every new Task carries an
+  `outfitter-task/v1` Ticket Run, full Task locator, immutable policy-bundle
+  digest, idempotency scope, and evidence record references. The deployment
+  MUST set `A2A_POLICY_BUNDLE_DIGEST`. It cannot come from message content.
+- **Evidence is a separate plane.** `A2A_EVIDENCE_CONFIG_PATH` names a JSON
+  file with `rootPath`, `actor`, and `policy`. The development sink stores
+  payloads once by SHA-256 and appends versioned action records. Pi tool hooks
+  capture the exact request before execution and the exact result after it.
+  A required capture failure blocks Task completion. The run manifest verifies
+  all required record classes and payload digests. This local sink does not
+  claim compliance-grade retention.
+- **Large Artifacts are references.** `A2A_ARTIFACT_STORE_PATH` is required.
+  `POST /artifacts` accepts base64 bytes, stores them by SHA-256, and returns an
+  Artifact with an authenticated URL and typed digest metadata
+  ([schema](./extensions/outfitter-artifact.v1.schema.json)). Reads recompute
+  the digest and require the caller's bearer token. Inline A2A Parts remain
+  bounded by the normal message limit.
 
 ## Resident-agent bridge
 
@@ -95,6 +114,8 @@ Inert unless `A2A_SERVER=1`; configuration is `A2A_STORE_PATH` (required),
 `A2A_CREDENTIALS_PATH` (required, `{"credentials": [{"token", "principal"}]}`),
 `A2A_HOST`/`A2A_PORT` (default loopback:8788), and `A2A_PUBLIC_URL` /
 `A2A_AGENT_NAME` / `A2A_AGENT_DESCRIPTION` / `A2A_AGENT_VERSION` for the Card.
+It also requires `A2A_POLICY_BUNDLE_DIGEST`, `A2A_ARTIFACT_STORE_PATH`, and
+`A2A_EVIDENCE_CONFIG_PATH`.
 
 An inbound message becomes a durable task plus a **body-free wake** — the
 same untrusted-content rule as every channel source. The agent then drives

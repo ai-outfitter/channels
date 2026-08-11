@@ -8,6 +8,7 @@ import { A2aClient } from "../extensions/a2a/client.ts";
 import { A2aRelayClient } from "../extensions/a2a-relay/client.ts";
 import { startA2aRelayServer } from "../extensions/a2a-relay/server.ts";
 import a2aRelayExtension from "../extensions/a2a-relay-extension.ts";
+import type { TaskEvidence } from "../extensions/evidence/runtime.ts";
 
 interface RegisteredTool {
 	readonly name: string;
@@ -15,6 +16,19 @@ interface RegisteredTool {
 }
 
 type Handler = (event?: { readonly prompt?: string }) => Promise<void> | void;
+
+const EVIDENCE = {
+	policyDigest: `sha256:${"a".repeat(64)}`,
+	async initialize() {},
+	async activate() {},
+	async beforeTool() {},
+	async afterTool() {},
+	async finalize() {},
+	references() {
+		return [];
+	},
+	async close() {},
+} as unknown as TaskEvidence;
 
 test("public A2A work completes through one private relay-backed Pi turn", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "a2a-relay-e2e-"));
@@ -26,11 +40,13 @@ test("public A2A work completes through one private relay-backed Pi turn", async
 			host: "127.0.0.1",
 			port: 0,
 			storePath: join(directory, "tasks.json"),
+			artifactStorePath: join(directory, "artifacts"),
 			credentials: [{ token: "caller-token", principal: "caller-a" }],
 			agentName: "resident-a",
 			agentDescription: "relay-backed agent",
 			publicUrl: "https://relay.example/agents/resident-a",
 			agentVersion: "0.0.1",
+			policyDigest: `sha256:${"a".repeat(64)}`,
 		},
 		connectorHost: "127.0.0.1",
 		connectorPort: 0,
@@ -65,7 +81,7 @@ test("public A2A work completes through one private relay-backed Pi turn", async
 		} as unknown as ExtensionAPI;
 		a2aRelayExtension(pi, {
 			configPath: () => "/run/secrets/relay.json",
-			loadConfig: async () => ({ client: worker, pollMs: 5 }),
+			loadConfig: async () => ({ client: worker, pollMs: 5, evidence: EVIDENCE }),
 			log: () => {},
 		});
 		await handlers.get("session_start")?.();

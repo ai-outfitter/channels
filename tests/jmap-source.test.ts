@@ -268,9 +268,8 @@ test("a calendar alert wakes regardless of the SSE event name", async () => {
 });
 
 test("a calendar activation preserves the exact occurrence locator and never correlates schedules", async () => {
-	const [event] = await streamEvents([
-		calendarAlert(ACCOUNT_ID, "task-123"),
-	]);
+	const [event] = await streamEvents([calendarAlert(ACCOUNT_ID, "task-123")]);
+	assert.ok(event?.work);
 	assert.deepEqual(event?.work?.nativeLocator, {
 		accountId: ACCOUNT_ID,
 		eventDigest: event.work.nativeLocator.eventDigest,

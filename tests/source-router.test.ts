@@ -151,6 +151,71 @@ test("native delivery is persisted and reported against the accepted task", asyn
 	await router.close();
 });
 
+test("a failing queued send does not block an older delivery report retry", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "channels-source-router-independent-"));
+	const path = join(directory, "outbox.json");
+	let sends = 0;
+	let reportAttempts = 0;
+	let rejectReport = true;
+	const router = await SourceRouter.start(
+		{
+			async sendMessage(): Promise<A2aSendMessageResponse> {
+				sends += 1;
+				if (sends > 1) throw new Error("destination offline");
+				return {
+					task: {
+						id: "task-report-first",
+						contextId: "context-report-first",
+						status: { state: "TASK_STATE_SUBMITTED" },
+					},
+				};
+			},
+		},
+		path,
+		5,
+		{
+			async report() {
+				reportAttempts += 1;
+				if (rejectReport) throw new Error("reporter offline");
+			},
+		},
+	);
+	const routed = {
+		channel: "slack",
+		summary: "new mention",
+		work: {
+			providerEventId: "Ev-report-first",
+			nativeLocator: { channelLocator: "slack:v1:report-first" },
+			receivedAt: "2026-08-11T12:00:00.000Z",
+			dedupeKey: "Ev-report-first",
+			correlationKey: "Ev-report-first",
+			sourceSummary: "new mention",
+			parts: [{ text: "first" }],
+		},
+	};
+	await router.accept(routed);
+	await waitFor(() => sends === 1);
+	await router.recordDelivery("slack", "slack:v1:report-first", {
+		channel: "slack",
+		locator: "slack:v1:report-first",
+		replied: true,
+		handled: true,
+	});
+	await waitFor(() => reportAttempts >= 1);
+	await router.accept({
+		...routed,
+		work: {
+			...routed.work,
+			providerEventId: "Ev-send-fails",
+			dedupeKey: "Ev-send-fails",
+			correlationKey: "Ev-send-fails",
+		},
+	});
+	rejectReport = false;
+	await waitFor(() => reportAttempts >= 2 && sends >= 2);
+	await router.close();
+});
+
 async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
 	const deadline = Date.now() + 2_000;
 	while (!(await predicate())) {

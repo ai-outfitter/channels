@@ -9,6 +9,7 @@ import {
 	A2aRelayClient,
 	type A2aRelayClientConfig,
 } from "./a2a-relay/client.ts";
+import { loadEvidenceRuntime, type TaskEvidence } from "./evidence/runtime.ts";
 
 const MAX_CONNECTOR_CONFIG_BYTES = 64 * 1024;
 const DEFAULT_POLL_MS = 2_000;
@@ -33,11 +34,13 @@ export interface A2aRelayRuntimeClient {
 			readonly parts: readonly A2aPart[];
 		},
 	): Promise<A2aTask>;
+	addEvidence(taskId: string, leaseId: string, reference: string): Promise<A2aTask>;
 }
 
 export interface A2aRelayRuntimeConfig {
 	readonly client: A2aRelayRuntimeClient;
 	readonly pollMs: number;
+	readonly evidence: TaskEvidence;
 }
 
 export interface A2aRelayExtensionDependencies {
@@ -210,6 +213,17 @@ export default function a2aRelayExtension(
 		async execute(_toolCallId, params) {
 			const { client, turn } = requireActiveTask(requireActive(), params.taskId);
 			if (params.outcome === "completed") {
+				await config?.evidence.finalize(params.taskId, {
+					name: "response",
+					text: params.response,
+				});
+				for (const reference of config?.evidence.references(params.taskId) ?? []) {
+					await client.addEvidence(
+						turn.claim.delivery.taskId,
+						turn.claim.delivery.lease.id,
+						reference,
+					);
+				}
 				await client.addArtifact(turn.claim.delivery.taskId, turn.claim.delivery.lease.id, {
 					artifactId: `response-${params.taskId}`,
 					name: "response",
@@ -230,6 +244,44 @@ export default function a2aRelayExtension(
 				details: { taskId: params.taskId, outcome: params.outcome },
 			};
 		},
+	});
+
+	pi.on("tool_call", async (event) => {
+		if (!active || !config || event.toolName.startsWith("a2a_")) return;
+		try {
+			await config.evidence.beforeTool(
+				active.claim.delivery.taskId,
+				event.toolCallId,
+				event.toolName,
+				event.input,
+			);
+			return undefined;
+		} catch (error) {
+			return {
+				block: true,
+				reason: `Required evidence capture failed: ${(error as Error).message}`,
+			};
+		}
+	});
+
+	pi.on("tool_result", async (event) => {
+		if (!active || !config || event.toolName.startsWith("a2a_")) return;
+		try {
+			await config.evidence.afterTool(
+				active.claim.delivery.taskId,
+				event.toolCallId,
+				event.toolName,
+				{ content: event.content, details: event.details, isError: event.isError },
+			);
+			return undefined;
+		} catch (error) {
+			return {
+				isError: true,
+				content: [
+					{ type: "text", text: `Required evidence capture failed: ${(error as Error).message}` },
+				],
+			};
+		}
 	});
 
 	pi.registerTool({
@@ -266,6 +318,10 @@ export default function a2aRelayExtension(
 		if (isSettled(task.status.state)) {
 			turn.settled = true;
 			return;
+		}
+		await config?.evidence.activate(task, task.history?.at(-1));
+		for (const reference of config?.evidence.references(task.id) ?? []) {
+			await client.addEvidence(task.id, turn.claim.delivery.lease.id, reference);
 		}
 		await client.updateStatus(
 			turn.claim.delivery.taskId,
@@ -312,6 +368,9 @@ export default function a2aRelayExtension(
 		pending = undefined;
 		active = undefined;
 		await Promise.all(turns.map((turn) => release(turn).catch(() => {})));
+		await config?.evidence.close();
+		config = undefined;
+		loading = undefined;
 	});
 }
 
@@ -328,11 +387,14 @@ export async function loadA2aRelayRuntimeConfig(path: string): Promise<A2aRelayR
 		throw new Error("A2A relay connector configuration is not valid JSON");
 	}
 	const record = parseConfigObject(value);
-	const allowed = ["url", "token", "pollMs", "allowInsecureLoopback"];
+	const allowed = ["url", "token", "pollMs", "allowInsecureLoopback", "evidenceConfigPath"];
 	const unknown = Object.keys(record).filter((key) => !allowed.includes(key));
 	if (unknown.length > 0) throw new Error(`unknown A2A relay connector field "${unknown[0]}"`);
 	if (typeof record.url !== "string" || typeof record.token !== "string") {
 		throw new Error("A2A relay connector requires string url and token fields");
+	}
+	if (typeof record.evidenceConfigPath !== "string") {
+		throw new Error("A2A relay connector requires evidenceConfigPath");
 	}
 	const pollMs = record.pollMs ?? DEFAULT_POLL_MS;
 	if (!Number.isSafeInteger(pollMs) || (pollMs as number) < 100) {
@@ -351,7 +413,11 @@ export async function loadA2aRelayRuntimeConfig(path: string): Promise<A2aRelayR
 			? {}
 			: { allowInsecureLoopback: record.allowInsecureLoopback }),
 	};
-	return { client: new A2aRelayClient(clientConfig), pollMs: pollMs as number };
+	return {
+		client: new A2aRelayClient(clientConfig),
+		pollMs: pollMs as number,
+		evidence: await loadEvidenceRuntime(record.evidenceConfigPath),
+	};
 }
 
 function parseConfigObject(value: unknown): Record<string, unknown> {

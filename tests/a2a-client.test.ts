@@ -23,11 +23,13 @@ async function launch(executor: A2aExecutor): Promise<RunningA2aServer> {
 		host: "127.0.0.1",
 		port: 0,
 		storePath: join(directory, "store.json"),
+		artifactStorePath: join(directory, "artifacts"),
 		credentials: [{ token: "test-token", principal: "client" }],
 		agentName: "client-test-agent",
 		agentDescription: "client test agent",
 		publicUrl: "https://agent.test/a2a",
 		agentVersion: "0.0.1",
+		policyDigest: `sha256:${"a".repeat(64)}`,
 	};
 	const server = await startA2aServer(config, executor);
 	cleanups.push(async () => {
@@ -158,4 +160,41 @@ test("the outbound client parses task subscription events", async () => {
 	const seen: A2aStreamResponse[] = [];
 	await client.subscribeTask("task-1", (event) => seen.push(event));
 	assert.deepEqual(seen, frames);
+});
+
+test("a subscription timeout ends after the SSE connection opens", async () => {
+	const frame: A2aStreamResponse = {
+		statusUpdate: {
+			taskId: "task-slow",
+			contextId: "context-slow",
+			status: { state: "TASK_STATE_COMPLETED" },
+		},
+	};
+	const client = new A2aClient({
+		baseUrl: "https://agent.example/a2a",
+		token: "secret",
+		timeoutMs: 5,
+		fetch: async (_input, init) => {
+			const signal = init?.signal;
+			const bytes = new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`);
+			return new Response(
+				new ReadableStream({
+					start(controller) {
+						const timer = setTimeout(() => {
+							controller.enqueue(bytes);
+							controller.close();
+						}, 20);
+						signal?.addEventListener("abort", () => {
+							clearTimeout(timer);
+							controller.error(signal.reason);
+						});
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		},
+	});
+	const seen: A2aStreamResponse[] = [];
+	await client.subscribeTask("task-slow", (event) => seen.push(event));
+	assert.deepEqual(seen, [frame]);
 });
