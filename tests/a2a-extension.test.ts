@@ -80,6 +80,7 @@ function stubController(task: A2aTask): A2aTaskController {
 
 /** Starts the extension and returns the executor the server was handed. */
 async function startExtension(tasks: Map<string, A2aTask>): Promise<{
+	readonly handlers: Map<string, LifecycleHandler>;
 	readonly tools: Map<string, RegisteredTool>;
 	readonly wakes: Wake[];
 	readonly executor: A2aExecutor;
@@ -108,7 +109,7 @@ async function startExtension(tasks: Map<string, A2aTask>): Promise<{
 	});
 	await handlers.get("session_start")?.();
 	assert.ok(executor);
-	return { tools, wakes, executor };
+	return { handlers, tools, wakes, executor };
 }
 
 test("the a2a extension is inert unless explicitly enabled", () => {
@@ -242,4 +243,33 @@ test("a task the session was woken for is readable", async () => {
 		taskId: task.id,
 	})) as { content: [{ text: string }] };
 	assert.match(result.content[0].text, /please do the thing/);
+});
+
+test("a restarted session cannot inherit task access from the prior session", async () => {
+	const task = stubTask("task-prior-session", "private work from the prior session");
+	const tasks = new Map([[task.id, task]]);
+	const { handlers, tools, executor } = await startExtension(tasks);
+	await executor({
+		principal: "alpha",
+		message: {
+			messageId: "inbound-1",
+			role: "ROLE_USER",
+			parts: [{ text: "private work from the prior session" }],
+		},
+		begin: async () => stubController(task),
+	});
+
+	await (tools.get("a2a_read_task") as RegisteredTool).execute("call-before-restart", {
+		taskId: task.id,
+	});
+	await handlers.get("session_shutdown")?.();
+	await handlers.get("session_start")?.();
+
+	await assert.rejects(
+		() =>
+			(tools.get("a2a_read_task") as RegisteredTool).execute("call-after-restart", {
+				taskId: task.id,
+			}),
+		/was woken for/,
+	);
 });

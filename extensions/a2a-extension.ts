@@ -99,6 +99,11 @@ export default function a2aServerExtension(
 
 	pi.on("session_shutdown", async () => {
 		stopped = true;
+		// Drop the woken set with the session that earned it. It is scoped to
+		// "this session", and in a long-lived process the next session must not
+		// inherit reach into tasks it was never woken for. A task orphaned by
+		// the restart stays readable over HTTP by its own principal.
+		wokenTaskIds.clear();
 		await starting?.catch(() => {});
 		const server = running;
 		running = undefined;
