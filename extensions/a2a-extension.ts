@@ -3,11 +3,12 @@ import { Type } from "typebox";
 import {
 	type A2aExecutor,
 	type A2aServerConfig,
+	type A2aTaskController,
 	configFromEnv,
 	type RunningA2aServer,
 	startA2aServer,
 } from "./a2a/server.ts";
-import type { A2aMessage, A2aPart } from "./a2a/types.ts";
+import { type A2aMessage, type A2aPart, isSettled, isTerminal } from "./a2a/types.ts";
 
 export interface A2aExtensionDependencies {
 	readonly enabled?: () => boolean;
@@ -46,25 +47,81 @@ export default function a2aServerExtension(
 	let starting: Promise<void> | undefined;
 	let stopped = false;
 
+	interface TaskTurn {
+		readonly taskId: string;
+		readonly wake: string;
+		readonly controller: A2aTaskController;
+	}
+	const pendingTurns: TaskTurn[] = [];
+	let activeTurn: TaskTurn | undefined;
+
+	const wakeFor = (taskId: string): string =>
+		`[channels] a2a task ${taskId} awaits. Read it with a2a_read_task, then settle it with a2a_complete_task or a2a_require_input.`;
+
+	const queueTurn = (controller: TaskTurn["controller"]): void => {
+		const taskId = controller.task.id;
+		const turn: TaskTurn = { taskId, wake: wakeFor(taskId), controller };
+		pendingTurns.push(turn);
+		try {
+			// Body-free wake, same rule as every channel source: an inbound A2A
+			// message is untrusted content and never rides the prompt.
+			const delivery: unknown = pi.sendUserMessage(turn.wake, { deliverAs: "followUp" });
+			if (delivery && typeof (delivery as PromiseLike<unknown>).then === "function") {
+				void (delivery as Promise<unknown>).catch(async (error) => {
+					const index = pendingTurns.indexOf(turn);
+					if (index >= 0) {
+						pendingTurns.splice(index, 1);
+						await controller.status("TASK_STATE_FAILED", statusMessage("The agent wake failed."));
+					}
+					log({ event: "a2a_wake_failed", taskId, error: (error as Error).message });
+				});
+			}
+		} catch (error) {
+			const index = pendingTurns.indexOf(turn);
+			if (index >= 0) pendingTurns.splice(index, 1);
+			throw error;
+		}
+	};
+
 	const executor: A2aExecutor = async (context) => {
 		const controller = await context.begin();
-		await controller.status("TASK_STATE_WORKING");
-		const taskId = controller.task.id;
-		// Body-free wake, same rule as every channel source: an inbound A2A
-		// message is untrusted content and never rides the prompt.
-		const delivery: unknown = pi.sendUserMessage(
-			`[channels] a2a task ${taskId} awaits. Read it with a2a_read_task, then settle it with a2a_complete_task or a2a_require_input.`,
-			{ deliverAs: "followUp" },
-		);
-		if (delivery && typeof (delivery as PromiseLike<unknown>).then === "function") {
-			void (delivery as Promise<unknown>).catch((error) => {
-				log({ event: "a2a_wake_failed", taskId, error: (error as Error).message });
-			});
-		}
+		queueTurn(controller);
 		return undefined;
 	};
 
-	registerA2aTools(pi, () => running);
+	registerA2aTools(
+		pi,
+		() => running,
+		(taskId) => activeTurn?.taskId === taskId,
+	);
+
+	pi.on("before_agent_start", async (event) => {
+		if (activeTurn) return;
+		const index = pendingTurns.findIndex((turn) => turn.wake === event.prompt);
+		if (index < 0) return;
+		const [turn] = pendingTurns.splice(index, 1);
+		if (!turn) return;
+		activeTurn = turn;
+		const task = await running?.readTask(turn.taskId);
+		if (!task) {
+			activeTurn = undefined;
+			return;
+		}
+		if (!isTerminal(task.status.state)) await turn.controller.status("TASK_STATE_WORKING");
+	});
+
+	pi.on("agent_end", async () => {
+		const turn = activeTurn;
+		activeTurn = undefined;
+		if (!turn) return;
+		const task = await running?.readTask(turn.taskId);
+		if (task && !isSettled(task.status.state)) {
+			await turn.controller.status(
+				"TASK_STATE_FAILED",
+				statusMessage("The agent turn ended without settling the task."),
+			);
+		}
+	});
 
 	pi.on("session_start", async () => {
 		if (running) return;
@@ -77,6 +134,7 @@ export default function a2aServerExtension(
 				return;
 			}
 			running = server;
+			for (const controller of await server.recoverableTaskControllers()) queueTurn(controller);
 			log({ event: "a2a_server_started", url: server.url });
 		})();
 		try {
@@ -88,6 +146,10 @@ export default function a2aServerExtension(
 
 	pi.on("session_shutdown", async () => {
 		stopped = true;
+		// Drop session capabilities. The next server start reads unfinished work
+		// from durable storage and issues fresh, task-scoped wakes.
+		pendingTurns.length = 0;
+		activeTurn = undefined;
 		await starting?.catch(() => {});
 		const server = running;
 		running = undefined;
@@ -100,11 +162,27 @@ export default function a2aServerExtension(
 export function registerA2aTools(
 	pi: ExtensionAPI,
 	server: () => RunningA2aServer | undefined,
+	isActive: (taskId: string) => boolean,
 ): void {
 	const requireServer = (): RunningA2aServer => {
 		const current = server();
 		if (!current) throw new Error("the a2a server is not running");
 		return current;
+	};
+
+	/**
+	 * readTask and controllerForTask look a task up without a principal — the
+	 * hosting session IS the server. The active-turn binding stands between one
+	 * caller's task and another caller's answer. Refuse every id except the one
+	 * bound to this exact agent turn.
+	 */
+	const requireActive = (taskId: string): string => {
+		if (!isActive(taskId)) {
+			throw new Error(
+				`a2a task "${taskId}" is not active in this agent turn; only act on the task id in the current [channels] a2a wake`,
+			);
+		}
+		return taskId;
 	};
 
 	pi.registerTool({
@@ -120,7 +198,7 @@ export function registerA2aTools(
 			taskId: Type.String({ minLength: 1, description: "Task id from the wake." }),
 		}),
 		async execute(_toolCallId, params) {
-			const task = await requireServer().readTask(params.taskId);
+			const task = await requireServer().readTask(requireActive(params.taskId));
 			if (!task) throw new Error(`a2a task "${params.taskId}" was not found`);
 			return {
 				content: [{ type: "text", text: renderTask(task.status.state, task.history ?? []) }],
@@ -144,7 +222,7 @@ export function registerA2aTools(
 			}),
 		}),
 		async execute(_toolCallId, params) {
-			const controller = await requireServer().controllerForTask(params.taskId);
+			const controller = await requireServer().controllerForTask(requireActive(params.taskId));
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
 				await controller.artifact({
@@ -174,7 +252,7 @@ export function registerA2aTools(
 			question: Type.String({ minLength: 1, maxLength: 40_000 }),
 		}),
 		async execute(_toolCallId, params) {
-			const controller = await requireServer().controllerForTask(params.taskId);
+			const controller = await requireServer().controllerForTask(requireActive(params.taskId));
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			await controller.status("TASK_STATE_INPUT_REQUIRED", statusMessage(params.question));
 			return {

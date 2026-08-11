@@ -7,7 +7,12 @@ the A2A protocol, pinned at:
 - Commit: `3303592588e388e62e0f69f701af531d2f4e3991`
 - Path in upstream: `specification/a2a.proto`
 - SHA-256: `e195bf96ab630c69797851970203e1b2b6b19528f2e9803b7d904b91a5104016`
-- License: Apache License 2.0 (upstream).
+
+The license is the Apache License 2.0. Its text is vendored beside the proto
+as `LICENSE`, copied from the repository root of the same pinned commit
+(<https://raw.githubusercontent.com/a2aproject/A2A/3303592588e388e62e0f69f701af531d2f4e3991/LICENSE>,
+SHA-256 `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`).
+Re-copy it whenever the pinned commit changes.
 
 The TypeScript data model in `extensions/a2a/types.ts` derives from this
 file. An upgrade past v1.0.1 is an explicit compatibility change: replace

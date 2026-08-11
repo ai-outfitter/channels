@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { A2aTaskStore, trimTask } from "./store.ts";
@@ -18,6 +18,7 @@ import {
 	isSettled,
 	isTerminal,
 	OUTFITTER_TASK_EXTENSION_URI,
+	validateIdentifier,
 	validateMessage,
 } from "./types.ts";
 
@@ -79,6 +80,8 @@ export interface RunningA2aServer {
 	 */
 	readTask(taskId: string): Promise<A2aTask | undefined>;
 	controllerForTask(taskId: string): Promise<A2aTaskController | undefined>;
+	/** Accepted tasks that need a new task-scoped agent turn after restart. */
+	recoverableTaskControllers(): Promise<readonly A2aTaskController[]>;
 }
 
 const DEFAULT_BLOCKING_TIMEOUT_MS = 60_000;
@@ -89,6 +92,7 @@ export async function startA2aServer(
 	config: A2aServerConfig,
 	executor: A2aExecutor,
 ): Promise<RunningA2aServer> {
+	validateA2aServerConfig(config);
 	const store = new A2aTaskStore(config.storePath);
 	await store.initialize();
 	const subscribers = new Map<string, Set<Subscriber>>();
@@ -142,15 +146,33 @@ export async function startA2aServer(
 		readonly taskId?: string;
 	}
 
-	const replayPrior = async (
+	/**
+	 * Takes the (principal, messageId) key or replays what it already holds.
+	 * The claim and the prior-outcome read are one store operation, so two
+	 * concurrent sends of the same messageId cannot both proceed to execute.
+	 */
+	const claimOrReplay = async (
 		principal: string,
 		message: A2aMessage,
 	): Promise<ExecutionOutcome | undefined> => {
-		const prior = await store.priorOutcome(principal, message);
-		if (!prior) return undefined;
-		return prior.kind === "task"
-			? { response: { task: await store.getTask(principal, prior.taskId) }, taskId: prior.taskId }
-			: { response: { message: prior.message } };
+		const claim = await store.claimOutcome(principal, message);
+		if (claim.kind === "claimed") return undefined;
+		if (claim.kind === "inProgress") {
+			// Do not wait on the in-flight send: holding the socket turns a
+			// duplicate into a second unit of work on the server's clock. The
+			// caller retries and gets the recorded outcome.
+			throw new A2aError(
+				409,
+				"DUPLICATE_MESSAGE_IN_PROGRESS",
+				`messageId "${message.messageId}" is already being processed; retry to read its outcome`,
+			);
+		}
+		return claim.outcome.kind === "task"
+			? {
+					response: { task: await store.getTask(principal, claim.outcome.taskId) },
+					taskId: claim.outcome.taskId,
+				}
+			: { response: { message: claim.outcome.message } };
 	};
 
 	const loadContinuation = async (
@@ -186,24 +208,24 @@ export async function startA2aServer(
 		request: A2aSendMessageRequest,
 	): Promise<ExecutionOutcome> => {
 		const message = validateMessage(request.message, "ROLE_USER");
-		const replay = await replayPrior(principal, message);
+		const replay = await claimOrReplay(principal, message);
 		if (replay) return replay;
-		const existing = await loadContinuation(principal, message);
 		let controller: A2aTaskController | undefined;
-		const begin = async (): Promise<A2aTaskController> => {
-			if (controller) return controller;
-			const bound = existing ?? (await mintTask(principal, message));
-			controller = controllerFor(principal, bound);
-			emit(bound.id, { task: bound });
-			return controller;
-		};
-		const context: A2aExecutorContext = {
-			principal,
-			message,
-			...(existing ? { task: existing } : {}),
-			begin,
-		};
 		try {
+			const existing = await loadContinuation(principal, message);
+			const begin = async (): Promise<A2aTaskController> => {
+				if (controller) return controller;
+				const bound = existing ?? (await mintTask(principal, message));
+				controller = controllerFor(principal, bound);
+				emit(bound.id, { task: bound });
+				return controller;
+			};
+			const context: A2aExecutorContext = {
+				principal,
+				message,
+				...(existing ? { task: existing } : {}),
+				begin,
+			};
 			const direct = await executor(context);
 			if (controller) return recordTaskOutcome(principal, message, controller.task.id);
 			if (!direct) {
@@ -217,11 +239,19 @@ export async function startA2aServer(
 			await store.recordOutcome(principal, message, { kind: "message", message: reply });
 			return { response: { message: reply } };
 		} catch (error) {
-			if (!controller || error instanceof A2aError) throw error;
-			const failed = await controller
-				.status("TASK_STATE_FAILED")
-				.catch(() => controller?.task as A2aTask);
-			return recordTaskOutcome(principal, message, failed.id);
+			if (!controller) {
+				// Nothing was minted, so there is no outcome to replay. Keeping
+				// the claim would 409 every retry of a message that never ran.
+				await store.releaseClaim(principal, message.messageId);
+				throw error;
+			}
+			// A task exists. Whatever the error kind, it must not stay
+			// non-terminal: an unsettled task is invisible to the retry, which
+			// would mint a second one. Settle it, fill in the claim so the retry
+			// replays the failure, then let the error reach the client.
+			await controller.status("TASK_STATE_FAILED").catch(() => undefined);
+			await store.recordOutcome(principal, message, { kind: "task", taskId: controller.task.id });
+			throw error;
 		}
 	};
 
@@ -328,11 +358,16 @@ export async function startA2aServer(
 		}
 		if (request.method === "POST" && path === "/message:stream") {
 			const body = (await readJsonBody(request)) as A2aSendMessageRequest;
+			// Execute BEFORE the stream opens. Opening first commits a 200 and
+			// the SSE content type, so every error — a duplicate payload, an
+			// unknown task, an executor failure — became an empty stream that
+			// closed, which a client cannot tell apart from success. With the
+			// stream opened after, those errors take the normal HTTP error path.
+			const outcome = await executeSend(principal, body);
 			openEventStream(response);
 			const forward = (event: A2aStreamResponse): void => {
 				response.write(`data: ${JSON.stringify(event)}\n\n`);
 			};
-			const outcome = await executeSend(principal, body);
 			forward(outcome.response);
 			if (!outcome.taskId) {
 				response.end();
@@ -359,16 +394,18 @@ export async function startA2aServer(
 			const statusTimestampAfter = url.searchParams.get("statusTimestampAfter");
 			const pageSize = integerParam(url, "pageSize");
 			const historyLength = integerParam(url, "historyLength");
-			const tasks = await store.listTasks(principal, {
+			const pageToken = url.searchParams.get("pageToken");
+			const page = await store.listTasks(principal, {
 				...(contextId === null ? {} : { contextId }),
 				...(status === null ? {} : { status }),
 				...(statusTimestampAfter === null ? {} : { statusTimestampAfter }),
 				...(pageSize === undefined ? {} : { pageSize }),
 				...(historyLength === undefined ? {} : { historyLength }),
+				...(pageToken === null ? {} : { pageToken }),
 				includeArtifacts: url.searchParams.get("includeArtifacts") === "true",
 			});
 			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE });
-			response.end(JSON.stringify({ tasks, nextPageToken: "" }));
+			response.end(JSON.stringify(page));
 			return;
 		}
 		const subscribeMatch = path.match(/^\/tasks\/([^/:]+):subscribe$/);
@@ -452,12 +489,36 @@ export async function startA2aServer(
 			const stored = await store.lookup(taskId);
 			return stored ? controllerFor(stored.principal, stored.task) : undefined;
 		},
+		recoverableTaskControllers: async () =>
+			(await store.listRecoverable()).map((stored) => controllerFor(stored.principal, stored.task)),
 		close: () =>
 			new Promise<void>((resolve, reject) => {
 				server.closeAllConnections();
+				store.close();
 				server.close((error) => (error ? reject(error) : resolve()));
 			}),
 	};
+}
+
+/**
+ * Fail-closed startup validation, mirroring the relay server's
+ * validateServerConfig. Every principal that reaches the store must satisfy
+ * the same identifier rule the store applies when it parses its file back:
+ * a principal accepted here but rejected on parse records tasks durably and
+ * then makes the server permanently unstartable. Tokens must also be unique,
+ * or two entries silently collapse onto whichever principal is listed first.
+ */
+export function validateA2aServerConfig(config: A2aServerConfig): void {
+	if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65_535) {
+		throw new Error("a2a port is invalid");
+	}
+	const tokens = new Set<string>();
+	for (const credential of config.credentials) {
+		if (!credential.token) throw new Error("a2a credential token is required");
+		if (tokens.has(credential.token)) throw new Error("a2a credential tokens must be unique");
+		tokens.add(credential.token);
+		validateIdentifier(credential.principal, "principal");
+	}
 }
 
 function requireSupportedVersion(request: IncomingMessage): void {
@@ -475,7 +536,15 @@ function requireSupportedVersion(request: IncomingMessage): void {
 function authenticate(request: IncomingMessage, credentials: readonly A2aCredential[]): string {
 	const header = request.headers.authorization ?? "";
 	const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
-	const credential = token && credentials.find((entry) => entry.token === token);
+	// Compare fixed-size digests, not the tokens themselves: a raw comparison
+	// needs a length short-circuit before timingSafeEqual, and that
+	// short-circuit leaks each configured token's length to an unauthenticated
+	// prober. Same reasoning, and the same shape, as the relay server's
+	// findCredential.
+	const digest = (value: string) => createHash("sha256").update(value).digest();
+	const candidate = token ? digest(token) : undefined;
+	const credential =
+		candidate && credentials.find((entry) => timingSafeEqual(digest(entry.token), candidate));
 	if (!credential) {
 		throw new A2aError(401, "UNAUTHENTICATED", "a valid bearer token is required");
 	}
@@ -533,7 +602,7 @@ export async function configFromEnv(): Promise<A2aServerConfig> {
 	}
 	const host = process.env.A2A_HOST?.trim() || "127.0.0.1";
 	const port = Number(process.env.A2A_PORT ?? "8788");
-	return {
+	const config: A2aServerConfig = {
 		host,
 		port,
 		storePath,
@@ -545,4 +614,8 @@ export async function configFromEnv(): Promise<A2aServerConfig> {
 		publicUrl: process.env.A2A_PUBLIC_URL?.trim() || `http://${host}:${port}`,
 		agentVersion: process.env.A2A_AGENT_VERSION?.trim() || "0.0.0",
 	};
+	// Fail here as well as in startA2aServer, so a bad credentials file names
+	// itself at load time rather than at listen time.
+	validateA2aServerConfig(config);
+	return config;
 }
