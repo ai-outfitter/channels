@@ -233,6 +233,22 @@ function validatePart(value: unknown): A2aPart {
 	return part;
 }
 
+export function validateArtifact(value: unknown): A2aArtifact {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new A2aError(400, "INVALID_ARGUMENT", "artifact must be an object");
+	}
+	const artifact = value as A2aArtifact;
+	validateIdentifier(artifact.artifactId, "artifactId");
+	if (!Array.isArray(artifact.parts) || artifact.parts.length === 0) {
+		throw new A2aError(400, "INVALID_ARGUMENT", "artifact must carry at least one part");
+	}
+	for (const part of artifact.parts) validatePart(part);
+	if (JSON.stringify(artifact).length > MAX_MESSAGE_BYTES) {
+		throw new A2aError(400, "INVALID_ARGUMENT", `artifact exceeds ${MAX_MESSAGE_BYTES} bytes`);
+	}
+	return artifact;
+}
+
 export function validateMessage(value: unknown, role?: A2aRole): A2aMessage {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new A2aError(400, "INVALID_ARGUMENT", "message must be an object");

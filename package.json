@@ -24,7 +24,9 @@
 			"./extensions/index.ts",
 			"./extensions/relay-extension.ts",
 			"./extensions/a2a-extension.ts",
-			"./extensions/a2a-client-extension.ts"
+			"./extensions/a2a-client-extension.ts",
+			"./extensions/a2a-relay-extension.ts",
+			"./extensions/a2a-relay-server-extension.ts"
 		]
 	},
 	"publishConfig": {
