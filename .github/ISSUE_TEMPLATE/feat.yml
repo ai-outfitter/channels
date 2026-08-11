@@ -1,0 +1,62 @@
+name: New capability or change
+description: >-
+  Request a new channel source, wake behaviour, or a change to an existing one.
+  The triage agent will label it and comment with a suggested plan.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: What does this touch?
+      options:
+        - A new channel source
+        - An existing channel source
+        - Wake conditions and matching
+        - The shared notification queue
+        - channel_read and untrusted-content handling
+        - Installation or configuration
+        - Documentation
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: service
+    attributes:
+      label: Service
+      description: For a new or existing source, which service this is about.
+      placeholder: e.g. Discord, Linear, Gmail
+    validations:
+      required: false
+  - type: textarea
+    id: problem
+    attributes:
+      label: What work are you missing today?
+      description: >-
+        The activity you want the session woken for, not the solution you have
+        in mind. A request stated as a problem survives a better idea than yours.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should it do?
+      description: >-
+        The behaviour you want. If it is a new source, say whether the service
+        supports push, needs a local daemon, or has to be polled.
+    validations:
+      required: true
+  - type: dropdown
+    id: trust
+    attributes:
+      label: Does this change what a wake carries?
+      description: >-
+        Wakes are body-free by design: they say there is activity, never what it
+        said. A request that needs content in the wake is a different question
+        and needs stating plainly.
+      options:
+        - "No — the wake stays body-free"
+        - "Yes — this needs content in the wake"
+        - Not sure
+    validations:
+      required: true

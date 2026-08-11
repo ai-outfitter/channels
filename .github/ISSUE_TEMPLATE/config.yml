@@ -1,0 +1,3 @@
+# Blank issues stay enabled: the triage agent can classify free-form issues
+# too — templates just give it (and contributors) more structure to work with.
+blank_issues_enabled: true

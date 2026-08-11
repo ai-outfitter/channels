@@ -1,0 +1,70 @@
+name: Something is broken
+description: >-
+  A channel source, a wake, or a read does not behave as documented. The triage
+  agent will label it and comment with a suggested plan.
+title: "fix: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: source
+    attributes:
+      label: Which channel source?
+      options:
+        - Email
+        - Signal
+        - GitHub notifications
+        - Slack
+        - Chatto
+        - Mattermost
+        - Zulip
+        - The shared notification queue
+        - Not source-specific
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: What kind of failure?
+      options:
+        - No wake fires when it should
+        - A wake fires when it should not
+        - The wake carries content it should not
+        - channel_read returns wrong or missing content
+        - Connection or authentication fails
+        - Installation or loading fails
+        - Documentation is wrong or out of date
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Pi and channels versions
+      description: Output of `pi list` for the channels entry, plus your Pi version.
+      placeholder: e.g. pi 0.4.2, channels at commit abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happens instead?
+      description: >-
+        Include error output verbatim. Redact message bodies, addresses, and
+        tokens — a wake is body-free by design and a bug report should be too.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >-
+        The channel entry from your settings. Redact tokens and addresses.
+      render: json
+    validations:
+      required: false
