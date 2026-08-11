@@ -59,7 +59,9 @@ export interface A2aExecutorContext {
 	 * Message instead — the server decides nothing; the executor owns the
 	 * Message-versus-Task decision.
 	 */
-	begin(): Promise<A2aTaskController>;
+	begin(taskId?: string): Promise<A2aTaskController>;
+	/** Principal-scoped lookup for a trusted executor routing continuation. */
+	lookupTask?(taskId: string): Promise<A2aTask | undefined>;
 }
 
 /**
@@ -191,16 +193,7 @@ export async function startA2aServer(
 		if (message.contextId && message.contextId !== existing.contextId) {
 			throw new A2aError(400, "INVALID_ARGUMENT", "contextId does not match the task's context");
 		}
-		return store.appendHistory(principal, existing.id, message);
-	};
-
-	const mintTask = async (principal: string, message: A2aMessage): Promise<A2aTask> => {
-		const task = await store.createTask(principal, message.contextId);
-		return store.appendHistory(principal, task.id, {
-			...message,
-			taskId: task.id,
-			contextId: task.contextId,
-		});
+		return existing;
 	};
 
 	const executeSend = async (
@@ -213,9 +206,20 @@ export async function startA2aServer(
 		let controller: A2aTaskController | undefined;
 		try {
 			const existing = await loadContinuation(principal, message);
-			const begin = async (): Promise<A2aTaskController> => {
+			const begin = async (selectedTaskId?: string): Promise<A2aTaskController> => {
 				if (controller) return controller;
-				const bound = existing ?? (await mintTask(principal, message));
+				if (existing && selectedTaskId && selectedTaskId !== existing.id) {
+					throw new A2aError(
+						400,
+						"INVALID_ARGUMENT",
+						"executor task selection conflicts with message taskId",
+					);
+				}
+				const bound = await store.bindClaimToTask(
+					principal,
+					message,
+					existing?.id ?? selectedTaskId,
+				);
 				controller = controllerFor(principal, bound);
 				emit(bound.id, { task: bound });
 				return controller;
@@ -225,6 +229,7 @@ export async function startA2aServer(
 				message,
 				...(existing ? { task: existing } : {}),
 				begin,
+				lookupTask: async (taskId) => store.lookupOwned(principal, taskId),
 			};
 			const direct = await executor(context);
 			if (controller) return recordTaskOutcome(principal, message, controller.task.id);

@@ -234,16 +234,30 @@ export function mentionNotificationEvent(
 	) {
 		return undefined;
 	}
+	const locator = encodeChattoLocator({
+		notificationId: notification.id,
+		roomId,
+		messageEventId: mention.eventId,
+		...(mention.threadRootEventId ? { threadRootEventId: mention.threadRootEventId } : {}),
+	});
 	return {
 		channel: "chatto",
 		summary: "new mention",
-		locator: {
-			key: encodeChattoLocator({
+		locator: { key: locator },
+		work: {
+			providerEventId: notification.id,
+			nativeLocator: {
 				notificationId: notification.id,
 				roomId,
 				messageEventId: mention.eventId,
 				...(mention.threadRootEventId ? { threadRootEventId: mention.threadRootEventId } : {}),
-			}),
+				channelLocator: locator,
+			},
+			receivedAt: notification.createdAt?.toDate().toISOString() ?? new Date().toISOString(),
+			dedupeKey: `chatto:${notification.id}`,
+			correlationKey: `chatto:${roomId}:${mention.threadRootEventId ?? mention.eventId}`,
+			sourceSummary: "new mention",
+			parts: [{ data: { channel: "chatto", locator } }],
 		},
 	};
 }
@@ -350,10 +364,13 @@ interface ChattoFrameContext {
 async function handleChattoMessage(data: unknown, context: ChattoFrameContext): Promise<void> {
 	const frame = RealtimeServerFrame.fromBinary(await messageBytes(data));
 	context.resetHeartbeat();
-	handleChattoFrame(frame, context);
+	await handleChattoFrame(frame, context);
 }
 
-function handleChattoFrame(frame: RealtimeServerFrame, context: ChattoFrameContext): void {
+async function handleChattoFrame(
+	frame: RealtimeServerFrame,
+	context: ChattoFrameContext,
+): Promise<void> {
 	switch (frame.frame.case) {
 		case "hello":
 			handleChattoHello(frame.frame.value, context);
@@ -362,7 +379,7 @@ function handleChattoFrame(frame: RealtimeServerFrame, context: ChattoFrameConte
 			context.state.subscribed = true;
 			return;
 		case "projectionEvent":
-			handleChattoProjection(frame.frame.value, context);
+			await handleChattoProjection(frame.frame.value, context);
 			return;
 		case "caughtUp":
 			if (frame.frame.value.cursor) context.onCursor(frame.frame.value.cursor);
@@ -395,28 +412,28 @@ function handleChattoHello(hello: RealtimeServerHello, context: ChattoFrameConte
 	);
 }
 
-function handleChattoProjection(
+async function handleChattoProjection(
 	projection: RealtimeProjectionEvent,
 	context: ChattoFrameContext,
-): void {
+): Promise<void> {
 	if (!context.state.subscribed) throw new Error("Chatto projected events before subscription");
 	for (const operation of projection.operations) {
 		if (operation.operation.case !== "notificationsReplace") continue;
-		handleNotificationReplacement(operation.operation.value, context);
+		await handleNotificationReplacement(operation.operation.value, context);
 	}
 	if (projection.resumeCursor) context.onCursor(projection.resumeCursor);
 }
 
-function handleNotificationReplacement(
+async function handleNotificationReplacement(
 	replacement: RealtimeProjectionNotificationsReplace,
 	context: ChattoFrameContext,
-): void {
+): Promise<void> {
 	const notifications = replacement.page?.notifications ?? [];
 	const currentIds = new Set(notifications.map((notification) => notification.id));
 	for (const notification of notifications) {
 		if (context.emittedNotificationIds.has(notification.id)) continue;
 		const mention = mentionNotificationEvent(notification, context.viewerId, context.cfg.roomIds);
-		if (mention && context.onEvent(mention) === false) currentIds.delete(notification.id);
+		if (mention && (await context.onEvent(mention)) === false) currentIds.delete(notification.id);
 	}
 	context.emittedNotificationIds.clear();
 	for (const id of currentIds) context.emittedNotificationIds.add(id);

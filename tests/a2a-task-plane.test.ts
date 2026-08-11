@@ -264,6 +264,30 @@ describe("a2a task plane", () => {
 		assert.equal(snapshot.history?.length, 2);
 	});
 
+	it("a trusted executor can route a new message into an owned non-terminal task", async () => {
+		let routedTaskId: string | undefined;
+		const routingExecutor: A2aExecutor = async (context) => {
+			const controller = await context.begin(routedTaskId);
+			routedTaskId ??= controller.task.id;
+			await controller.status("TASK_STATE_INPUT_REQUIRED");
+			return undefined;
+		};
+		const server = await launch(routingExecutor);
+		const first = await send(server, "token-a", {
+			message: userMessage("m-routed-1", "first activation"),
+		});
+		const firstTask = ((await first.json()) as { task: A2aTask }).task;
+		const second = await send(server, "token-a", {
+			message: userMessage("m-routed-2", "thread continuation"),
+		});
+		const secondTask = ((await second.json()) as { task: A2aTask }).task;
+		assert.equal(secondTask.id, firstTask.id);
+		assert.deepEqual(
+			secondTask.history?.map((message) => message.messageId),
+			["m-routed-1", "m-routed-2"],
+		);
+	});
+
 	it("continuing a terminal task fails, requests without a bearer token fail, and push-notification routes are explicitly unsupported", async () => {
 		const server = await launch(completingExecutor);
 		const created = await send(server, "token-a", { message: userMessage("m-13", "work") });
@@ -412,6 +436,27 @@ describe("a2a task plane", () => {
 		);
 	});
 
+	it("task binding and its dedupe outcome survive one atomic restart boundary", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-bind-test-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const path = join(directory, "store.json");
+		const message = userMessage("m-bound-before-crash", "persist this work");
+		const first = new A2aTaskStore(path);
+		assert.deepEqual(await first.claimOutcome("alpha", message), { kind: "claimed" });
+		const task = await first.bindClaimToTask("alpha", message);
+		first.close();
+
+		const second = new A2aTaskStore(path);
+		assert.deepEqual(await second.claimOutcome("alpha", message), {
+			kind: "replay",
+			outcome: { kind: "task", taskId: task.id },
+		});
+		assert.deepEqual(
+			(await second.listTasks("alpha", {})).tasks.map((entry) => entry.id),
+			[task.id],
+		);
+	});
+
 	it("a closed store refuses further operations instead of rebuilding itself", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "a2a-close-test-"));
 		cleanups.push(() => rm(directory, { recursive: true, force: true }));
@@ -519,15 +564,16 @@ describe("a2a task plane", () => {
 		};
 		const first = send(server, "token-a", request);
 		while (begins === 0) await new Promise((resolve) => setTimeout(resolve, 5));
-		// The claim is taken inside one store operation, so the second send
-		// cannot observe an empty key even though the first is still gated.
+		// begin() binds the claim and task in one store operation. The second
+		// send can replay that durable task while the first executor is gated.
 		const secondResponse = await send(server, "token-a", request);
+		const secondTask = ((await secondResponse.json()) as { task: A2aTask }).task;
 		release();
 		const firstResponse = await first;
+		const firstTask = ((await firstResponse.json()) as { task: A2aTask }).task;
 		assert.equal(firstResponse.status, 200);
-		assert.equal(secondResponse.status, 409);
-		const error = (await secondResponse.json()) as { details: [{ reason: string }] };
-		assert.equal(error.details[0].reason, "DUPLICATE_MESSAGE_IN_PROGRESS");
+		assert.equal(secondResponse.status, 200);
+		assert.equal(secondTask.id, firstTask.id);
 		assert.equal(begins, 1);
 		const listed = await fetch(`${server.url}/tasks`, {
 			headers: { authorization: "Bearer token-a" },

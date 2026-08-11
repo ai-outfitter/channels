@@ -15,6 +15,7 @@ import {
 } from "../a2a/server.ts";
 import {
 	A2A_MEDIA_TYPE,
+	A2A_PROTOCOL_VERSION,
 	A2aError,
 	type A2aMessage,
 	type A2aTaskState,
@@ -24,6 +25,9 @@ import {
 	validateIdentifier,
 	validateMessage,
 } from "../a2a/types.ts";
+import { OriginRouter } from "../origins/router.ts";
+import { OriginStore } from "../origins/store.ts";
+import type { TaskLocator } from "../origins/types.ts";
 import { type A2aRelayDelivery, A2aRelayStore } from "./store.ts";
 
 const MAX_CONNECTOR_BODY_BYTES = 256 * 1024;
@@ -46,6 +50,7 @@ export interface A2aRelayWorkerCredential {
 export interface A2aRelayServerConfig {
 	readonly agentId: string;
 	readonly queuePath: string;
+	readonly originStorePath: string;
 	readonly a2a: A2aServerConfig;
 	readonly connectorHost: string;
 	readonly connectorPort: number;
@@ -66,6 +71,8 @@ export async function a2aRelayConfigFromEnv(): Promise<A2aRelayServerConfig> {
 	if (!agentId) throw new Error("A2A_RELAY_AGENT_ID is required");
 	const queuePath = process.env.A2A_RELAY_QUEUE_PATH?.trim();
 	if (!queuePath) throw new Error("A2A_RELAY_QUEUE_PATH is required");
+	const originStorePath = process.env.A2A_RELAY_ORIGIN_STORE_PATH?.trim();
+	if (!originStorePath) throw new Error("A2A_RELAY_ORIGIN_STORE_PATH is required");
 	const credentialsPath = process.env.A2A_RELAY_WORKER_CREDENTIALS_PATH?.trim();
 	if (!credentialsPath) throw new Error("A2A_RELAY_WORKER_CREDENTIALS_PATH is required");
 	const document = JSON.parse(await readFile(credentialsPath, "utf8")) as {
@@ -82,6 +89,7 @@ export async function a2aRelayConfigFromEnv(): Promise<A2aRelayServerConfig> {
 	const config: A2aRelayServerConfig = {
 		agentId,
 		queuePath,
+		originStorePath,
 		a2a: await a2aConfigFromEnv(),
 		connectorHost: process.env.A2A_RELAY_HOST?.trim() || "127.0.0.1",
 		connectorPort: Number(process.env.A2A_RELAY_PORT ?? "8789"),
@@ -106,17 +114,27 @@ export async function startA2aRelayServer(
 ): Promise<RunningA2aRelayServer> {
 	validateConfig(config);
 	const queue = new A2aRelayStore(config.queuePath);
+	const origins = new OriginStore(config.originStorePath);
 	await queue.initialize();
-	const a2a = await startA2aServer(config.a2a, async (context) => {
-		const controller = await context.begin();
-		await queue.enqueue(controller.task.id, config.agentId);
-		return undefined;
-	});
+	await origins.initialize();
+	const router = new OriginRouter(origins, config.a2a.publicUrl);
+	let a2a: RunningA2aServer;
+	try {
+		a2a = await startA2aServer(config.a2a, async (context) => {
+			const routed = await router.route(context);
+			await queue.enqueue(routed.controller.task.id, config.agentId);
+			return undefined;
+		});
+	} catch (error) {
+		queue.close();
+		origins.close();
+		throw error;
+	}
 	try {
 		for (const controller of await a2a.recoverableTaskControllers()) {
 			await queue.enqueue(controller.task.id, config.agentId);
 		}
-		const connector = await startConnector(config, a2a, queue);
+		const connector = await startConnector(config, a2a, queue, origins);
 		return {
 			a2aUrl: a2a.url,
 			connectorUrl: connector.url,
@@ -124,11 +142,13 @@ export async function startA2aRelayServer(
 				await connector.close();
 				await a2a.close();
 				queue.close();
+				origins.close();
 			},
 		};
 	} catch (error) {
 		await a2a.close();
 		queue.close();
+		origins.close();
 		throw error;
 	}
 }
@@ -137,11 +157,12 @@ async function startConnector(
 	config: A2aRelayServerConfig,
 	a2a: RunningA2aServer,
 	queue: A2aRelayStore,
+	origins: OriginStore,
 ): Promise<{ readonly url: string; close(): Promise<void> }> {
 	const leaseMs = config.leaseMs ?? DEFAULT_LEASE_MS;
 	const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
 		try {
-			await handleConnectorRequest(request, response, config, a2a, queue, leaseMs);
+			await handleConnectorRequest(request, response, config, a2a, queue, origins, leaseMs);
 		} catch (error) {
 			const connectorError = normalizeError(error);
 			writeJson(response, connectorError.status, {
@@ -184,11 +205,16 @@ async function handleConnectorRequest(
 	config: A2aRelayServerConfig,
 	a2a: RunningA2aServer,
 	queue: A2aRelayStore,
+	origins: OriginStore,
 	leaseMs: number,
 ): Promise<void> {
 	const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
 	if (request.method === "GET" && url.pathname === "/healthz") {
 		writeJson(response, 200, { status: "ok" });
+		return;
+	}
+	if (url.pathname.startsWith("/v1/trace/")) {
+		await handleTrace(request, response, url.pathname, config, origins);
 		return;
 	}
 	const worker = authenticate(request, config.workerCredentials);
@@ -215,6 +241,124 @@ async function handleConnectorRequest(
 		match[2],
 		leaseMs,
 	);
+}
+
+async function handleTrace(
+	request: IncomingMessage,
+	response: ServerResponse,
+	path: string,
+	config: A2aRelayServerConfig,
+	origins: OriginStore,
+): Promise<void> {
+	const principal = authenticateTrace(request, config.a2a.credentials);
+	const allowed = new Set([principal]);
+	const activationMatch = path.match(/^\/v1\/trace\/activations\/([^/]+)$/);
+	if (request.method === "GET" && activationMatch) {
+		const trace = await origins.activationTrace(
+			allowed,
+			decodePathSegment(activationMatch[1] as string),
+		);
+		if (!trace) throw new ConnectorError(404, "trace_not_found", "trace was not found");
+		writeJson(response, 200, trace);
+		return;
+	}
+	const taskMatch = path.match(/^\/v1\/trace\/tasks\/([^/]+)$/);
+	if (request.method === "GET" && taskMatch) {
+		const task = traceTask(config, taskMatch[1] as string);
+		const trace = await origins.taskTrace(allowed, task);
+		if (!trace) throw new ConnectorError(404, "trace_not_found", "trace was not found");
+		writeJson(response, 200, trace);
+		return;
+	}
+	const deliveryMatch = path.match(/^\/v1\/trace\/tasks\/([^/]+)\/delivery$/);
+	if (request.method === "POST" && deliveryMatch) {
+		await handleDeliveryTrace(
+			request,
+			response,
+			config,
+			origins,
+			allowed,
+			deliveryMatch[1] as string,
+		);
+		return;
+	}
+	throw new ConnectorError(404, "trace_not_found", "trace was not found");
+}
+
+async function handleDeliveryTrace(
+	request: IncomingMessage,
+	response: ServerResponse,
+	config: A2aRelayServerConfig,
+	origins: OriginStore,
+	allowed: ReadonlySet<string>,
+	encodedTaskId: string,
+): Promise<void> {
+	const task = traceTask(config, encodedTaskId);
+	const trace = await origins.taskTrace(allowed, task);
+	if (!trace) throw new ConnectorError(404, "trace_not_found", "trace was not found");
+	const body = await readJsonBody(request);
+	const sourceKind = requiredString(body.sourceKind, "sourceKind");
+	const providerEventId = requiredString(body.providerEventId, "providerEventId");
+	const matched = trace.origins.find(
+		(entry) =>
+			entry.activation.sourceKind === sourceKind &&
+			entry.activation.providerEventId === providerEventId,
+	);
+	if (!matched) throw new ConnectorError(404, "trace_not_found", "activation was not found");
+	const delivery = await origins.recordDelivery(matched.activation.id, task, {
+		state: deliveryState(body.state),
+		attemptCount: nonNegativeInteger(body.attemptCount, "attemptCount"),
+		...(body.responseId === undefined
+			? {}
+			: { responseId: requiredString(body.responseId, "responseId") }),
+		...(body.errorCode === undefined
+			? {}
+			: { errorCode: requiredString(body.errorCode, "errorCode") }),
+	});
+	writeJson(response, 200, delivery);
+}
+
+function traceTask(config: A2aRelayServerConfig, encodedTaskId: string): TaskLocator {
+	return {
+		agentInterface: config.a2a.publicUrl,
+		protocolBinding: "HTTP+JSON",
+		protocolVersion: A2A_PROTOCOL_VERSION,
+		taskId: validateIdentifier(decodePathSegment(encodedTaskId), "task id"),
+	};
+}
+
+function deliveryState(value: unknown): "pending" | "delivered" | "failed" | "not-applicable" {
+	if (
+		value === "pending" ||
+		value === "delivered" ||
+		value === "failed" ||
+		value === "not-applicable"
+	) {
+		return value;
+	}
+	throw new ConnectorError(400, "invalid_delivery", "native delivery state is invalid");
+}
+
+function requiredString(value: unknown, label: string): string {
+	if (typeof value !== "string" || value.length === 0 || value.length > 512) {
+		throw new ConnectorError(400, "invalid_delivery", `${label} must contain 1-512 characters`);
+	}
+	return value;
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+	if (!Number.isSafeInteger(value) || (value as number) < 0) {
+		throw new ConnectorError(400, "invalid_delivery", `${label} must be a non-negative integer`);
+	}
+	return value as number;
+}
+
+function decodePathSegment(value: string): string {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		throw new ConnectorError(400, "invalid_path", "trace path identifier is invalid");
+	}
 }
 
 async function handleClaim(
@@ -404,6 +548,22 @@ function authenticate(
 	throw new ConnectorError(401, "unauthenticated", "bearer token rejected");
 }
 
+function authenticateTrace(
+	request: IncomingMessage,
+	credentials: A2aServerConfig["credentials"],
+): string {
+	const header = request.headers.authorization;
+	if (!header?.startsWith("Bearer "))
+		throw new ConnectorError(401, "unauthenticated", "bearer token required");
+	const digest = (value: string): Buffer => createHash("sha256").update(value).digest();
+	const supplied = digest(header.slice(7));
+	const credential = credentials.find((candidate) =>
+		timingSafeEqual(digest(candidate.token), supplied),
+	);
+	if (!credential) throw new ConnectorError(401, "unauthenticated", "bearer token rejected");
+	return credential.principal;
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
 	const chunks: Buffer[] = [];
 	let total = 0;
@@ -450,6 +610,7 @@ function normalizeError(error: unknown): ConnectorError {
 function validateConfig(config: A2aRelayServerConfig): void {
 	validateIdentifier(config.agentId, "agent id");
 	if (!config.queuePath) throw new Error("A2A relay queuePath is required");
+	if (!config.originStorePath) throw new Error("A2A relay originStorePath is required");
 	if (
 		!Number.isSafeInteger(config.connectorPort) ||
 		config.connectorPort < 0 ||

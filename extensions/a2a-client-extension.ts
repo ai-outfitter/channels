@@ -10,6 +10,11 @@ import {
 	type A2aSendMessageResponse,
 	type A2aTask,
 } from "./a2a/types.ts";
+import {
+	activationMetadata,
+	digestParts,
+	OUTFITTER_ORIGIN_EXTENSION_URI,
+} from "./origins/types.ts";
 
 const MAX_DELEGATE_CONFIG_BYTES = 256 * 1024;
 const MAX_DELEGATES = 32;
@@ -77,11 +82,26 @@ export default function a2aClientExtension(
 		}),
 		async execute(_toolCallId, params) {
 			const delegate = await target(params.target);
+			const messageId = randomUUID();
+			const parts = [{ text: params.request }];
 			const result = await delegate.client.sendMessage({
 				message: {
-					messageId: randomUUID(),
+					messageId,
 					role: "ROLE_USER",
-					parts: [{ text: params.request }],
+					parts,
+					extensions: [OUTFITTER_ORIGIN_EXTENSION_URI],
+					metadata: activationMetadata({
+						sourceKind: "a2a",
+						providerEventId: messageId,
+						nativeLocator: {
+							target: params.target,
+							agentInterface: delegate.agentInterface,
+						},
+						receivedAt: new Date().toISOString(),
+						dedupeKey: messageId,
+						contentDigest: digestParts(parts),
+						sourceSummary: "delegated A2A task",
+					}),
 				},
 				configuration: { returnImmediately: true },
 			});

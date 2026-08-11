@@ -28,7 +28,7 @@
  * privately may be unreachable or firewalled — dereferencing it turns every
  * wake into a silent no-op.
  */
-import type { ChannelSource } from "./types.ts";
+import type { ChannelEvent, ChannelSource } from "./types.ts";
 import { errorMessage, parseList, scopedLog, sinceFrom, trimTrailingSlash } from "./util.ts";
 
 const log = scopedLog("github");
@@ -110,8 +110,8 @@ interface Notification {
 	id: string;
 	reason: string;
 	updated_at: string;
-	// `subject.url` is deliberately absent: see the security invariant above.
-	subject?: { title?: string; type?: string };
+	// The URL is parsed only to build a native browser link. It is never fetched.
+	subject?: { title?: string; type?: string; url?: string };
 	repository?: { full_name?: string };
 }
 
@@ -207,7 +207,7 @@ interface PollState {
 interface PollDeps {
 	cfg: GithubConfig;
 	signal: AbortSignal;
-	onEvent: (event: { channel: string; summary: string }) => void;
+	onEvent: (event: import("./types.ts").ChannelEvent) => unknown;
 	request: Request_;
 }
 
@@ -280,7 +280,7 @@ async function emitNew(
 		if (seen.has(key) || signal.aborted) continue;
 		const reason = classify(n);
 		if (!reason || !cfg.filters.has(reason)) continue;
-		onEvent({ channel: "github", summary: reason });
+		await onEvent(githubChannelEvent(cfg.api, n, reason));
 		handled.push(n);
 	}
 	// Drain serially. One poll can return up to 50 threads, and GitHub's
@@ -291,6 +291,52 @@ async function emitNew(
 		for (const n of handled) await markRead(n, request);
 	}
 	return batch;
+}
+
+function githubChannelEvent(api: string, notification: Notification, reason: string): ChannelEvent {
+	const providerEventId = `github:${notification.id}:${notification.updated_at}`;
+	const nativeUrl = githubNativeUrl(api, notification.subject?.url);
+	return {
+		channel: "github",
+		summary: reason,
+		dedupeKey: providerEventId,
+		work: {
+			providerEventId,
+			nativeLocator: {
+				threadId: notification.id,
+				updatedAt: notification.updated_at,
+				...(notification.repository?.full_name
+					? { repository: notification.repository.full_name }
+					: {}),
+				...(notification.subject?.type ? { subjectType: notification.subject.type } : {}),
+			},
+			receivedAt: new Date(notification.updated_at).toISOString(),
+			dedupeKey: providerEventId,
+			correlationKey: `github:${notification.id}`,
+			sourceSummary: reason,
+			...(nativeUrl ? { nativeUrl } : {}),
+			parts: [{ data: { channel: "github", notificationId: notification.id } }],
+		},
+	};
+}
+
+/** Convert only a structurally valid subject API URL into its browser URL. */
+function githubNativeUrl(api: string, value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	let subject: URL;
+	let base: URL;
+	try {
+		subject = new URL(value);
+		base = new URL(api);
+	} catch {
+		return undefined;
+	}
+	if (subject.origin !== base.origin) return undefined;
+	const match = /^\/repos\/([^/]+)\/([^/]+)\/(issues|pulls)\/(\d+)$/.exec(subject.pathname);
+	if (!match) return undefined;
+	const webOrigin = base.hostname === "api.github.com" ? "https://github.com" : base.origin;
+	const kind = match[3] === "pulls" ? "pull" : "issues";
+	return `${webOrigin}/${match[1]}/${match[2]}/${kind}/${match[4]}`;
 }
 
 /** Best-effort: a failed mark-read must not drop the event already emitted. */

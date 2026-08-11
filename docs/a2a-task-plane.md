@@ -2,11 +2,10 @@
 
 Channels adopts [A2A v1](https://github.com/a2aproject/A2A) as its common
 task protocol ([RFC #35](https://github.com/ai-outfitter/channels/issues/35)).
-This module is the first contract commit: the HTTP+JSON server binding, the
-durable task store, the mandatory idempotency rule, the Outfitter task
-extension, and the resident-agent bridge. Native adapters (Slack, GitHub,
-Chatto, JMAP) keep their own event intake and result delivery; wiring them
-through this plane is later work under the RFC.
+This module provides the HTTP+JSON server binding, durable task store,
+mandatory idempotency rule, Outfitter task and origin extensions, relay, and
+resident-agent bridge. Slack, GitHub, Chatto, and JMAP intake submits work
+through the source router.
 
 ## Pinned protocol source
 
@@ -57,9 +56,10 @@ token maps to a principal, and every task and dedupe record is scoped to it.
   Message verbatim. Retention: 30 days, never shorter than the referenced
   task's life. A duplicate `messageId` with a different payload is an
   explicit `409 DUPLICATE_MESSAGE_ID`, never a silent replay. The key is
-  claimed before the executor runs, so a duplicate that arrives while the
-  first send is still executing gets `409 DUPLICATE_MESSAGE_IN_PROGRESS` and
-  is told to retry; it never waits and never executes a second time.
+  claimed before the executor runs. A duplicate that arrives before the
+  executor binds a Task gets `409 DUPLICATE_MESSAGE_IN_PROGRESS`. After
+  `begin()` atomically binds the claim and Task, a concurrent duplicate
+  replays that Task immediately. It never executes a second time.
 - **Recovery uses durable state.** Streams are ephemeral; the durable Task —
   status, history, artifacts — is the record. A reconnecting client reads
   the Task, then opens a new subscription; nothing replays.
@@ -107,6 +107,31 @@ the task with three tools:
   task enters `input-required` and the caller's answer arrives as a new wake
   on the same task. This is the protocol-native structured-question surface
   ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+
+## Source router
+
+`A2A_SOURCE_ROUTER_FILE` selects one deployment-owned A2A destination. The
+JSON file contains `baseUrl`, `traceUrl`, `token`, `outboxPath`, optional
+`allowInsecureLoopback`, and optional `retryMs`. `outboxPath` MUST be an
+absolute path.
+
+The router writes a native activation to its local outbox before a source
+acknowledges the provider event. Delivery is at least once. The A2A message id
+is stable, and the server deduplicates it. Durable receipts suppress provider
+redelivery after the outbox removes an accepted send. Native event bodies do
+not enter a trusted wake. The task history contains a structural locator that
+the resident agent uses with the channel adapter.
+
+After `channel_respond` performs a native response, the source router records
+the delivery result against the exact activation and Task through `traceUrl`.
+This state is separate from A2A Task completion. A failed trace write remains
+in the durable source store and retries.
+
+JMAP email intake uses `JMAP_STATE_PATH` as its absolute durable cursor file.
+It establishes an initial Email state, reconciles every later push with
+`Email/changes`, fetches each created item with `Email/get`, persists the A2A
+activation, and only then advances the cursor. Each task therefore carries an
+exact account and email id instead of a generic “mail changed” signal.
 
 ## Verification gates
 

@@ -21,6 +21,7 @@ test("public A2A work completes through one private relay-backed Pi turn", async
 	const server = await startA2aRelayServer({
 		agentId: "resident-a",
 		queuePath: join(directory, "queue.json"),
+		originStorePath: join(directory, "origins.json"),
 		a2a: {
 			host: "127.0.0.1",
 			port: 0,

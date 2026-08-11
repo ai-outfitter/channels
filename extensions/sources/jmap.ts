@@ -9,6 +9,9 @@
  *
  * Tested shape: Stalwart's JMAP EventSource (RFC 8620 §7.3).
  */
+import { createHash } from "node:crypto";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { dirname, isAbsolute } from "node:path";
 import type { ChannelEvent, ChannelSource } from "./types.ts";
 import { RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
 
@@ -17,6 +20,7 @@ const log = scopedLog("jmap");
 /** The account has ~30s ping; treat a stream silent for this long as dead. */
 const IDLE_TIMEOUT_MS = 90_000;
 const MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
+const CORE_CAPABILITY = "urn:ietf:params:jmap:core";
 const CALENDARS_CAPABILITY = "urn:ietf:params:jmap:calendars";
 /**
  * The uid is the only event-derived text surfaced in the trusted wake summary,
@@ -39,6 +43,7 @@ export interface JmapConfig {
 	baseUrl: string;
 	user: string;
 	pass: string;
+	statePath?: string;
 }
 
 /** Build config from the mail skill's XIN_* env, or undefined if unset. */
@@ -47,7 +52,9 @@ export function jmapConfigFromEnv(): JmapConfig | undefined {
 	const user = process.env.XIN_BASIC_USER;
 	const pass = process.env.XIN_BASIC_PASS;
 	if (!baseUrl || !user || !pass) return undefined;
-	return { baseUrl: baseUrl.replace(/\/+$/, ""), user, pass };
+	const statePath = process.env.JMAP_STATE_PATH?.trim();
+	if (statePath && !isAbsolute(statePath)) throw new Error("JMAP_STATE_PATH must be absolute");
+	return { baseUrl: baseUrl.replace(/\/+$/, ""), user, pass, ...(statePath ? { statePath } : {}) };
 }
 
 export function createJmapSource(
@@ -58,12 +65,32 @@ export function createJmapSource(
 
 	return {
 		async start(onEvent) {
+			let cursor = cfg.statePath ? await readEmailCursor(cfg.statePath) : undefined;
 			return supervise(
 				async (signal) => {
 					const session = await fetchSession(cfg.baseUrl, auth, signal);
+					if (cursor?.accountId !== session.accountId) cursor = undefined;
+					if (session.apiUrl && !cursor) {
+						const state = await currentEmailState(session, auth, signal);
+						cursor = { accountId: session.accountId, state };
+						if (cfg.statePath) await writeEmailCursor(cfg.statePath, session.accountId, state);
+					}
 					log(`watching Email state and calendar alerts for account ${session.accountId}`);
-					await streamStateChanges(session, auth, signal, (wake) => {
-						onEvent({ channel: "jmap", ...wake });
+					await streamStateChanges(session, auth, signal, async (wake) => {
+						if (wake.emailState && session.apiUrl && cursor) {
+							const state = await reconcileEmailChanges(
+								session,
+								auth,
+								cursor.state,
+								wake.emailState,
+								signal,
+								onEvent,
+								cfg.statePath,
+							);
+							cursor = { accountId: session.accountId, state };
+							return;
+						}
+						await onEvent({ channel: "jmap", ...wake });
 					});
 				},
 				log,
@@ -74,7 +101,9 @@ export function createJmapSource(
 }
 
 /** A trusted wake signal: the summary plus an optional queue-coalescing key. */
-type JmapWake = Pick<ChannelEvent, "summary" | "dedupeKey">;
+interface JmapWake extends Pick<ChannelEvent, "summary" | "dedupeKey" | "work"> {
+	readonly emailState?: string;
+}
 
 /**
  * The accounts one connection accepts frames for. Calendar alerts may arrive on
@@ -92,6 +121,7 @@ interface JmapAccounts {
 interface JmapSession {
 	accountId: string;
 	alertAccountIds: ReadonlySet<string>;
+	apiUrl?: string;
 	/** Absolute EventSource URL for the given push `{types}` list. */
 	eventSourceUrlFor: (types: string) => string;
 }
@@ -108,6 +138,7 @@ async function fetchSession(
 	});
 	if (!res.ok) throw new Error(`session fetch ${res.status}`);
 	const body = (await res.json()) as {
+		apiUrl?: string;
 		eventSourceUrl?: string;
 		primaryAccounts?: Record<string, string>;
 		accounts?: Record<string, { accountCapabilities?: Record<string, unknown> }>;
@@ -147,14 +178,15 @@ async function fetchSession(
 			template.replace("{types}", types).replace("{closeafter}", "no").replace("{ping}", "30"),
 			sessionUrl,
 		).toString();
-	return { accountId, alertAccountIds, eventSourceUrlFor };
+	const apiUrl = body.apiUrl ? new URL(body.apiUrl, sessionUrl).toString() : undefined;
+	return { accountId, alertAccountIds, ...(apiUrl ? { apiUrl } : {}), eventSourceUrlFor };
 }
 
 async function streamStateChanges(
 	session: JmapSession,
 	auth: string,
 	parentSignal: AbortSignal,
-	onWake: (wake: JmapWake) => void,
+	onWake: (wake: JmapWake) => unknown,
 ): Promise<void> {
 	// A derived controller: aborts when the supervisor stops us OR when the
 	// stream goes idle past IDLE_TIMEOUT_MS (a half-open connection), which
@@ -230,11 +262,11 @@ async function streamStateChanges(
 				// Normalize CRLF on the whole buffer so a \r\n split across read
 				// boundaries can't hide an SSE frame separator.
 				buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
-				buffer = emitFrames(buffer, accounts, onWake);
+				buffer = await emitFrames(buffer, accounts, onWake);
 			}
 			// Flush a trailing complete frame the server sent right before EOF.
 			buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
-			if (buffer.trim()) emitFrame(buffer, accounts, onWake);
+			if (buffer.trim()) await emitFrame(buffer, accounts, onWake);
 		} finally {
 			await reader.cancel().catch(() => {});
 		}
@@ -245,22 +277,26 @@ async function streamStateChanges(
 }
 
 /** Consume every complete `\n\n`-terminated SSE frame; return the remainder. */
-function emitFrames(
+async function emitFrames(
 	buffer: string,
 	accounts: JmapAccounts,
-	onWake: (wake: JmapWake) => void,
-): string {
+	onWake: (wake: JmapWake) => unknown,
+): Promise<string> {
 	let rest = buffer;
 	let sep = rest.indexOf("\n\n");
 	while (sep !== -1) {
-		emitFrame(rest.slice(0, sep), accounts, onWake);
+		await emitFrame(rest.slice(0, sep), accounts, onWake);
 		rest = rest.slice(sep + 2);
 		sep = rest.indexOf("\n\n");
 	}
 	return rest;
 }
 
-function emitFrame(frame: string, accounts: JmapAccounts, onWake: (wake: JmapWake) => void): void {
+async function emitFrame(
+	frame: string,
+	accounts: JmapAccounts,
+	onWake: (wake: JmapWake) => unknown,
+): Promise<void> {
 	// Per SSE, the last `event:` line names the frame and `data:` lines rejoin
 	// with "\n".
 	let event: string | undefined;
@@ -284,10 +320,11 @@ function emitFrame(frame: string, accounts: JmapAccounts, onWake: (wake: JmapWak
 	// server that names the frame differently must still wake the agent.
 	if (isCalendarAlert(payload, event)) {
 		const wake = calendarAlertWake(payload, accounts);
-		if (wake) onWake(wake);
+		if (wake) await onWake(wake);
 		return;
 	}
-	if (isMailStateChange(payload, accounts.mailAccountId)) onWake({ summary: "new mail" });
+	const wake = mailStateChangeWake(payload, accounts.mailAccountId);
+	if (wake) await onWake(wake);
 }
 
 /**
@@ -327,7 +364,7 @@ function calendarAlertWake(
 	// must not reach the trusted wake summary — only the conservative charset
 	// passes; everything else gets the generic form.
 	if (typeof uid !== "string" || !CALENDAR_ALERT_UID_PATTERN.test(uid)) {
-		return { summary: "calendar alert", dedupeKey: "calendar-alert" };
+		return calendarWork(payload, accountId, "calendar alert", "calendar-alert");
 	}
 	// A recurring event can have two occurrences pending in one wake window;
 	// keying on the occurrence keeps them distinct. recurrenceId is
@@ -341,15 +378,276 @@ function calendarAlertWake(
 	// renders one line per *distinct summary*, so two occurrences of one uid that
 	// share a summary would collapse to a single line — spending two of the wake's
 	// bounded entries to say one thing, and pushing another channel's signal out.
+	const summary = recurrence ? `calendar alert: ${uid} (${recurrence})` : `calendar alert: ${uid}`;
+	const dedupeKey = recurrence ? `calendar-alert:${uid}#${recurrence}` : `calendar-alert:${uid}`;
+	return calendarWork(payload, accountId, summary, dedupeKey, uid);
+}
+
+function mailStateChangeWake(
+	payload: Record<string, unknown>,
+	accountId: string,
+): JmapWake | undefined {
+	if (payload["@type"] !== "StateChange") return undefined;
+	const changed = payload.changed as Record<string, Record<string, string>> | undefined;
+	const state = changed?.[accountId]?.Email;
+	if (typeof state !== "string" || state.length === 0 || state.length > 512) return undefined;
+	const id = digest(`${accountId}\0${state}`);
 	return {
-		summary: recurrence ? `calendar alert: ${uid} (${recurrence})` : `calendar alert: ${uid}`,
-		dedupeKey: recurrence ? `calendar-alert:${uid}#${recurrence}` : `calendar-alert:${uid}`,
+		summary: "new mail",
+		emailState: state,
+		work: {
+			providerEventId: `jmap-email:${id}`,
+			nativeLocator: { accountId, emailState: state },
+			receivedAt: new Date().toISOString(),
+			dedupeKey: `jmap-email:${id}`,
+			sourceSummary: "new mail",
+			parts: [{ data: { channel: "jmap", accountId, emailState: state } }],
+		},
 	};
 }
 
-/** A StateChange whose `changed[account]` includes the Email type means new/changed mail. */
-function isMailStateChange(payload: Record<string, unknown>, accountId: string): boolean {
-	if (payload["@type"] !== "StateChange") return false;
-	const changed = payload.changed as Record<string, Record<string, string>> | undefined;
-	return changed?.[accountId]?.Email != null;
+function calendarWork(
+	payload: Record<string, unknown>,
+	accountId: string,
+	summary: string,
+	dedupeKey: string,
+	uid?: string,
+): JmapWake {
+	const id = digest(JSON.stringify(payload));
+	const calendarEventId = structuralField(payload.calendarEventId);
+	const recurrenceId = structuralField(payload.recurrenceId);
+	const alertId = structuralField(payload.alertId);
+	return {
+		summary,
+		dedupeKey,
+		work: {
+			providerEventId: `jmap-calendar:${id}`,
+			nativeLocator: {
+				accountId,
+				eventDigest: id,
+				...(calendarEventId ? { calendarEventId } : {}),
+				...(uid ? { uid } : {}),
+				...(recurrenceId ? { recurrenceId } : {}),
+				...(alertId ? { alertId } : {}),
+			},
+			receivedAt: new Date().toISOString(),
+			dedupeKey: `jmap-calendar:${id}`,
+			sourceSummary: summary,
+			parts: [
+				{
+					data: {
+						channel: "jmap",
+						kind: "calendar-alert",
+						accountId,
+						eventDigest: id,
+						...(calendarEventId ? { calendarEventId } : {}),
+						...(uid ? { uid } : {}),
+						...(recurrenceId ? { recurrenceId } : {}),
+						...(alertId ? { alertId } : {}),
+					},
+				},
+			],
+		},
+	};
+}
+
+function structuralField(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 && value.length <= 1_024
+		? value
+		: undefined;
+}
+
+function digest(value: string): string {
+	return createHash("sha256").update(value).digest("hex").slice(0, 48);
+}
+
+interface EmailCursor {
+	readonly accountId: string;
+	readonly state: string;
+}
+
+interface JmapEmail {
+	readonly id: string;
+	readonly threadId?: string;
+	readonly receivedAt?: string;
+}
+
+async function currentEmailState(
+	session: JmapSession,
+	auth: string,
+	signal: AbortSignal,
+): Promise<string> {
+	const result = await jmapMethod(session, auth, signal, "Email/get", {
+		accountId: session.accountId,
+		ids: [],
+		properties: ["id"],
+	});
+	const state = result.state;
+	if (typeof state !== "string" || state.length === 0) {
+		throw new Error("Email/get returned no state");
+	}
+	return state;
+}
+
+async function reconcileEmailChanges(
+	session: JmapSession,
+	auth: string,
+	sinceState: string,
+	targetState: string,
+	signal: AbortSignal,
+	onEvent: (event: ChannelEvent) => unknown,
+	statePath: string | undefined,
+): Promise<string> {
+	let cursor = sinceState;
+	while (cursor !== targetState) {
+		const changes = await jmapMethod(session, auth, signal, "Email/changes", {
+			accountId: session.accountId,
+			sinceState: cursor,
+			maxChanges: 256,
+		});
+		if (!Array.isArray(changes.created) || typeof changes.newState !== "string") {
+			throw new Error("Email/changes returned an invalid result");
+		}
+		const ids = changes.created.filter((id): id is string => typeof id === "string");
+		if (ids.length > 0) await emitExactEmails(session, auth, signal, ids, onEvent);
+		cursor = changes.newState;
+		if (statePath) await writeEmailCursor(statePath, session.accountId, cursor);
+		if (changes.hasMoreChanges !== true) break;
+	}
+	return cursor;
+}
+
+async function emitExactEmails(
+	session: JmapSession,
+	auth: string,
+	signal: AbortSignal,
+	ids: readonly string[],
+	onEvent: (event: ChannelEvent) => unknown,
+): Promise<void> {
+	const fetched = await jmapMethod(session, auth, signal, "Email/get", {
+		accountId: session.accountId,
+		ids,
+		properties: ["id", "threadId", "receivedAt"],
+	});
+	if (!Array.isArray(fetched.list)) throw new Error("Email/get returned an invalid list");
+	for (const value of fetched.list) {
+		const email = validateJmapEmail(value);
+		if ((await onEvent(exactEmailEvent(session.accountId, email))) === false) {
+			throw new Error("the A2A source router rejected an exact email activation");
+		}
+	}
+}
+
+function exactEmailEvent(accountId: string, email: JmapEmail): ChannelEvent {
+	const id = digest(`${accountId}\0${email.id}`);
+	const receivedAt =
+		email.receivedAt && Number.isFinite(Date.parse(email.receivedAt))
+			? new Date(email.receivedAt).toISOString()
+			: new Date().toISOString();
+	return {
+		channel: "jmap",
+		summary: "new mail",
+		dedupeKey: `jmap-email:${id}`,
+		work: {
+			providerEventId: `jmap-email:${id}`,
+			nativeLocator: {
+				accountId,
+				emailId: email.id,
+				...(email.threadId ? { threadId: email.threadId } : {}),
+			},
+			receivedAt,
+			dedupeKey: `jmap-email:${id}`,
+			...(email.threadId
+				? { correlationKey: `jmap-email-thread:${digest(`${accountId}\0${email.threadId}`)}` }
+				: {}),
+			sourceSummary: "new mail",
+			parts: [{ data: { channel: "jmap", accountId, emailId: email.id } }],
+		},
+	};
+}
+
+function validateJmapEmail(value: unknown): JmapEmail {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Email/get returned an invalid email");
+	}
+	const email = value as Record<string, unknown>;
+	if (typeof email.id !== "string" || email.id.length === 0 || email.id.length > 1_024) {
+		throw new Error("Email/get returned an invalid email id");
+	}
+	return {
+		id: email.id,
+		...(typeof email.threadId === "string" && email.threadId.length <= 1_024
+			? { threadId: email.threadId }
+			: {}),
+		...(typeof email.receivedAt === "string" ? { receivedAt: email.receivedAt } : {}),
+	};
+}
+
+async function jmapMethod(
+	session: JmapSession,
+	auth: string,
+	signal: AbortSignal,
+	name: "Email/get" | "Email/changes",
+	arguments_: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	if (!session.apiUrl) throw new Error("JMAP session has no apiUrl");
+	const response = await fetch(session.apiUrl, {
+		method: "POST",
+		headers: {
+			Authorization: auth,
+			Accept: "application/json",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			using: [CORE_CAPABILITY, MAIL_CAPABILITY],
+			methodCalls: [[name, arguments_, "c0"]],
+		}),
+		signal,
+	});
+	if (!response.ok) throw new Error(`JMAP API returned HTTP ${response.status}`);
+	const body = (await response.json()) as { methodResponses?: unknown[] };
+	const method = body.methodResponses?.[0];
+	if (!Array.isArray(method) || method[0] !== name || method[2] !== "c0") {
+		throw new Error(`JMAP API returned no ${name} response`);
+	}
+	if (!method[1] || typeof method[1] !== "object" || Array.isArray(method[1])) {
+		throw new Error(`JMAP API returned an invalid ${name} response`);
+	}
+	return method[1] as Record<string, unknown>;
+}
+
+async function readEmailCursor(path: string): Promise<EmailCursor | undefined> {
+	try {
+		const value = JSON.parse(await readFile(path, "utf8")) as Partial<EmailCursor> & {
+			version?: number;
+		};
+		if (
+			value.version !== 1 ||
+			typeof value.accountId !== "string" ||
+			typeof value.state !== "string"
+		) {
+			throw new Error("JMAP email cursor is invalid");
+		}
+		return { accountId: value.accountId, state: value.state };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+async function writeEmailCursor(path: string, accountId: string, state: string): Promise<void> {
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const temporary = `${path}.${process.pid}.${digest(`${accountId}\0${state}`)}.tmp`;
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		handle = await open(temporary, "w", 0o600);
+		await handle.writeFile(`${JSON.stringify({ version: 1, accountId, state })}\n`, "utf8");
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		await rename(temporary, path);
+	} finally {
+		await handle?.close().catch(() => {});
+		await unlink(temporary).catch(() => {});
+	}
 }

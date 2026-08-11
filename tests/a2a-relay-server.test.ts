@@ -9,6 +9,11 @@ import {
 	type RunningA2aRelayServer,
 	startA2aRelayServer,
 } from "../extensions/a2a-relay/server.ts";
+import {
+	activationMetadata,
+	digestParts,
+	OUTFITTER_ORIGIN_EXTENSION_URI,
+} from "../extensions/origins/types.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 after(async () => {
@@ -21,6 +26,7 @@ async function config(): Promise<A2aRelayServerConfig> {
 	return {
 		agentId: "resident-a",
 		queuePath: join(directory, "queue.json"),
+		originStorePath: join(directory, "origins.json"),
 		a2a: {
 			host: "127.0.0.1",
 			port: 0,
@@ -189,4 +195,105 @@ test("relay restart recovers accepted offline work without minting another task"
 		page.tasks.map((task) => task.id),
 		[created.id],
 	);
+});
+
+test("Slack activations create and continue one task with authorized bidirectional trace", async () => {
+	const server = await startA2aRelayServer(await config());
+	cleanups.push(() => server.close());
+	const a2a = client(server);
+	const sendActivation = async (eventId: string, timestamp: string, text: string) => {
+		const parts = [{ text }];
+		const result = await a2a.sendMessage({
+			message: {
+				messageId: `message-${eventId}`,
+				role: "ROLE_USER",
+				parts,
+				extensions: [OUTFITTER_ORIGIN_EXTENSION_URI],
+				metadata: activationMetadata({
+					sourceKind: "slack",
+					providerEventId: eventId,
+					nativeLocator: {
+						workspace: "T123",
+						channel: "C123",
+						messageTs: timestamp,
+						threadTs: "1712345678.000100",
+					},
+					receivedAt: "2026-08-11T12:00:00.000Z",
+					dedupeKey: eventId,
+					contentDigest: digestParts(parts),
+					correlationKey: "slack:T123:C123:1712345678.000100",
+					sourceSummary: "Slack mention",
+					nativeUrl: "https://example.slack.com/archives/C123/p1712345678000100",
+				}),
+			},
+			configuration: { returnImmediately: true },
+		});
+		assert.ok("task" in result);
+		return result.task;
+	};
+
+	const first = await sendActivation("Ev-first", "1712345678.000100", "first request");
+	const second = await sendActivation("Ev-second", "1712345680.000200", "thread follow-up");
+	assert.equal(second.id, first.id);
+	assert.deepEqual(
+		second.history?.map((message) => message.parts[0]?.text),
+		["first request", "thread follow-up"],
+	);
+
+	const taskTraceResponse = await connector(server, `/v1/trace/tasks/${first.id}`, {
+		token: "caller-token",
+	});
+	assert.equal(taskTraceResponse.status, 200);
+	const taskTrace = (await taskTraceResponse.json()) as {
+		origins: Array<{
+			activation: { id: string; nativeLocator: { messageTs: string }; contentDigest: string };
+			origin: { relation: string };
+		}>;
+	};
+	assert.deepEqual(
+		taskTrace.origins.map((entry) => entry.origin.relation),
+		["created", "continued"],
+	);
+	assert.equal(taskTrace.origins[0]?.activation.nativeLocator.messageTs, "1712345678.000100");
+	assert.match(taskTrace.origins[0]?.activation.contentDigest ?? "", /^sha256:/);
+
+	const activationId = taskTrace.origins[0]?.activation.id as string;
+	const reverse = await connector(server, `/v1/trace/activations/${activationId}`, {
+		token: "caller-token",
+	});
+	assert.equal(reverse.status, 200);
+	assert.equal(
+		((await reverse.json()) as { origins: [{ task: { taskId: string } }] }).origins[0].task.taskId,
+		first.id,
+	);
+	assert.equal(
+		(await connector(server, `/v1/trace/tasks/${first.id}`, { token: "wrong-token" })).status,
+		401,
+	);
+	const delivery = await connector(server, `/v1/trace/tasks/${first.id}/delivery`, {
+		method: "POST",
+		token: "caller-token",
+		body: {
+			sourceKind: "slack",
+			providerEventId: "Ev-second",
+			state: "delivered",
+			attemptCount: 1,
+			responseId: "1712345681.000250",
+		},
+	});
+	assert.equal(delivery.status, 200);
+	const tracedDelivery = (await (
+		await connector(server, `/v1/trace/tasks/${first.id}`, { token: "caller-token" })
+	).json()) as {
+		origins: Array<{ activation: { providerEventId: string }; delivery?: { state: string } }>;
+	};
+	assert.equal(
+		tracedDelivery.origins.find((entry) => entry.activation.providerEventId === "Ev-second")
+			?.delivery?.state,
+		"delivered",
+	);
+
+	await a2a.cancelTask(first.id);
+	const afterTerminal = await sendActivation("Ev-third", "1712345682.000300", "new request");
+	assert.notEqual(afterTerminal.id, first.id);
 });

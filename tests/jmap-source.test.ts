@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import channelEventsExtension, { MAX_SIGNAL_ENTRIES_PER_WAKE } from "../extensions/index.ts";
 import { createJmapSource } from "../extensions/sources/jmap.ts";
@@ -34,6 +37,11 @@ function sessionResponse(url: string): Response {
 	});
 	Object.defineProperty(response, "url", { value: url });
 	return response;
+}
+
+function wakeShape(event: ChannelEvent) {
+	const { channel, summary, dedupeKey } = event;
+	return { channel, summary, ...(dedupeKey ? { dedupeKey } : {}) };
 }
 
 /** An SSE response streaming one chunk per entry of `chunks`, then ending. */
@@ -123,7 +131,7 @@ test("a uid outside the conservative charset falls back to the generic summary",
 		calendarAlert(ACCOUNT_ID, "task\n123"),
 		calendarAlert(ACCOUNT_ID, "x".repeat(500)),
 	]);
-	assert.deepEqual(events, [
+	assert.deepEqual(events.map(wakeShape), [
 		{ channel: "jmap", summary: "calendar alert", dedupeKey: "calendar-alert" },
 		{ channel: "jmap", summary: "calendar alert", dedupeKey: "calendar-alert" },
 	]);
@@ -135,6 +143,101 @@ test("an Email StateChange wakes regardless of the SSE event name", async () => 
 	assert.deepEqual(await summariesOf([`data: ${STATE_CHANGE}\n\n`]), ["new mail"]);
 	// The payload's @type/changed shape is the discriminator, not the frame name.
 	assert.deepEqual(await summariesOf([`event: ping\ndata: ${STATE_CHANGE}\n\n`]), ["new mail"]);
+});
+
+test("Email state changes reconcile to exact durable message activations", async () => {
+	const originalFetch = globalThis.fetch;
+	const directory = await mkdtemp(join(tmpdir(), "channels-jmap-cursor-"));
+	const statePath = join(directory, "email-state.json");
+	const apiCalls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) {
+			const response = Response.json({
+				apiUrl: "https://jmap.example/api",
+				eventSourceUrl:
+					"https://jmap.example/events?types={types}&closeafter={closeafter}&ping={ping}",
+				primaryAccounts: { "urn:ietf:params:jmap:mail": ACCOUNT_ID },
+			});
+			Object.defineProperty(response, "url", { value: url });
+			return response;
+		}
+		if (url === "https://jmap.example/api") {
+			const request = JSON.parse(String(init?.body)) as {
+				methodCalls: [[string, Record<string, unknown>, string]];
+			};
+			const [name, arguments_, callId] = request.methodCalls[0];
+			apiCalls.push({ name, arguments: arguments_ });
+			if (name === "Email/get" && Array.isArray(arguments_.ids) && arguments_.ids.length === 0) {
+				return Response.json({ methodResponses: [[name, { state: "state-1", list: [] }, callId]] });
+			}
+			if (name === "Email/changes") {
+				return Response.json({
+					methodResponses: [
+						[
+							name,
+							{
+								oldState: "state-1",
+								newState: "state-2",
+								hasMoreChanges: false,
+								created: ["email-1"],
+								updated: [],
+								destroyed: [],
+							},
+							callId,
+						],
+					],
+				});
+			}
+			return Response.json({
+				methodResponses: [
+					[
+						name,
+						{
+							state: "state-2",
+							list: [
+								{
+									id: "email-1",
+									threadId: "thread-1",
+									receivedAt: "2026-08-11T12:34:56Z",
+								},
+							],
+						},
+						callId,
+					],
+				],
+			});
+		}
+		return sseResponse([`event: state\ndata: ${STATE_CHANGE}\n\n`]);
+	}) as typeof fetch;
+
+	const events: ChannelEvent[] = [];
+	const stop = await createJmapSource({ ...CONFIG, statePath }).start((event) =>
+		events.push(event),
+	);
+	try {
+		await waitFor(() => events.some((event) => event.work?.nativeLocator.emailId === "email-1"));
+	} finally {
+		await stop();
+		globalThis.fetch = originalFetch;
+	}
+	const exact = events.find((event) => event.work?.nativeLocator.emailId === "email-1");
+	assert.deepEqual(exact?.work?.nativeLocator, {
+		accountId: ACCOUNT_ID,
+		emailId: "email-1",
+		threadId: "thread-1",
+	});
+	assert.equal(exact?.work?.receivedAt, "2026-08-11T12:34:56.000Z");
+	assert.deepEqual(
+		apiCalls.map((call) => call.name),
+		["Email/get", "Email/changes", "Email/get"],
+	);
+	assert.equal(apiCalls[1]?.arguments.sinceState, "state-1");
+	assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), {
+		version: 1,
+		accountId: ACCOUNT_ID,
+		state: "state-2",
+	});
 });
 
 test("a calendar alert wakes regardless of the SSE event name", async () => {
@@ -162,6 +265,31 @@ test("a calendar alert wakes regardless of the SSE event name", async () => {
 		]),
 		["calendar alert: task-123"],
 	);
+});
+
+test("a calendar activation preserves the exact occurrence locator and never correlates schedules", async () => {
+	const [event] = await streamEvents([
+		calendarAlert(ACCOUNT_ID, "task-123"),
+	]);
+	assert.deepEqual(event?.work?.nativeLocator, {
+		accountId: ACCOUNT_ID,
+		eventDigest: event.work.nativeLocator.eventDigest,
+		calendarEventId: "event-1",
+		uid: "task-123",
+		recurrenceId: RECURRENCE_ID,
+		alertId: "alert-1",
+	});
+	assert.equal(event?.work?.correlationKey, undefined);
+	assert.deepEqual(event?.work?.parts[0]?.data, {
+		channel: "jmap",
+		kind: "calendar-alert",
+		accountId: ACCOUNT_ID,
+		eventDigest: event.work.nativeLocator.eventDigest,
+		calendarEventId: "event-1",
+		uid: "task-123",
+		recurrenceId: RECURRENCE_ID,
+		alertId: "alert-1",
+	});
 });
 
 test("a mail StateChange is never routed to the alert path", async () => {
@@ -306,7 +434,7 @@ test("streams calendar-alert and mail events through the public fetch path", asy
 		`event: state\r\ndata: ${STATE_CHANGE}\r\n\r\n`,
 	]);
 
-	assert.deepEqual(events, [
+	assert.deepEqual(events.map(wakeShape), [
 		{ channel: "jmap", summary: "calendar alert: task-123", dedupeKey: "calendar-alert:task-123" },
 		{ channel: "jmap", summary: "calendar alert: task-456", dedupeKey: "calendar-alert:task-456" },
 		{ channel: "jmap", summary: "calendar alert: task-789", dedupeKey: "calendar-alert:task-789" },
@@ -625,7 +753,7 @@ test("the captured live-Stalwart alert frame wakes with its uid", async () => {
 		await stop();
 		globalThis.fetch = originalFetch;
 	}
-	assert.deepEqual(events[0], {
+	assert.deepEqual(wakeShape(events[0] as ChannelEvent), {
 		channel: "jmap",
 		summary: "calendar alert: vega-cron-probe-001",
 		dedupeKey: "calendar-alert:vega-cron-probe-001",

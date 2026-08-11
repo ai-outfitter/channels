@@ -176,6 +176,33 @@ export class A2aTaskStore {
 		});
 	}
 
+	/** Bind a held message claim to its task in one durable write. */
+	async bindClaimToTask(
+		principal: string,
+		message: A2aMessage,
+		selectedTaskId?: string,
+	): Promise<A2aTask> {
+		return this.#run(async () => {
+			const { claimIndex, claim } = this.#pendingClaim(principal, message);
+			const stored = this.#selectOrCreateTask(principal, message, selectedTaskId);
+
+			const task: A2aTask = {
+				...stored.task,
+				history: [
+					...(stored.task.history ?? []),
+					{ ...message, taskId: stored.task.id, contextId: stored.task.contextId },
+				].slice(-MAX_HISTORY_MESSAGES),
+			};
+			this.#data.tasks[task.id] = { task, principal, updatedAt: new Date().toISOString() };
+			this.#data.dedupe[claimIndex] = {
+				...claim,
+				outcome: { kind: "task", taskId: task.id },
+			};
+			await this.#persist();
+			return task;
+		});
+	}
+
 	/**
 	 * Fills in the claim this caller holds. It updates the claim rather than
 	 * appending: an append would leave the pending record in front of the real
@@ -271,6 +298,14 @@ export class A2aTaskStore {
 	 */
 	async lookup(taskId: string): Promise<StoredTask | undefined> {
 		return this.#run(async () => this.#data.tasks[taskId]);
+	}
+
+	/** Principal-scoped lookup that returns undefined for missing or foreign tasks. */
+	async lookupOwned(principal: string, taskId: string): Promise<A2aTask | undefined> {
+		return this.#run(async () => {
+			const stored = this.#data.tasks[taskId];
+			return stored?.principal === principal ? stored.task : undefined;
+		});
 	}
 
 	/**
@@ -394,6 +429,61 @@ export class A2aTaskStore {
 			throw new A2aError(404, "TASK_NOT_FOUND", `task "${taskId}" was not found`);
 		}
 		return stored;
+	}
+
+	#pendingClaim(
+		principal: string,
+		message: A2aMessage,
+	): { readonly claimIndex: number; readonly claim: DedupeRecord } {
+		const claimIndex = this.#data.dedupe.findIndex(
+			(entry) =>
+				entry.principal === principal &&
+				entry.messageId === message.messageId &&
+				entry.outcome.kind === "pending",
+		);
+		const claim = this.#data.dedupe[claimIndex];
+		if (!claim || claim.payloadHash !== hashPayload(message)) {
+			throw new A2aError(409, "DUPLICATE_MESSAGE_ID", "message claim is not available");
+		}
+		return { claimIndex, claim };
+	}
+
+	#selectOrCreateTask(
+		principal: string,
+		message: A2aMessage,
+		selectedTaskId: string | undefined,
+	): StoredTask {
+		if (!selectedTaskId) return this.#newTask(principal, message.contextId);
+		const stored = this.#owned(principal, selectedTaskId);
+		if (isTerminal(stored.task.status.state)) {
+			throw new A2aError(
+				400,
+				"UNSUPPORTED_OPERATION",
+				`task "${selectedTaskId}" is in terminal state ${stored.task.status.state} and cannot continue`,
+			);
+		}
+		if (message.contextId && message.contextId !== stored.task.contextId) {
+			throw new A2aError(400, "INVALID_ARGUMENT", "contextId does not match the task's context");
+		}
+		return stored;
+	}
+
+	#newTask(principal: string, requestedContextId: string | undefined): StoredTask {
+		const contextId =
+			requestedContextId && this.#principalOwnsContext(principal, requestedContextId)
+				? requestedContextId
+				: randomUUID();
+		return {
+			principal,
+			updatedAt: new Date().toISOString(),
+			task: {
+				id: randomUUID(),
+				contextId,
+				status: { state: "TASK_STATE_SUBMITTED", timestamp: new Date().toISOString() },
+				artifacts: [],
+				history: [],
+			},
+		};
 	}
 
 	#principalOwnsContext(principal: string, contextId: string): boolean {
