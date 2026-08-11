@@ -314,6 +314,11 @@ export function validateIdentifier(value: unknown, label: string): string {
 	return value;
 }
 
+/** Shared guard for stored timestamps: a string every store can round-trip through `Date`. */
+export function isTimestamp(value: unknown): value is string {
+	return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
 function validatePart(value: unknown): A2aPart {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new A2aError(400, "INVALID_ARGUMENT", "part must be an object");

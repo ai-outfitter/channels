@@ -6,12 +6,6 @@ import { activationFromMessage, type ChannelActivation, type TaskLocator } from 
 const ROUTER_ID = "channels-source-router";
 const ROUTER_VERSION = "1";
 
-export interface RoutedTask {
-	readonly controller: A2aTaskController;
-	readonly activation?: ChannelActivation;
-	readonly relation?: "created" | "continued";
-}
-
 /** Persists source evidence before selecting a new or correlated A2A Task. */
 export class OriginRouter {
 	readonly #store: OriginStore;
@@ -22,9 +16,9 @@ export class OriginRouter {
 		this.#agentInterface = agentInterface;
 	}
 
-	async route(context: A2aExecutorContext): Promise<RoutedTask> {
+	async route(context: A2aExecutorContext): Promise<A2aTaskController> {
 		const input = activationFromMessage(context.message);
-		if (!input) return { controller: await context.begin() };
+		if (!input) return await context.begin();
 		const activation = await this.#store.recordActivation(context.principal, input);
 		const selected = await this.#selectContinuation(context, activation);
 		const action = selected ? "continue" : "create";
@@ -39,11 +33,7 @@ export class OriginRouter {
 			selected ? "continued" : "created",
 			this.#locator(controller.task.id),
 		);
-		return {
-			controller,
-			activation,
-			relation: selected ? "continued" : "created",
-		};
+		return controller;
 	}
 
 	async #selectContinuation(context: A2aExecutorContext, activation: ChannelActivation) {

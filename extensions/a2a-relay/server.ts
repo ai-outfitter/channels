@@ -121,8 +121,8 @@ export async function startA2aRelayServer(
 	let a2a: RunningA2aServer;
 	try {
 		a2a = await startA2aServer(config.a2a, async (context) => {
-			const routed = await router.route(context);
-			await queue.enqueue(routed.controller.task.id, config.agentId);
+			const controller = await router.route(context);
+			await queue.enqueue(controller.task.id, config.agentId);
 			return undefined;
 		});
 	} catch (error) {

@@ -1,3 +1,5 @@
+import type { A2aPart } from "../a2a/types.ts";
+
 /**
  * A channel event-source turns a channel's native push stream (JMAP EventSource,
  * signal-cli daemon, Slack Socket Mode, …) into callbacks the extension can use to
@@ -58,7 +60,7 @@ export interface ChannelWork {
 	/** Direct provider link, when the source can derive one safely. */
 	nativeUrl?: string;
 	/** Exact untrusted A2A message parts for the task history. */
-	parts: readonly import("../a2a/types.ts").A2aPart[];
+	parts: readonly A2aPart[];
 }
 
 /** A channel-specific reference that lets a skill fetch the untrusted content. */

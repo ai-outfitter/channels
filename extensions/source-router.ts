@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { dirname, isAbsolute } from "node:path";
 import { A2aClient } from "./a2a/client.ts";
+import { validateBaseUrl } from "./a2a/http.ts";
 import type { A2aSendMessageRequest } from "./a2a/types.ts";
 import {
 	activationMetadata,
@@ -62,8 +63,9 @@ export interface RunningSourceRouter {
 /** Load one deployment-owned route. Native sources never select an agent URL. */
 export async function loadSourceRouter(path: string): Promise<RunningSourceRouter> {
 	if (!isAbsolute(path)) throw new Error("A2A_SOURCE_ROUTER_FILE must be an absolute path");
-	const stat = await import("node:fs/promises").then((fs) => fs.stat(path));
-	if (stat.size > MAX_CONFIG_BYTES) throw new Error("A2A source router file is too large");
+	if ((await stat(path)).size > MAX_CONFIG_BYTES) {
+		throw new Error("A2A source router file is too large");
+	}
 	const value = JSON.parse(await readFile(path, "utf8")) as SourceRouterDocument;
 	if (!value || typeof value !== "object") throw new Error("A2A source router file is invalid");
 	if (!isAbsolute(value.outboxPath)) throw new Error("A2A source outbox path must be absolute");
@@ -355,17 +357,8 @@ class HttpDeliveryReporter implements DeliveryReporter {
 }
 
 function secureBaseUrl(value: string): URL {
-	const url = new URL(value);
-	const loopback =
-		url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
-	if (url.protocol !== "https:" && !(loopback && url.protocol === "http:")) {
-		throw new Error("A2A traceUrl must use HTTPS outside loopback");
-	}
-	if (url.username || url.password || url.search || url.hash) {
-		throw new Error("A2A traceUrl must not contain credentials, a query, or a fragment");
-	}
-	url.pathname = `${url.pathname.replace(/\/+$/, "")}/`;
-	return url;
+	// The trace URL is deployment-owned, so loopback http: needs no separate opt-in.
+	return validateBaseUrl(value, { label: "A2A traceUrl", allowInsecureLoopback: true });
 }
 
 function hash(value: string): string {

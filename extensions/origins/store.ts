@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isTimestamp } from "../a2a/types.ts";
 import type {
 	ActivationTrace,
 	ChannelActivation,
@@ -388,7 +389,7 @@ function validateStoredActivation(activation: ChannelActivation): void {
 	if (
 		!id ||
 		!sourcePrincipal ||
-		!validDate(recordedAt) ||
+		!isTimestamp(recordedAt) ||
 		id !== activationId(sourcePrincipal, validated.sourceKind, validated.providerEventId)
 	) {
 		throw new Error("invalid stored activation");
@@ -405,7 +406,7 @@ function validateStoredDecision(
 		decision.activationId !== activationId ||
 		!activations[activationId] ||
 		!decision.id ||
-		!validDate(decision.decidedAt)
+		!isTimestamp(decision.decidedAt)
 	) {
 		throw new Error("invalid stored routing decision");
 	}
@@ -424,7 +425,7 @@ function validateStoredOrigin(
 		!activation ||
 		origin.sourcePrincipal !== activation.sourcePrincipal ||
 		(origin.relation !== "created" && origin.relation !== "continued") ||
-		!validDate(origin.recordedAt)
+		!isTimestamp(origin.recordedAt)
 	) {
 		throw new Error("invalid stored task origin");
 	}
@@ -442,12 +443,8 @@ function validateStoredDelivery(
 		!["pending", "delivered", "failed", "not-applicable"].includes(delivery.state) ||
 		!Number.isSafeInteger(delivery.attemptCount) ||
 		delivery.attemptCount < 0 ||
-		!validDate(delivery.updatedAt)
+		!isTimestamp(delivery.updatedAt)
 	) {
 		throw new Error("invalid stored native delivery state");
 	}
-}
-
-function validDate(value: unknown): value is string {
-	return typeof value === "string" && Number.isFinite(Date.parse(value));
 }

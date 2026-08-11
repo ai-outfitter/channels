@@ -207,7 +207,7 @@ interface PollState {
 interface PollDeps {
 	cfg: GithubConfig;
 	signal: AbortSignal;
-	onEvent: (event: import("./types.ts").ChannelEvent) => unknown;
+	onEvent: (event: ChannelEvent) => unknown;
 	request: Request_;
 }
 

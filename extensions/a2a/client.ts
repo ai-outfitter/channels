@@ -1,4 +1,12 @@
 import {
+	DEFAULT_TIMEOUT_MS,
+	pathIdentifier as encodePathIdentifier,
+	MAX_RESPONSE_BYTES,
+	parseJson as parseJsonBody,
+	readBoundedText as readBoundedBody,
+	validateBaseUrl,
+} from "./http.ts";
+import {
 	A2A_MEDIA_TYPE,
 	A2A_PROTOCOL_VERSION,
 	A2A_VERSION_HEADER,
@@ -9,9 +17,6 @@ import {
 	type A2aTask,
 	type A2aTaskState,
 } from "./types.ts";
-
-const MAX_RESPONSE_BYTES = 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface A2aClientConfig {
 	readonly baseUrl: string;
@@ -55,7 +60,10 @@ export class A2aClient {
 	readonly #fetch: typeof globalThis.fetch;
 
 	constructor(config: A2aClientConfig) {
-		this.#baseUrl = validateBaseUrl(config.baseUrl, config.allowInsecureLoopback ?? false);
+		this.#baseUrl = validateBaseUrl(config.baseUrl, {
+			label: "A2A baseUrl",
+			allowInsecureLoopback: config.allowInsecureLoopback ?? false,
+		});
 		if (!config.token.trim()) throw new Error("A2A bearer token is required");
 		this.#token = config.token;
 		this.#timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -178,33 +186,8 @@ export class A2aClient {
 	}
 }
 
-function validateBaseUrl(value: string, allowInsecureLoopback: boolean): URL {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new Error("A2A baseUrl must be an absolute URL");
-	}
-	if (url.username || url.password || url.search || url.hash) {
-		throw new Error("A2A baseUrl must not contain credentials, a query, or a fragment");
-	}
-	const loopback =
-		url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
-	if (
-		url.protocol !== "https:" &&
-		!(allowInsecureLoopback && loopback && url.protocol === "http:")
-	) {
-		throw new Error("A2A baseUrl must use HTTPS, except explicit loopback development");
-	}
-	url.pathname = `${url.pathname.replace(/\/+$/, "")}/`;
-	return url;
-}
-
 function pathIdentifier(value: string): string {
-	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
-		throw new Error("A2A task id is invalid");
-	}
-	return encodeURIComponent(value);
+	return encodePathIdentifier(value, "A2A task id");
 }
 
 function integer(value: number, label: string): string {
@@ -232,34 +215,13 @@ function consumeSseFrames(input: string, onEvent: (event: A2aStreamResponse) => 
 	}
 }
 
-async function readBoundedText(response: Response): Promise<string> {
-	if (!response.body) return "";
-	const reader = response.body.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		total += value.byteLength;
-		if (total > MAX_RESPONSE_BYTES) {
-			await reader.cancel();
-			throw new A2aRemoteError(502, "A2A response exceeded the response limit");
-		}
-		chunks.push(value);
-	}
-	const bytes = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		bytes.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return new TextDecoder().decode(bytes);
+function readBoundedText(response: Response): Promise<string> {
+	return readBoundedBody(
+		response,
+		() => new A2aRemoteError(502, "A2A response exceeded the response limit"),
+	);
 }
 
 function parseJson(text: string): unknown {
-	try {
-		return JSON.parse(text) as unknown;
-	} catch {
-		throw new A2aRemoteError(502, "A2A response was not valid JSON");
-	}
+	return parseJsonBody(text, () => new A2aRemoteError(502, "A2A response was not valid JSON"));
 }

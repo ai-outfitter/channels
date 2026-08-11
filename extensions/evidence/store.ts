@@ -116,9 +116,11 @@ export class DevelopmentEvidenceStore {
 					(value): value is EvidencePayloadReference => value !== undefined,
 				),
 			);
-			for (const reference of references) await this.#verifyPayload(reference);
+			// One record's request often is another's, so verify each payload once.
+			const distinct = new Map(references.map((reference) => [reference.digest, reference]));
+			await Promise.all([...distinct.values()].map((value) => this.#verifyPayload(value)));
 			const recordDigests = records.map((record) => digest(canonicalJson(record)));
-			const payloadDigests = [...new Set(references.map((reference) => reference.digest))];
+			const payloadDigests = [...distinct.keys()];
 			const request = await this.putPayload({ recordDigests, payloadDigests });
 			const record = await this.#appendUnlocked({
 				recordType: "run.manifest",

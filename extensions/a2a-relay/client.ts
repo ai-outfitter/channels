@@ -1,8 +1,12 @@
+import {
+	DEFAULT_TIMEOUT_MS,
+	parseJson as parseJsonBody,
+	pathIdentifier,
+	readBoundedText as readBoundedBody,
+	validateBaseUrl,
+} from "../a2a/http.ts";
 import type { A2aArtifact, A2aMessage, A2aTask, A2aTaskState } from "../a2a/types.ts";
 import type { A2aRelayDelivery } from "./store.ts";
-
-const MAX_RESPONSE_BYTES = 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface A2aRelayClientConfig {
 	readonly baseUrl: string;
@@ -36,7 +40,10 @@ export class A2aRelayClient {
 	readonly #fetch: typeof globalThis.fetch;
 
 	constructor(config: A2aRelayClientConfig) {
-		this.#baseUrl = validateBaseUrl(config.baseUrl, config.allowInsecureLoopback ?? false);
+		this.#baseUrl = validateBaseUrl(config.baseUrl, {
+			label: "A2A relay connector baseUrl",
+			allowInsecureLoopback: config.allowInsecureLoopback ?? false,
+		});
 		if (!config.token.trim()) throw new Error("A2A relay connector token is required");
 		this.#token = config.token;
 		this.#timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -129,66 +136,20 @@ export class A2aRelayClient {
 	}
 }
 
-function validateBaseUrl(value: string, allowInsecureLoopback: boolean): URL {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new Error("A2A relay connector baseUrl must be an absolute URL");
-	}
-	if (url.username || url.password || url.search || url.hash) {
-		throw new Error(
-			"A2A relay connector baseUrl must not contain credentials, a query, or a fragment",
-		);
-	}
-	const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
-	if (
-		url.protocol !== "https:" &&
-		!(allowInsecureLoopback && loopback && url.protocol === "http:")
-	) {
-		throw new Error(
-			"A2A relay connector baseUrl must use HTTPS, except explicit loopback development",
-		);
-	}
-	url.pathname = `${url.pathname.replace(/\/+$/, "")}/`;
-	return url;
-}
-
 function identifier(value: string): string {
-	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
-		throw new Error("A2A relay task or lease id is invalid");
-	}
-	return encodeURIComponent(value);
+	return pathIdentifier(value, "A2A relay task or lease id");
 }
 
-async function readBoundedText(response: Response): Promise<string> {
-	if (!response.body) return "";
-	const reader = response.body.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		total += value.byteLength;
-		if (total > MAX_RESPONSE_BYTES) {
-			await reader.cancel();
-			throw new A2aRelayConnectorError(502, "A2A relay response exceeded the response limit");
-		}
-		chunks.push(value);
-	}
-	const bytes = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		bytes.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return new TextDecoder().decode(bytes);
+function readBoundedText(response: Response): Promise<string> {
+	return readBoundedBody(
+		response,
+		() => new A2aRelayConnectorError(502, "A2A relay response exceeded the response limit"),
+	);
 }
 
 function parseJson(text: string): unknown {
-	try {
-		return JSON.parse(text) as unknown;
-	} catch {
-		throw new A2aRelayConnectorError(502, "A2A relay response was not valid JSON");
-	}
+	return parseJsonBody(
+		text,
+		() => new A2aRelayConnectorError(502, "A2A relay response was not valid JSON"),
+	);
 }

@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
-import { validateIdentifier } from "../a2a/types.ts";
+import { isTimestamp, validateIdentifier } from "../a2a/types.ts";
 
 const MAX_PENDING_PER_AGENT = 10_000;
+
+/** Queue order: oldest enqueue first, task id as the tiebreak. */
+function earlier(left: A2aRelayDelivery, right: A2aRelayDelivery): number {
+	return left.queuedAt.localeCompare(right.queuedAt) || left.taskId.localeCompare(right.taskId);
+}
 
 export interface A2aRelayLease {
 	readonly id: string;
@@ -88,13 +93,14 @@ export class A2aRelayStore {
 		return this.#run(async () => {
 			const allowed = new Set(agentIds.map((id) => validateIdentifier(id, "agent id")));
 			const workerId = validateIdentifier(worker, "worker id");
-			const delivery = Object.values(this.#data.deliveries)
-				.filter((candidate) => allowed.has(candidate.agentId))
-				.filter((candidate) => !candidate.lease || Date.parse(candidate.lease.expiresAt) <= now)
-				.sort(
-					(left, right) =>
-						left.queuedAt.localeCompare(right.queuedAt) || left.taskId.localeCompare(right.taskId),
-				)[0];
+			// One linear pass for the head of the queue: sorting up to MAX_PENDING_PER_AGENT
+			// deliveries on every poll is wasted work when only the minimum is used.
+			let delivery: A2aRelayDelivery | undefined;
+			for (const candidate of Object.values(this.#data.deliveries)) {
+				if (!allowed.has(candidate.agentId)) continue;
+				if (candidate.lease && Date.parse(candidate.lease.expiresAt) > now) continue;
+				if (!delivery || earlier(candidate, delivery) < 0) delivery = candidate;
+			}
 			if (!delivery) return undefined;
 			const claimed: A2aRelayDelivery = {
 				...delivery,
@@ -226,7 +232,7 @@ function parseDelivery(taskId: string, value: unknown): A2aRelayDelivery {
 	if (
 		record.taskId !== taskId ||
 		typeof record.agentId !== "string" ||
-		!validDate(record.queuedAt)
+		!isTimestamp(record.queuedAt)
 	) {
 		throw new Error("invalid A2A relay delivery");
 	}
@@ -248,7 +254,7 @@ function parseLease(value: unknown): A2aRelayLease {
 	if (
 		typeof record.id !== "string" ||
 		typeof record.worker !== "string" ||
-		!validDate(record.expiresAt)
+		!isTimestamp(record.expiresAt)
 	) {
 		throw new Error("invalid A2A relay lease");
 	}
@@ -257,8 +263,4 @@ function parseLease(value: unknown): A2aRelayLease {
 		worker: validateIdentifier(record.worker, "worker id"),
 		expiresAt: record.expiresAt,
 	};
-}
-
-function validDate(value: unknown): value is string {
-	return typeof value === "string" && Number.isFinite(Date.parse(value));
 }

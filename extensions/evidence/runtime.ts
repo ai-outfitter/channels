@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { A2aMessage, A2aTask } from "../a2a/types.ts";
 import { taskMetadataFromTask } from "../a2a/types.ts";
 import { DevelopmentEvidenceStore } from "./store.ts";
@@ -172,6 +173,62 @@ export class TaskEvidenceRuntime implements TaskEvidence {
 		if (!run) throw new Error(`task ${taskId} has no active evidence run`);
 		return run;
 	}
+}
+
+/** The evidence ledger and task a tool call should be recorded against, if any. */
+export interface EvidenceCapture {
+	readonly evidence: TaskEvidence;
+	readonly taskId: string;
+}
+
+/**
+ * Record every tool call and result of the active task in its evidence ledger.
+ * A capture failure blocks the call rather than letting the task proceed with an
+ * incomplete manifest. The extension's own `a2a_*` settlement tools are exempt:
+ * they close the task the ledger belongs to.
+ */
+export function registerEvidenceHooks(
+	pi: ExtensionAPI,
+	capture: () => EvidenceCapture | undefined,
+): void {
+	pi.on("tool_call", async (event) => {
+		const active = capture();
+		if (!active || event.toolName.startsWith("a2a_")) return;
+		try {
+			await active.evidence.beforeTool(
+				active.taskId,
+				event.toolCallId,
+				event.toolName,
+				event.input,
+			);
+			return undefined;
+		} catch (error) {
+			return {
+				block: true,
+				reason: `Required evidence capture failed: ${(error as Error).message}`,
+			};
+		}
+	});
+
+	pi.on("tool_result", async (event) => {
+		const active = capture();
+		if (!active || event.toolName.startsWith("a2a_")) return;
+		try {
+			await active.evidence.afterTool(active.taskId, event.toolCallId, event.toolName, {
+				content: event.content,
+				details: event.details,
+				isError: event.isError,
+			});
+			return undefined;
+		} catch (error) {
+			return {
+				isError: true,
+				content: [
+					{ type: "text", text: `Required evidence capture failed: ${(error as Error).message}` },
+				],
+			};
+		}
+	});
 }
 
 export async function loadEvidenceRuntime(path: string): Promise<TaskEvidenceRuntime> {
