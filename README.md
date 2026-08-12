@@ -72,6 +72,12 @@ Set `OUTFITTER_CHANNELS` in your shell before launching pi:
 Auto-detect enables a channel when its required environment variables are
 present.
 
+Channels also starts one durable local A2A task plane by default. Native Slack,
+GitHub, Chatto, and JMAP work enters that plane before it wakes the agent. State
+defaults under `$HOME/.channels/task-plane`. Set `OUTFITTER_CHANNELS=off` or
+`none` to disable both channel intake and the local plane. Only one Pi process
+MUST use a given task-plane directory at a time.
+
 ### Native agent session chat — `agent`
 
 The `agent` channel carries agent-to-agent and authorized operator-to-agent chat.

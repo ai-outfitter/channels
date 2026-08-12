@@ -24,6 +24,7 @@ import type { ExtensionAPI, MessageUpdateEvent } from "@earendil-works/pi-coding
 import { AgentSessionJournal } from "./agent/journal.ts";
 import { registerAgentTools } from "./agent-tools.ts";
 import { registerChannelTools } from "./channel-tools.ts";
+import { currentLocalTaskPlane } from "./local-task-plane.ts";
 import type { AgentChannelActions } from "./sources/agent.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "./sources/types.ts";
 import { parseList, scopedLog } from "./sources/util.ts";
@@ -197,7 +198,8 @@ export default function channelEventsExtension(
 	sources: Readonly<Record<string, SourceRegistration>> = SOURCES,
 ): void {
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
-	if (selection === "off" || selection === "none") return;
+	const normalizedSelection = selection?.toLowerCase();
+	if (normalizedSelection === "off" || normalizedSelection === "none") return;
 
 	// unset → auto-detect all; set (even to "") → exactly the listed channels,
 	// de-duplicated so a repeated name can't start a source twice.
@@ -230,7 +232,14 @@ export default function channelEventsExtension(
 				.loadActions(channel === "agent" ? agentJournal : undefined)
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" actions are not configured`);
-					return loaded;
+					return {
+						read: (locator: string) => loaded.read(locator),
+						async respond(locator: string, response: string) {
+							const result = await loaded.respond(locator, response);
+							await currentLocalTaskPlane()?.recordDelivery(channel, locator, result);
+							return result;
+						},
+					};
 				})
 				.catch((error) => {
 					actionCache.delete(channel);
@@ -301,8 +310,10 @@ export default function channelEventsExtension(
 		log(`waking agent for: ${[...new Set(events.map((event) => event.channel))].join(", ")}`);
 	};
 
-	const onEvent = (incoming: ChannelEvent): boolean => {
+	const onEvent = (incoming: ChannelEvent): boolean | Promise<boolean> => {
 		if (stopped) return false; // ignore late callbacks from a source torn down mid-flight
+		const plane = currentLocalTaskPlane();
+		if (incoming.work && plane) return plane.accept(incoming);
 		let event = incoming;
 		let key = channelEventKey(event);
 		// One channel's dedupe-keyed entries are bounded: a jmap alarm storm minting

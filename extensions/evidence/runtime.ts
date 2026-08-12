@@ -272,7 +272,7 @@ export async function defaultEvidenceRuntime(): Promise<TaskEvidenceRuntime> {
 				"tool.result": "optional",
 				"artifact.created": "required",
 			},
-			allowedTools: ["channel_read", "channel_respond", "mcp__*"],
+			allowedTools: ["channel_read", "channel_respond", "mcp", "mcp__*"],
 		},
 	});
 	await runtime.initialize();

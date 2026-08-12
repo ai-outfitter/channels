@@ -1,3 +1,5 @@
+import type { A2aPart } from "../a2a/types.ts";
+
 /**
  * A channel event-source turns a channel's native push stream (JMAP EventSource,
  * signal-cli daemon, Slack Socket Mode, …) into callbacks the extension can use to
@@ -37,6 +39,26 @@ export interface ChannelEvent {
 	 * and must never contain sender-controlled message content.
 	 */
 	locator?: ChannelLocator;
+	/** Exact, untrusted work submitted to the local A2A task plane. */
+	work?: ChannelWork;
+}
+
+/** Source-owned evidence and routing keys for one native provider event. */
+export interface ChannelWork {
+	/** Provider-stable event id. Redelivery MUST use the same value. */
+	providerEventId: string;
+	/** Provider-native structural fields. Values MUST NOT contain message bodies. */
+	nativeLocator: Readonly<Record<string, string>>;
+	/** Time at which this source received or reconciled the event. */
+	receivedAt: string;
+	/** Provider-stable idempotency key. */
+	dedupeKey: string;
+	/** Stable conversation key. Events with this key MAY continue one task. */
+	correlationKey?: string;
+	/** Direct provider link, when the source can derive one safely. */
+	nativeUrl?: string;
+	/** Exact untrusted A2A message parts for the task history. */
+	parts: readonly A2aPart[];
 }
 
 /** A channel-specific reference that lets a skill fetch the untrusted content. */

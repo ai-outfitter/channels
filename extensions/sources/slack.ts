@@ -98,28 +98,73 @@ export function slackActionsConfigFromEnv(): SlackActionsConfig | undefined {
 export function mentionEvent(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
+	metadata: {
+		readonly eventId?: string;
+		readonly teamId?: string;
+		readonly receivedAt?: string;
+	} = {},
 ): ChannelEvent | undefined {
-	if (!isRecord(raw)) return undefined;
-	if (raw.type !== "app_mention" || raw.subtype || raw.bot_id) return undefined;
+	const mention = validMention(raw, channelIds);
+	if (!mention) return undefined;
+	return slackChannelEvent(mention, metadata);
+}
+
+interface ValidSlackMention extends Record<string, unknown> {
+	readonly channel: string;
+	readonly ts: string;
+	readonly thread_ts?: string;
+}
+
+function validMention(
+	raw: unknown,
+	channelIds: ReadonlySet<string>,
+): ValidSlackMention | undefined {
+	if (!isRecord(raw) || raw.type !== "app_mention" || raw.subtype || raw.bot_id) return undefined;
 	if (typeof raw.channel !== "string" || !CHANNEL_ID.test(raw.channel)) return undefined;
 	if (typeof raw.ts !== "string" || !MESSAGE_TS.test(raw.ts)) return undefined;
 	if (channelIds.size > 0 && !channelIds.has(raw.channel)) return undefined;
-	if (
-		raw.thread_ts !== undefined &&
-		(typeof raw.thread_ts !== "string" || !MESSAGE_TS.test(raw.thread_ts))
-	) {
-		return undefined;
-	}
+	if (raw.thread_ts !== undefined && typeof raw.thread_ts !== "string") return undefined;
+	if (typeof raw.thread_ts === "string" && !MESSAGE_TS.test(raw.thread_ts)) return undefined;
+	return raw as ValidSlackMention;
+}
 
+function slackChannelEvent(
+	raw: ValidSlackMention,
+	metadata: {
+		readonly eventId?: string;
+		readonly teamId?: string;
+		readonly receivedAt?: string;
+	},
+): ChannelEvent {
+	const threadTs = raw.thread_ts ?? raw.ts;
+	const teamId = metadata.teamId && CHANNEL_ID.test(metadata.teamId) ? metadata.teamId : undefined;
+	const locator = encodeSlackLocator({
+		channel: raw.channel,
+		ts: raw.ts,
+		...(raw.thread_ts ? { thread_ts: raw.thread_ts } : {}),
+	});
+	const nativeLocator = {
+		...(teamId ? { workspaceId: teamId } : {}),
+		channelId: raw.channel,
+		messageTs: raw.ts,
+		threadTs,
+		channelLocator: locator,
+	};
+	const nativeUrl = teamId
+		? `https://app.slack.com/client/${teamId}/${raw.channel}/thread/${raw.channel}-${raw.ts}`
+		: undefined;
 	return {
 		channel: "slack",
 		summary: "new mention",
-		locator: {
-			key: encodeSlackLocator({
-				channel: raw.channel,
-				ts: raw.ts,
-				...(typeof raw.thread_ts === "string" ? { thread_ts: raw.thread_ts } : {}),
-			}),
+		locator: { key: locator },
+		work: {
+			providerEventId: metadata.eventId ?? `slack:${raw.channel}:${raw.ts}`,
+			nativeLocator,
+			receivedAt: metadata.receivedAt ?? new Date().toISOString(),
+			dedupeKey: `slack:${raw.channel}:${raw.ts}`,
+			correlationKey: `slack:${raw.channel}:${threadTs}`,
+			...(nativeUrl ? { nativeUrl } : {}),
+			parts: [{ data: { channel: "slack", locator } }],
 		},
 	};
 }
@@ -365,7 +410,7 @@ async function runSlackAttempt(
 	cfg: SlackConfig,
 	clients: SlackClientFactories,
 	signal: AbortSignal,
-	onEvent: (event: ChannelEvent) => void,
+	onEvent: (event: ChannelEvent) => unknown,
 ): Promise<void> {
 	const botUserId = await authenticateBot(clients.web(cfg.botToken));
 
@@ -374,7 +419,9 @@ async function runSlackAttempt(
 		log(`socket mode error: ${errorMessage(error)}`);
 	});
 	socket.on("slack_event", (payload) => {
-		void handleSlackEnvelope(payload, cfg.channelIds, onEvent);
+		void handleSlackEnvelope(payload, cfg.channelIds, onEvent).catch((error) => {
+			log(`Slack event delivery failed: ${errorMessage(error)}`);
+		});
 	});
 	try {
 		await socket.start();
@@ -398,7 +445,7 @@ function untilAborted(signal: AbortSignal): Promise<void> {
 async function handleSlackEnvelope(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
-	onEvent: (event: ChannelEvent) => void,
+	onEvent: (event: ChannelEvent) => unknown,
 ): Promise<void> {
 	if (!isRecord(raw)) return;
 	const envelope = raw as SlackEnvelope;
@@ -406,15 +453,26 @@ async function handleSlackEnvelope(
 		log("Slack envelope did not provide an acknowledgement callback");
 		return;
 	}
+	if (envelope.type !== "events_api" || !isRecord(envelope.body)) {
+		await envelope.ack();
+		return;
+	}
+	const body = envelope.body;
+	const receivedAt =
+		typeof body.event_time === "number"
+			? new Date(body.event_time * 1_000).toISOString()
+			: new Date().toISOString();
+	const event = mentionEvent(body.event, channelIds, {
+		...(typeof body.event_id === "string" ? { eventId: body.event_id } : {}),
+		...(typeof body.team_id === "string" ? { teamId: body.team_id } : {}),
+		receivedAt,
+	});
+	if (event && (await onEvent(event)) === false) return;
 	try {
 		await envelope.ack();
 	} catch (error) {
 		log(`failed to acknowledge Slack envelope: ${errorMessage(error)}`);
-		return;
 	}
-	if (envelope.type !== "events_api" || !isRecord(envelope.body)) return;
-	const event = mentionEvent(envelope.body.event, channelIds);
-	if (event) onEvent(event);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

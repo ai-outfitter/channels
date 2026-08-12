@@ -87,6 +87,10 @@ async function run(
 	return { events, calls: fetchStub.calls, stop, restore: fetchStub.restore };
 }
 
+function eventSummaries(events: readonly { channel: string; summary: string }[]) {
+	return events.map(({ channel, summary }) => ({ channel, summary }));
+}
+
 test("wakes on a review request and reports the reason, never the title", async () => {
 	const { events, stop, restore } = await run(config, {
 		[`${API}/user`]: { body: { login: "bot" } },
@@ -94,7 +98,7 @@ test("wakes on a review request and reports the reason, never the title", async 
 	});
 	await stop();
 	restore();
-	assert.deepEqual(events, [{ channel: "github", summary: "review_requested" }]);
+	assert.deepEqual(eventSummaries(events), [{ channel: "github", summary: "review_requested" }]);
 });
 
 test("splits the single `assign` reason on subject type", async () => {
@@ -115,7 +119,7 @@ test("splits the single `assign` reason on subject type", async () => {
 		// Every forge source must emit the same word for the same event, because
 		// the agent reads this string.
 		assert.deepEqual(
-			matching.events,
+			eventSummaries(matching.events),
 			[{ channel: "github", summary: filter }],
 			`${type} should match ${filter}`,
 		);
@@ -137,7 +141,7 @@ test("wakes the author of a pull request on activity they did not cause", async 
 	});
 	await stop();
 	restore();
-	assert.deepEqual(events, [{ channel: "github", summary: "author" }]);
+	assert.deepEqual(eventSummaries(events), [{ channel: "github", summary: "author" }]);
 });
 
 test("stays silent on reasons outside the filter set", async () => {
@@ -271,7 +275,7 @@ test("an identity-check failure does not stop the poller", async () => {
 	});
 	await stop();
 	restore();
-	assert.deepEqual(events, [{ channel: "github", summary: "review_requested" }]);
+	assert.deepEqual(eventSummaries(events), [{ channel: "github", summary: "review_requested" }]);
 });
 
 test("a filter name that can never match is reported, not silently kept", () => {
