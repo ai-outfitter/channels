@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ai-outfitter/channels/a2a-extensions/outfitter-artifact/v1",
+  "title": "outfitter-artifact/v1",
+  "description": "Digest and size metadata for an authenticated content-addressed A2A Artifact URL.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["digest", "byteSize"],
+  "properties": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "byteSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 33554432
+    }
+  }
+}

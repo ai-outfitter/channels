@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -10,7 +11,14 @@ import {
 	startA2aServer,
 } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
-import type { A2aSendMessageRequest, A2aTask } from "../extensions/a2a/types.ts";
+import {
+	A2aError,
+	type A2aSendMessageRequest,
+	type A2aTask,
+	MAX_MESSAGE_BYTES,
+	taskMetadataFromTask,
+	validateMessage,
+} from "../extensions/a2a/types.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 after(async () => {
@@ -26,6 +34,7 @@ async function launch(
 		host: "127.0.0.1",
 		port: 0,
 		storePath: join(directory, "store.json"),
+		artifactStorePath: join(directory, "artifacts"),
 		credentials: [
 			{ token: "token-a", principal: "alpha" },
 			{ token: "token-b", principal: "beta" },
@@ -34,6 +43,7 @@ async function launch(
 		agentDescription: "test agent",
 		publicUrl: "https://agent.test/a2a",
 		agentVersion: "0.0.1",
+		policyDigest: `sha256:${"a".repeat(64)}`,
 		blockingTimeoutMs: 2_000,
 		...overrides,
 	};
@@ -80,6 +90,7 @@ const completingExecutor: A2aExecutor = async (context) => {
 		name: "result",
 		parts: [{ text: "done" }],
 	});
+	await controller.evidence("evidence-record-1");
 	await controller.status("TASK_STATE_COMPLETED");
 	return undefined;
 };
@@ -103,6 +114,18 @@ describe("a2a task plane", () => {
 		const first = await send(server, "token-a", { message: userMessage("m-2", "do work") });
 		const firstBody = (await first.json()) as { task: A2aTask };
 		assert.equal(firstBody.task.status.state, "TASK_STATE_COMPLETED");
+		assert.deepEqual(taskMetadataFromTask(firstBody.task), {
+			ticketRunId: taskMetadataFromTask(firstBody.task).ticketRunId,
+			task: {
+				agentInterface: "https://agent.test/a2a",
+				protocolBinding: "HTTP+JSON",
+				protocolVersion: "1.0",
+				taskId: firstBody.task.id,
+			},
+			policyDigest: `sha256:${"a".repeat(64)}`,
+			evidence: ["evidence-record-1"],
+			idempotency: { messageId: "m-2", scope: "alpha" },
+		});
 		const duplicate = await send(server, "token-a", { message: userMessage("m-2", "do work") });
 		const duplicateBody = (await duplicate.json()) as { task: A2aTask };
 		assert.equal(duplicateBody.task.id, firstBody.task.id);
@@ -112,6 +135,36 @@ describe("a2a task plane", () => {
 		assert.equal(mismatched.status, 409);
 		const error = (await mismatched.json()) as { details: [{ reason: string }] };
 		assert.equal(error.details[0].reason, "DUPLICATE_MESSAGE_ID");
+	});
+
+	it("a duplicate message is rejected while the first execution is still in progress", async () => {
+		let entered: () => void = () => {};
+		const executing = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let executions = 0;
+		const server = await launch(async (context) => {
+			executions += 1;
+			entered();
+			await gate;
+			const controller = await context.begin();
+			await controller.status("TASK_STATE_COMPLETED");
+			return undefined;
+		});
+		const request = { message: userMessage("m-in-progress", "do this once") };
+		const first = send(server, "token-a", request);
+		await executing;
+		const duplicate = await send(server, "token-a", request);
+		assert.equal(duplicate.status, 409);
+		const error = (await duplicate.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "DUPLICATE_MESSAGE_IN_PROGRESS");
+		assert.equal(executions, 1);
+		release();
+		assert.equal((await first).status, 200);
 	});
 
 	it("a blocking send waits for a settled task; return_immediately returns the submitted task", async () => {
@@ -264,6 +317,30 @@ describe("a2a task plane", () => {
 		assert.equal(snapshot.history?.length, 2);
 	});
 
+	it("a trusted executor can route a new message into an owned non-terminal task", async () => {
+		let routedTaskId: string | undefined;
+		const routingExecutor: A2aExecutor = async (context) => {
+			const controller = await context.begin(routedTaskId);
+			routedTaskId ??= controller.task.id;
+			await controller.status("TASK_STATE_INPUT_REQUIRED");
+			return undefined;
+		};
+		const server = await launch(routingExecutor);
+		const first = await send(server, "token-a", {
+			message: userMessage("m-routed-1", "first activation"),
+		});
+		const firstTask = ((await first.json()) as { task: A2aTask }).task;
+		const second = await send(server, "token-a", {
+			message: userMessage("m-routed-2", "thread continuation"),
+		});
+		const secondTask = ((await second.json()) as { task: A2aTask }).task;
+		assert.equal(secondTask.id, firstTask.id);
+		assert.deepEqual(
+			secondTask.history?.map((message) => message.messageId),
+			["m-routed-1", "m-routed-2"],
+		);
+	});
+
 	it("continuing a terminal task fails, requests without a bearer token fail, and push-notification routes are explicitly unsupported", async () => {
 		const server = await launch(completingExecutor);
 		const created = await send(server, "token-a", { message: userMessage("m-13", "work") });
@@ -288,15 +365,71 @@ describe("a2a task plane", () => {
 			capabilities: {
 				streaming: boolean;
 				pushNotifications: boolean;
-				extensions: [{ uri: string }];
+				extensions: Array<{ uri: string }>;
 			};
 			supportedInterfaces: [{ protocolBinding: string; protocolVersion: string }];
 		};
 		assert.equal(card.capabilities.streaming, true);
 		assert.equal(card.capabilities.pushNotifications, false);
-		assert.match(card.capabilities.extensions[0].uri, /outfitter-task\/v1$/);
+		assert.match(card.capabilities.extensions[0]?.uri ?? "", /outfitter-task\/v1$/);
+		assert.match(card.capabilities.extensions[1]?.uri ?? "", /outfitter-artifact\/v1$/);
 		assert.equal(card.supportedInterfaces[0].protocolBinding, "HTTP+JSON");
 		assert.equal(card.supportedInterfaces[0].protocolVersion, "1.0");
+	});
+
+	it("large artifacts use authenticated digest-bound URLs", async () => {
+		const server = await launch(completingExecutor);
+		const bytes = Buffer.alloc(300_000, 0x5a);
+		const uploaded = await fetch(`${server.url}/artifacts`, {
+			method: "POST",
+			headers: {
+				authorization: "Bearer token-a",
+				"content-type": "application/a2a+json",
+			},
+			body: JSON.stringify({
+				raw: bytes.toString("base64"),
+				mediaType: "application/octet-stream",
+				filename: "large.bin",
+			}),
+		});
+		assert.equal(uploaded.status, 201);
+		const artifact = (await uploaded.json()) as {
+			artifact: {
+				extensions: string[];
+				parts: [{ url: string; metadata: { "outfitter-artifact/v1": { digest: string } } }];
+			};
+		};
+		const digest = artifact.artifact.parts[0].metadata["outfitter-artifact/v1"].digest;
+		assert.match(digest, /^sha256:[0-9a-f]{64}$/);
+		assert.match(artifact.artifact.parts[0].url, new RegExp(digest.slice(7)));
+		const path = `/artifacts/${digest.slice(7)}`;
+		assert.equal((await fetch(`${server.url}${path}`)).status, 401);
+		const downloaded = await fetch(`${server.url}${path}`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		assert.equal(downloaded.status, 200);
+		assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), bytes);
+	});
+
+	it("malformed artifact base64 is an invalid client argument", async () => {
+		const server = await launch(completingExecutor);
+		const response = await fetch(`${server.url}/artifacts`, {
+			method: "POST",
+			headers: {
+				authorization: "Bearer token-a",
+				"content-type": "application/a2a+json",
+			},
+			body: JSON.stringify({ raw: "!!!!", mediaType: "application/octet-stream" }),
+		});
+		assert.equal(response.status, 400);
+		const body = (await response.json()) as { details: [{ reason: string }] };
+		assert.equal(body.details[0].reason, "INVALID_ARGUMENT");
+	});
+
+	it("message size limits count UTF-8 bytes", () => {
+		const message = userMessage("multibyte-message", "界".repeat(MAX_MESSAGE_BYTES / 2));
+		assert.ok(JSON.stringify(message).length < MAX_MESSAGE_BYTES);
+		assert.throws(() => validateMessage(message, "ROLE_USER"), /message exceeds/);
 	});
 
 	it("listTasks filters by contextId and status within the authenticated principal", async () => {
@@ -395,13 +528,272 @@ describe("a2a task plane", () => {
 		const path = join(directory, "store.json");
 		const first = new A2aTaskStore(path);
 		const task = await first.createTask("alpha", undefined);
+		const unfinished = await first.createTask("alpha", undefined);
+		await first.updateStatus("alpha", unfinished.id, { state: "TASK_STATE_WORKING" });
 		await first.updateStatus("alpha", task.id, { state: "TASK_STATE_COMPLETED" });
 		const message = userMessage("m-17", "persisted");
 		await first.recordOutcome("alpha", message, { kind: "task", taskId: task.id });
 		const second = new A2aTaskStore(path);
 		const reloaded = await second.getTask("alpha", task.id);
 		assert.equal(reloaded.status.state, "TASK_STATE_COMPLETED");
-		const prior = await second.priorOutcome("alpha", message);
-		assert.deepEqual(prior, { kind: "task", taskId: task.id });
+		const prior = await second.claimOutcome("alpha", message);
+		assert.deepEqual(prior, { kind: "replay", outcome: { kind: "task", taskId: task.id } });
+		const recoverable = await second.listRecoverable();
+		assert.deepEqual(
+			recoverable.map((entry) => entry.task.id),
+			[unfinished.id],
+		);
+	});
+
+	it("task binding and its dedupe outcome survive one atomic restart boundary", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-bind-test-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const path = join(directory, "store.json");
+		const message = userMessage("m-bound-before-crash", "persist this work");
+		const first = new A2aTaskStore(path);
+		assert.deepEqual(await first.claimOutcome("alpha", message), { kind: "claimed" });
+		const task = await first.bindClaimToTask("alpha", message);
+		first.close();
+
+		const second = new A2aTaskStore(path);
+		assert.deepEqual(await second.claimOutcome("alpha", message), {
+			kind: "replay",
+			outcome: { kind: "task", taskId: task.id },
+		});
+		assert.deepEqual(
+			(await second.listTasks("alpha", {})).tasks.map((entry) => entry.id),
+			[task.id],
+		);
+	});
+
+	it("dedupe retention does not evict a live task record at the former size cap", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-dedupe-cap-test-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const path = join(directory, "store.json");
+		const createdAt = new Date().toISOString();
+		const firstMessage = userMessage("m-retained-task", "retained");
+		const task: A2aTask = {
+			id: "task-retained",
+			contextId: "context-retained",
+			status: { state: "TASK_STATE_WORKING", timestamp: createdAt },
+			artifacts: [],
+			history: [firstMessage],
+		};
+		const hash = (message: ReturnType<typeof userMessage>): string =>
+			createHash("sha256")
+				.update(
+					JSON.stringify({
+						contextId: "",
+						taskId: "",
+						role: message.role,
+						parts: message.parts,
+						referenceTaskIds: [],
+					}),
+				)
+				.digest("hex");
+		const directMessage = userMessage("direct-result", "done");
+		const dedupe = [
+			{
+				principal: "alpha",
+				messageId: firstMessage.messageId,
+				payloadHash: hash(firstMessage),
+				createdAt,
+				outcome: { kind: "task", taskId: task.id },
+			},
+			...Array.from({ length: 9_999 }, (_, index) => {
+				const message = userMessage(`m-retained-${index}`, "same payload");
+				return {
+					principal: "alpha",
+					messageId: message.messageId,
+					payloadHash: hash(message),
+					createdAt,
+					outcome: { kind: "message", message: directMessage },
+				};
+			}),
+		];
+		await writeFile(
+			path,
+			`${JSON.stringify({
+				version: 1,
+				tasks: { [task.id]: { task, principal: "alpha", updatedAt: createdAt } },
+				dedupe,
+			})}\n`,
+		);
+		const store = new A2aTaskStore(path);
+		assert.deepEqual(await store.claimOutcome("alpha", userMessage("m-over-cap", "new")), {
+			kind: "claimed",
+		});
+		assert.deepEqual(await store.claimOutcome("alpha", firstMessage), {
+			kind: "replay",
+			outcome: { kind: "task", taskId: task.id },
+		});
+		store.close();
+	});
+
+	it("a closed store refuses further operations instead of rebuilding itself", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-close-test-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const store = new A2aTaskStore(join(directory, "store.json"));
+		await store.initialize();
+		store.close();
+		await assert.rejects(() => store.createTask("alpha", undefined), /store is closed/);
+	});
+
+	it("a stream request that fails before the stream opens returns an HTTP error, not an empty 200 stream", async () => {
+		const server = await launch(completingExecutor);
+		const stream = (text: string): Promise<Response> =>
+			fetch(`${server.url}/message:stream`, {
+				method: "POST",
+				headers: { authorization: "Bearer token-a", "content-type": "application/a2a+json" },
+				body: JSON.stringify({ message: userMessage("m-stream-dup", text) }),
+			});
+		const first = await stream("original");
+		assert.equal(first.status, 200);
+		await first.body?.cancel();
+		const mismatched = await stream("different payload");
+		assert.equal(mismatched.status, 409);
+		assert.doesNotMatch(mismatched.headers.get("content-type") ?? "", /text\/event-stream/);
+		const error = (await mismatched.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "DUPLICATE_MESSAGE_ID");
+	});
+
+	it("GET /tasks pages through every task exactly once", async () => {
+		const server = await launch(completingExecutor);
+		const created = new Set<string>();
+		for (let index = 0; index < 7; index += 1) {
+			const response = await send(server, "token-a", {
+				message: userMessage(`m-page-${index}`, `work ${index}`),
+			});
+			created.add(((await response.json()) as { task: A2aTask }).task.id);
+		}
+		const seen: string[] = [];
+		let token = "";
+		let pages = 0;
+		do {
+			const query = `pageSize=3${token ? `&pageToken=${encodeURIComponent(token)}` : ""}`;
+			const response = await fetch(`${server.url}/tasks?${query}`, {
+				headers: { authorization: "Bearer token-a" },
+			});
+			assert.equal(response.status, 200);
+			const body = (await response.json()) as { tasks: A2aTask[]; nextPageToken: string };
+			assert.ok(body.tasks.length <= 3);
+			for (const task of body.tasks) seen.push(task.id);
+			token = body.nextPageToken;
+			pages += 1;
+			assert.ok(pages < 10, "pagination did not terminate");
+		} while (token);
+		assert.equal(seen.length, created.size);
+		assert.deepEqual(new Set(seen), created);
+	});
+
+	it("a page token the server did not mint is a clean 400", async () => {
+		const server = await launch(completingExecutor);
+		const response = await fetch(`${server.url}/tasks?pageToken=not-a-cursor`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		assert.equal(response.status, 400);
+		const error = (await response.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "INVALID_ARGUMENT");
+	});
+
+	it("a principal the store cannot parse back is refused at startup, not on the next restart", async () => {
+		await assert.rejects(
+			() =>
+				launch(directExecutor, { credentials: [{ token: "t", principal: "nick@example.com" }] }),
+			/principal must match/,
+		);
+	});
+
+	it("two credentials sharing a token are refused at startup", async () => {
+		await assert.rejects(
+			() =>
+				launch(directExecutor, {
+					credentials: [
+						{ token: "same", principal: "alpha" },
+						{ token: "same", principal: "beta" },
+					],
+				}),
+			/tokens must be unique/,
+		);
+	});
+
+	it("concurrent sends of one messageId mint exactly one task", async () => {
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let begins = 0;
+		const gatedExecutor: A2aExecutor = async (context) => {
+			const controller = await context.begin();
+			begins += 1;
+			await gate;
+			await controller.status("TASK_STATE_COMPLETED");
+			return undefined;
+		};
+		const server = await launch(gatedExecutor);
+		const request: A2aSendMessageRequest = {
+			message: userMessage("m-concurrent", "once only"),
+			configuration: { returnImmediately: true },
+		};
+		const first = send(server, "token-a", request);
+		while (begins === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+		// begin() binds the claim and task in one store operation. The second
+		// send can replay that durable task while the first executor is gated.
+		const secondResponse = await send(server, "token-a", request);
+		const secondTask = ((await secondResponse.json()) as { task: A2aTask }).task;
+		release();
+		const firstResponse = await first;
+		const firstTask = ((await firstResponse.json()) as { task: A2aTask }).task;
+		assert.equal(firstResponse.status, 200);
+		assert.equal(secondResponse.status, 200);
+		assert.equal(secondTask.id, firstTask.id);
+		assert.equal(begins, 1);
+		const listed = await fetch(`${server.url}/tasks`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		const body = (await listed.json()) as { tasks: A2aTask[] };
+		assert.equal(body.tasks.length, 1);
+	});
+
+	it("an executor that throws after begin() settles the task and records it for the retry", async () => {
+		let attempts = 0;
+		const failingExecutor: A2aExecutor = async (context) => {
+			attempts += 1;
+			await context.begin();
+			throw new A2aError(400, "INVALID_ARGUMENT", "the executor refused this work");
+		};
+		const server = await launch(failingExecutor);
+		const first = await send(server, "token-a", { message: userMessage("m-boom", "explode") });
+		assert.equal(first.status, 400);
+		const listed = await fetch(`${server.url}/tasks`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		const tasks = ((await listed.json()) as { tasks: A2aTask[] }).tasks;
+		assert.equal(tasks.length, 1);
+		assert.equal((tasks[0] as A2aTask).status.state, "TASK_STATE_FAILED");
+		// The retry replays the recorded failure instead of minting a second task.
+		const retry = await send(server, "token-a", { message: userMessage("m-boom", "explode") });
+		assert.equal(retry.status, 200);
+		const retryBody = (await retry.json()) as { task: A2aTask };
+		assert.equal(retryBody.task.id, (tasks[0] as A2aTask).id);
+		assert.equal(retryBody.task.status.state, "TASK_STATE_FAILED");
+		assert.equal(attempts, 1);
+	});
+
+	it("a send that fails before any task exists releases the key for a retry", async () => {
+		let attempts = 0;
+		const lateExecutor: A2aExecutor = async (context) => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("transient failure before begin()");
+			const controller = await context.begin();
+			await controller.status("TASK_STATE_COMPLETED");
+			return undefined;
+		};
+		const server = await launch(lateExecutor);
+		const first = await send(server, "token-a", { message: userMessage("m-retry", "try me") });
+		assert.equal(first.status, 500);
+		const second = await send(server, "token-a", { message: userMessage("m-retry", "try me") });
+		assert.equal(second.status, 200);
+		assert.equal(attempts, 2);
 	});
 });
