@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/ai-outfitter/channels/compare/v1.6.1...v1.7.0) (2026-08-13)
+
+
+### Features
+
+* triage issues with an agent resolved from the catalog ([#45](https://github.com/ai-outfitter/channels/issues/45)) ([fa0fe60](https://github.com/ai-outfitter/channels/commit/fa0fe608d323cd0864c806fa012c91087d4d77da))
+
+
+### Bug Fixes
+
+* track the action's v1 tag instead of a commit ([#48](https://github.com/ai-outfitter/channels/issues/48)) ([ea3f861](https://github.com/ai-outfitter/channels/commit/ea3f861146e66544bd74edd24195d75168a07931))
+
 ## [1.6.1](https://github.com/ai-outfitter/channels/compare/v1.6.0...v1.6.1) (2026-08-08)
 
 
