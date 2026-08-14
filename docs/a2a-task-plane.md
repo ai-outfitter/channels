@@ -2,11 +2,12 @@
 
 Channels adopts [A2A v1](https://github.com/a2aproject/A2A) as its common
 task protocol ([RFC #35](https://github.com/ai-outfitter/channels/issues/35)).
-This module is the first contract commit: the HTTP+JSON server binding, the
-durable task store, the mandatory idempotency rule, the Outfitter task
-extension, and the resident-agent bridge. Native adapters (Slack, GitHub,
-Chatto, JMAP) keep their own event intake and result delivery; wiring them
-through this plane is later work under the RFC.
+This module is the first contract commit. It defines the HTTP+JSON server
+binding and the durable task store. It also defines the mandatory idempotency
+rule, the Outfitter task extension, and the resident-agent bridge. Native
+adapters keep their own event intake and result delivery. The
+[source conformance matrix](./a2a-source-conformance.md) defines their
+source-specific contracts.
 
 ## Pinned protocol source
 
@@ -45,18 +46,94 @@ Version negotiation: an `A2A-Version` header other than `1.0` fails
 explicitly with `VERSION_NOT_SUPPORTED`. Authentication is bearer-token; each
 token maps to a principal, and every task and dedupe record is scoped to it.
 
+## Task and conversation semantics
+
+This section states the target contract for the task-plane milestone. The
+current store holds only tasks and dedupe records; the context and
+reply-anchor mappings below do not exist yet.
+
+Message versus Task is the executor's decision. Work mints a Task. A simple
+interaction returns a direct A2A Message and no Task ever exists. For an
+activation that mints a Task, the rules below apply.
+
+Each provider event that is not a continuation creates exactly one new
+Task. An event is a continuation only through the two methods below. Separate
+events in one conversation create separate Tasks in the same A2A
+`contextId`.
+
+Channels stores this atomic mapping:
+
+```text
+(principal, source, conversationKey) -> contextId
+```
+
+The `conversationKey` is the source's Conversation fields from the
+[source conformance matrix](./a2a-source-conformance.md).
+
+Channels keeps this mapping for 30 days after the last provider event in
+the conversation, and never removes it while a non-terminal Task references
+its `contextId`. Concurrent
+first messages use one atomic upsert. They receive the same `contextId`.
+
+The trusted task-plane interface creates a new Task in an existing context
+(`createTask(principal, contextId)`). A conversation key
+never selects a Task. A thread identifier never continues a Task.
+
+A provider reply continues a Task only through one of these methods:
+
+- A verified reply anchor selects the Task.
+- An authorized client supplies an explicit `taskId`.
+
+An explicit `taskId` is authorized under the same convention as `contextId`:
+it attaches only when the requesting principal already owns the Task. An
+explicit `taskId` arrives only over the trusted task-plane interface or the
+authenticated A2A binding. Channels never parses a `taskId` out of a provider
+message body — sender-controlled values remain untrusted.
+
+A verified reply anchor requires all these conditions:
+
+1. The Task has the `INPUT_REQUIRED` or `AUTH_REQUIRED` state.
+2. Channels sent a provider response for that Task.
+3. Channels stored the provider response ID as a reply anchor.
+4. The new event directly replies to that anchor.
+5. The event's authenticated intake principal matches the anchor's
+   principal. The anchor-key scope enforces this condition.
+6. The Task records an unanswered input request.
+
+If any condition fails, the event creates a new Task in the conversation's
+context — the same disposition as a normal thread message. Anchor failure is
+never a rejection; only an unauthorized explicit `taskId` fails explicitly.
+
+Channels stores this reply-anchor mapping:
+
+```text
+(principal, source, providerResponseId) -> taskId
+```
+
+A source supports reply anchors only where the provider exposes a per-message
+reply relation to the response Channels sent. A thread-root identifier does
+not satisfy condition 4. The
+[source conformance matrix](./a2a-source-conformance.md) records per-source
+support in its Continuation column. Only an authorized explicit `taskId`
+continues a Task from a source without reply-anchor support.
+
+Channels accepts an item when its Task, wake, and evidence record are
+durably committed. A source may advance its checkpoint or acknowledge the
+provider only after acceptance.
+
+Task creation grants no authority. An inbound message does not select an
+agent, a tool set, or a workflow topology.
+
 ## Contract decisions
 
-- **Message versus Task is the executor's decision.** A simple interaction
-  returns a direct A2A Message and no Task ever exists; work mints a Task.
-  Task creation grants no authority — nothing in an inbound message selects
-  an agent, tool set, or workflow topology.
 - **Idempotency is mandatory and stronger than the A2A minimum.** Scope:
   `(authenticated principal, messageId)`. Stored outcome: the full prior
   result — the created Task (a duplicate returns that Task) or the direct
   Message verbatim. Retention: 30 days, never shorter than the referenced
   task's life. A duplicate `messageId` with a different payload is an
-  explicit `409 DUPLICATE_MESSAGE_ID`, never a silent replay.
+  explicit `409 DUPLICATE_MESSAGE_ID`, never a silent replay. For native
+  intake, the source's Event identity fields from the conformance matrix,
+  scoped to the intake principal, serve as the `messageId` for this rule.
 - **Recovery uses durable state.** Streams are ephemeral; the durable Task —
   status, history, artifacts — is the record. A reconnecting client reads
   the Task, then opens a new subscription; nothing replays.
@@ -96,16 +173,32 @@ the task with three tools:
 - `a2a_complete_task` — record the response as an artifact and complete, or
   reject with a reason.
 - `a2a_require_input` — pause the task on the caller with a question; the
-  task enters `input-required` and the caller's answer arrives as a new wake
-  on the same task. This is the protocol-native structured-question surface
-  ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+  task enters `INPUT_REQUIRED`. Today the answer arrives as an authorized
+  explicit `taskId` follow-up; the runtime commits add verified reply
+  anchors, and make this tool fail for a Task whose source declares no
+  continuation method in the conformance matrix — the executor completes or
+  rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
+  a new wake for that Task. This tool is the protocol-native structured-question
+  surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
 
 ## Verification gates
 
 `tests/a2a-task-plane.test.ts` proves, by name, the gates from the RFC's
-conformance note: equal task ids from two servers do not collide; a foreign
-`contextId` does not join local work; a reconnect can miss transient
-messages without losing critical state; a duplicate direct Message returns
-its prior direct result; a follow-up message continues the same non-terminal
-task; an unsupported A2A version fails explicitly; subscribe is `GET`,
-streams, and rejects terminal tasks.
+conformance note: equal task IDs from two servers do not collide; a foreign
+`contextId` does not join local work; a reconnect can miss transient messages
+without losing critical state; a simple interaction returns a direct Message
+and a duplicate direct Message returns its prior direct result; an unsupported
+A2A version fails explicitly; and subscribe uses `GET`, streams updates, and
+rejects terminal Tasks.
+
+The existing continuation test (`tests/a2a-task-plane.test.ts`) already
+proves the authorized explicit `taskId` method, which this contract keeps —
+the runtime commits keep that test. They add the new gates: two messages in
+one provider thread create two Tasks in one context; concurrent first
+messages resolve one `contextId` through the atomic upsert; the trusted
+interface creates a new Task in an existing context; a verified direct reply
+continues one waiting Task, including from the `AUTH_REQUIRED` state; a
+redelivered duplicate provider event returns the prior Task; a reply anchor
+from a principal that cannot access the Task creates a new Task instead; a
+later thread message creates a new Task; an unauthorized explicit `taskId` fails; and a `taskId`
+embedded in a provider message body neither selects nor continues a Task.

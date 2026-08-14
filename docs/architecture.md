@@ -4,6 +4,10 @@ The Channels extension turns external activity into trusted, body-free wakes for
 one resident Pi session. Transport sources detect activity; channel adapters read
 and act on the untrusted content after the agent wakes.
 
+The A2A task plane is specified in [A2A task plane](a2a-task-plane.md); its
+per-source contracts live in the
+[source conformance matrix](a2a-source-conformance.md).
+
 The native agent-to-agent and operator-to-agent plane is specified separately in
 [Agent Session Gateway](agent-session-gateway.md). It reuses this extension's
 body-free wake and channel-tool boundary while keeping chat distinct from session

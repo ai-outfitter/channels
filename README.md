@@ -404,10 +404,16 @@ Native agent-to-agent and authorized operator-to-agent chat, including the
 identity model and boundaries from observation/control/lifecycle, is specified in
 [Agent Session Gateway](docs/agent-session-gateway.md).
 
+The A2A task plane is specified in
+[docs/a2a-task-plane.md](docs/a2a-task-plane.md); per-source contracts live in
+the [source conformance matrix](docs/a2a-source-conformance.md).
+
 ## Add a channel
 
 Add `extensions/sources/<name>.ts` with a `ChannelSource` and, for exact-item
-tools, `ChannelActions`, then add one entry in the `SOURCES` registry.
+tools, `ChannelActions`, then add one entry in the `SOURCES` registry. Add the
+source's row to the
+[source conformance matrix](docs/a2a-source-conformance.md).
 
 ```text
 extensions/
