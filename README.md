@@ -49,10 +49,13 @@ new session — that's expected.
 ## Pair each channel with a skill
 
 The extension provides wake transport plus `channel_read` and
-`channel_respond`. Skills teach the agent when to use them. The
+`channel_respond`. Skills teach the agent when to use them. Responder skills
+live in this repository (for example
+[`dev/slack-responder/SKILL.md`](dev/slack-responder/SKILL.md)) or in a
+catalog you control — the
 [`ai-outfitter/community-profiles`](https://github.com/ai-outfitter/community-profiles)
-catalog publishes `mail`, `signal-responder`, `slack-responder`, and ready-made
-agent profiles. Enable a matching skill when one is available. Chatto,
+catalog does not publish channel responder skills. Enable a matching skill
+when one is available. Chatto,
 Mattermost, and Zulip expose the common tools directly, so the agent's profile
 or instructions must define when to read and respond. The existing JMAP, Signal,
 and GitHub skills retain their current workflows until their exact-item adapters
