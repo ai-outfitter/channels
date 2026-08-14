@@ -153,20 +153,40 @@ export class A2aTaskStore {
 				requestedContextId && this.#principalOwnsContext(principal, requestedContextId)
 					? requestedContextId
 					: randomUUID();
-			const task: A2aTask = {
-				id: randomUUID(),
-				contextId,
-				status: { state: "TASK_STATE_SUBMITTED", timestamp: new Date().toISOString() },
-				artifacts: [],
-				history: [],
-			};
-			this.#data.tasks[task.id] = {
-				task,
-				principal,
-				updatedAt: new Date().toISOString(),
-			};
-			await this.#persist();
-			return task;
+			return this.#createTask(principal, randomUUID(), contextId);
+		});
+	}
+
+	/** Trusted task-plane creation in an already resolved context. */
+	async beginNew(principal: string, contextId: string): Promise<A2aTask> {
+		return this.#run(async () => {
+			validateIdentifier(contextId, "contextId");
+			if (!this.#principalOwnsContext(principal, contextId)) {
+				throw new A2aError(404, "TASK_NOT_FOUND", `context "${contextId}" was not found`);
+			}
+			return this.#createTask(principal, randomUUID(), contextId);
+		});
+	}
+
+	/**
+	 * Idempotent projection used by activation-journal replay. The task id is
+	 * minted before the journal claim is flushed, so recovery must use it
+	 * verbatim rather than minting another task.
+	 */
+	async createTaskWithId(principal: string, taskId: string, contextId: string): Promise<A2aTask> {
+		return this.#run(async () => {
+			validateIdentifier(principal, "principal");
+			validateIdentifier(taskId, "taskId");
+			validateIdentifier(contextId, "contextId");
+			const prior = this.#data.tasks[taskId];
+			if (prior) {
+				if (prior.principal !== principal || prior.task.contextId !== contextId) {
+					throw new Error(`task "${taskId}" conflicts with its activation claim`);
+				}
+				await this.#persist();
+				return prior.task;
+			}
+			return this.#createTask(principal, taskId, contextId);
 		});
 	}
 
@@ -181,6 +201,17 @@ export class A2aTaskStore {
 	 */
 	async lookup(taskId: string): Promise<StoredTask | undefined> {
 		return this.#run(async () => this.#data.tasks[taskId]);
+	}
+
+	/**
+	 * Contexts still referenced by any retained Task, across every principal.
+	 * Terminal Tasks remain durable for TASK_RETENTION_MS and keep their context
+	 * mapping reachable for exactly that same period.
+	 */
+	async activeContextIds(): Promise<ReadonlySet<string>> {
+		return this.#run(
+			async () => new Set(Object.values(this.#data.tasks).map((entry) => entry.task.contextId)),
+		);
 	}
 
 	async listTasks(principal: string, filter: ListTasksFilter): Promise<readonly A2aTask[]> {
@@ -204,11 +235,38 @@ export class A2aTaskStore {
 	}
 
 	async appendHistory(principal: string, taskId: string, message: A2aMessage): Promise<A2aTask> {
+		return this.#run(async () => this.#appendHistory(this.#owned(principal, taskId), message));
+	}
+
+	async appendHistoryIdempotent(
+		principal: string,
+		taskId: string,
+		message: A2aMessage,
+	): Promise<A2aTask> {
 		return this.#run(async () => {
 			const stored = this.#owned(principal, taskId);
-			const history = [...(stored.task.history ?? []), message].slice(-MAX_HISTORY_MESSAGES);
-			return this.#replace(stored, { ...stored.task, history });
+			const prior = stored.task.history?.find((entry) => entry.messageId === message.messageId);
+			if (prior) {
+				if (JSON.stringify(prior) !== JSON.stringify(message)) {
+					throw new Error(`message "${message.messageId}" conflicts with its activation claim`);
+				}
+				await this.#persist();
+				return stored.task;
+			}
+			if (isTerminal(stored.task.status.state)) {
+				throw new A2aError(
+					400,
+					"UNSUPPORTED_OPERATION",
+					`task "${taskId}" is already in terminal state ${stored.task.status.state}`,
+				);
+			}
+			return this.#appendHistory(stored, message);
 		});
+	}
+
+	#appendHistory(stored: StoredTask, message: A2aMessage): Promise<A2aTask> {
+		const history = [...(stored.task.history ?? []), message].slice(-MAX_HISTORY_MESSAGES);
+		return this.#replace(stored, { ...stored.task, history });
 	}
 
 	async updateStatus(principal: string, taskId: string, status: A2aTaskStatus): Promise<A2aTask> {
@@ -245,6 +303,23 @@ export class A2aTaskStore {
 		this.#data.tasks[task.id] = {
 			task,
 			principal: stored.principal,
+			updatedAt: new Date().toISOString(),
+		};
+		await this.#persist();
+		return task;
+	}
+
+	async #createTask(principal: string, taskId: string, contextId: string): Promise<A2aTask> {
+		const task: A2aTask = {
+			id: taskId,
+			contextId,
+			status: { state: "TASK_STATE_SUBMITTED", timestamp: new Date().toISOString() },
+			artifacts: [],
+			history: [],
+		};
+		this.#data.tasks[task.id] = {
+			task,
+			principal,
 			updatedAt: new Date().toISOString(),
 		};
 		await this.#persist();

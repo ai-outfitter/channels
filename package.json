@@ -21,9 +21,7 @@
 	],
 	"pi": {
 		"extensions": [
-			"./extensions/index.ts",
-			"./extensions/relay-extension.ts",
-			"./extensions/a2a-extension.ts"
+			"./extensions/runtime-extension.ts"
 		]
 	},
 	"publishConfig": {

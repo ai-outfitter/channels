@@ -26,7 +26,8 @@ import { registerAgentTools } from "./agent-tools.ts";
 import { registerChannelTools } from "./channel-tools.ts";
 import type { AgentChannelActions } from "./sources/agent.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "./sources/types.ts";
-import { parseList, scopedLog } from "./sources/util.ts";
+import { errorMessage, parseList, scopedLog } from "./sources/util.ts";
+import type { SourceTaskActivationSink } from "./task-plane/types.ts";
 
 const log = scopedLog("");
 export const MAX_LOCATORS_PER_WAKE = 25;
@@ -44,7 +45,10 @@ export interface SourceRegistration {
 	/** Cheap environment probe that must not import the channel implementation. */
 	configured(): boolean;
 	/** Dynamically load and configure the channel implementation. */
-	load(journal?: AgentSessionJournal): Promise<ChannelSource | undefined>;
+	load(
+		journal?: AgentSessionJournal,
+		taskSink?: SourceTaskActivationSink,
+	): Promise<ChannelSource | undefined>;
 	/** Dynamically load the channel's agent-facing actions, when supported. */
 	loadActions?(journal?: AgentSessionJournal): Promise<ChannelActions | undefined>;
 	/** Load the native agent channel's discovery/send actions, when supported. */
@@ -195,9 +199,10 @@ const SOURCES: Record<string, SourceRegistration> = {
 export default function channelEventsExtension(
 	pi: ExtensionAPI,
 	sources: Readonly<Record<string, SourceRegistration>> = SOURCES,
-): void {
+	taskSink: () => SourceTaskActivationSink | undefined = () => undefined,
+): ChannelEventsLifecycle | undefined {
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
-	if (selection === "off" || selection === "none") return;
+	if (selection === "off" || selection === "none") return undefined;
 
 	// unset → auto-detect all; set (even to "") → exactly the listed channels,
 	// de-duplicated so a repeated name can't start a source twice.
@@ -270,6 +275,11 @@ export default function channelEventsExtension(
 	let starting = false;
 	let stopped = false;
 	let overflowLogged = false;
+	let startupSucceeded = false;
+
+	const lifecycle: ChannelEventsLifecycle = {
+		startupSucceeded: () => startupSucceeded,
+	};
 
 	const maybeWake = (): void => {
 		if (wakeInFlight || pending.size === 0) return;
@@ -330,52 +340,89 @@ export default function channelEventsExtension(
 		return true;
 	};
 
-	// Resolve and start one channel; returns its stop handle, or undefined when
-	// the channel is unknown, unconfigured, or failed to start (all logged).
-	const startChannel = async (kind: string): Promise<(() => Promise<void>) | undefined> => {
-		const registration = sources[kind];
-		if (!registration) {
-			log(`unknown channel "${kind}"; skipping`);
-			return undefined;
-		}
-		if (!registration.configured()) {
-			if (selection) log(`channel "${kind}" is not configured; skipping`);
-			return undefined;
-		}
+	// Resolve and start one channel behind a staged intake callback. Explicit
+	// selection is transactional; auto-detection preserves 1.7's per-source
+	// isolation and simply skips a source that cannot load or start.
+	const startChannel = async (
+		kind: string,
+		intake: (event: ChannelEvent) => boolean,
+		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: explicit and auto-detected startup deliberately have different failure contracts
+	): Promise<(() => Promise<void>) | undefined> => {
 		try {
-			const source = await registration.load(kind === "agent" ? agentJournal : undefined);
-			if (!source) {
-				log(`channel "${kind}" configuration is incomplete; skipping`);
+			const registration = sources[kind];
+			if (!registration) throw new Error(`unknown channel "${kind}"`);
+			if (!registration.configured()) {
+				if (selection !== undefined) throw new Error(`channel "${kind}" is not configured`);
 				return undefined;
 			}
-			return await source.start(onEvent);
-		} catch (err) {
-			log(`failed to start "${kind}": ${(err as Error).message}`);
+			const source = await registration.load(
+				kind === "agent" ? agentJournal : undefined,
+				taskSink(),
+			);
+			if (!source) throw new Error(`channel "${kind}" configuration is incomplete`);
+			return await source.start(intake);
+		} catch (error) {
+			if (selection !== undefined) throw error;
+			log(`failed to start "${kind}": ${(error as Error).message}; skipping`);
 			return undefined;
 		}
 	};
 
+	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup deliberately keeps staging, rollback, shutdown races, and readiness in one lifecycle transaction
 	pi.on("session_start", async (_event, ctx) => {
 		if (stops.length > 0 || starting) return; // idempotent across reload / concurrent fires
 		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
 		starting = true;
 		stopped = false;
+		startupSucceeded = false;
+		const started: Array<{ kind: string; stop: () => Promise<void> }> = [];
+		const staged: ChannelEvent[] = [];
+		let stagedOverflowLogged = false;
+		let intakeOpen = false;
+		const stage = (event: ChannelEvent): boolean => {
+			if (stopped) return false;
+			if (intakeOpen) return onEvent(event);
+			if (staged.length >= MAX_PENDING_EVENTS) {
+				if (!stagedOverflowLogged) {
+					stagedOverflowLogged = true;
+					log(`staged notification queue is full (${MAX_PENDING_EVENTS}); dropping new events`);
+				}
+				return false;
+			}
+			staged.push(event);
+			return true;
+		};
 		try {
-			await Promise.all(
-				wanted.map(async (kind) => {
-					const stop = await startChannel(kind);
-					if (!stop) return;
-					if (stopped) {
-						// Shutdown raced startup — tear this source back down instead of
-						// leaking it (it never made it into `stops`).
-						await stop().catch(() => {});
-						return;
-					}
-					stops.push(stop);
-					log(`started channel "${kind}"`);
-				}),
+			const results = await Promise.allSettled(
+				wanted.map(async (kind) => ({ kind, stop: await startChannel(kind, stage) })),
 			);
+			for (const [index, result] of results.entries()) {
+				if (result.status === "fulfilled") {
+					const { kind, stop } = result.value;
+					if (stop) started.push({ kind, stop });
+				} else {
+					log(`channel "${wanted[index]}" startup failed: ${errorMessage(result.reason)}`);
+				}
+			}
+			const failed = results.find((result) => result.status === "rejected");
+			if (failed?.status === "rejected") throw failed.reason;
+			if (stopped) {
+				for (const { stop } of started.reverse()) await stop().catch(() => {});
+				return;
+			}
+			for (const { kind, stop } of started) {
+				stops.push(stop);
+				log(`started channel "${kind}"`);
+			}
+			intakeOpen = true;
+			for (const event of staged) onEvent(event);
+			staged.length = 0;
+			startupSucceeded = true;
 			if (stops.length === 0) log("no channels started");
+		} catch (error) {
+			for (const { stop } of started.reverse()) await stop().catch(() => {});
+			log(`channels unhealthy: ${(error as Error).message}`);
+			throw error;
 		} finally {
 			starting = false;
 		}
@@ -422,6 +469,7 @@ export default function channelEventsExtension(
 
 	pi.on("session_shutdown", async () => {
 		stopped = true;
+		startupSucceeded = false;
 		// Stop the forwarder before releasing transports: a pending flush after
 		// the shared transport is released must be dropped, not given a chance
 		// to open a fresh connection nothing will ever close.
@@ -431,6 +479,12 @@ export default function channelEventsExtension(
 		const all = stops.splice(0);
 		await Promise.all(all.map((stop) => stop().catch(() => {})));
 	});
+
+	return lifecycle;
+}
+
+export interface ChannelEventsLifecycle {
+	startupSucceeded(): boolean;
 }
 
 /**

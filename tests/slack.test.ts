@@ -690,14 +690,16 @@ test("channel registry never statically imports a source implementation", async 
 	assert.doesNotMatch(index, /^import .*\.\/sources\/(?:jmap|signal|github|slack)\.ts/m);
 });
 
-test("a source import failure does not prevent later channels from starting", async () => {
+test("a selected source failure rolls back every source before intake opens", async () => {
 	const priorSelection = process.env.OUTFITTER_CHANNELS;
 	const handlers = new Map<string, () => Promise<void> | void>();
 	let healthyStarts = 0;
 	let healthyStops = 0;
+	let wakes = 0;
 	const healthySource: ChannelSource = {
-		async start() {
+		async start(onEvent) {
 			healthyStarts += 1;
+			onEvent({ channel: "healthy", summary: "staged" });
 			return async () => {
 				healthyStops += 1;
 			};
@@ -717,7 +719,37 @@ test("a source import failure does not prevent later channels from starting", as
 	};
 
 	try {
+		// Broken is listed first: healthy must still start concurrently before the
+		// transaction observes the failure and rolls every successful start back.
 		process.env.OUTFITTER_CHANNELS = "broken,healthy";
+		channelEventsExtension(
+			{
+				on(event: string, handler: () => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerTool() {},
+				sendUserMessage() {
+					wakes += 1;
+				},
+			} as never,
+			sources,
+		);
+		await assert.rejects(async () => handlers.get("session_start")?.(), /simulated module failure/);
+		assert.equal(healthyStarts, 1);
+		assert.equal(healthyStops, 1);
+		assert.equal(wakes, 0);
+	} finally {
+		restoreEnv("OUTFITTER_CHANNELS", priorSelection);
+	}
+});
+
+test("auto-detect isolates a failed source and keeps healthy sources running", async () => {
+	const priorSelection = process.env.OUTFITTER_CHANNELS;
+	const handlers = new Map<string, () => Promise<void> | void>();
+	let healthyStarts = 0;
+	let healthyStops = 0;
+	try {
+		delete process.env.OUTFITTER_CHANNELS;
 		channelEventsExtension(
 			{
 				on(event: string, handler: () => Promise<void> | void) {
@@ -726,12 +758,134 @@ test("a source import failure does not prevent later channels from starting", as
 				registerTool() {},
 				sendUserMessage() {},
 			} as never,
-			sources,
+			{
+				broken: {
+					configured: () => true,
+					load: async () => {
+						throw new Error("auto-detected failure");
+					},
+				},
+				healthy: {
+					configured: () => true,
+					load: async () => ({
+						async start() {
+							healthyStarts += 1;
+							return async () => {
+								healthyStops += 1;
+							};
+						},
+					}),
+				},
+			},
 		);
 		await handlers.get("session_start")?.();
 		assert.equal(healthyStarts, 1);
 		await handlers.get("session_shutdown")?.();
 		assert.equal(healthyStops, 1);
+	} finally {
+		restoreEnv("OUTFITTER_CHANNELS", priorSelection);
+	}
+});
+
+test("auto-detect isolates an asynchronously rejected source start", async () => {
+	const priorSelection = process.env.OUTFITTER_CHANNELS;
+	const handlers = new Map<string, () => Promise<void> | void>();
+	let healthyStarts = 0;
+	let healthyStops = 0;
+	try {
+		delete process.env.OUTFITTER_CHANNELS;
+		channelEventsExtension(
+			{
+				on(event: string, handler: () => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerTool() {},
+				sendUserMessage() {},
+			} as never,
+			{
+				broken: {
+					configured: () => true,
+					load: async () => ({
+						start: async () => Promise.reject(new Error("asynchronous start failure")),
+					}),
+				},
+				healthy: {
+					configured: () => true,
+					load: async () => ({
+						async start() {
+							healthyStarts += 1;
+							return async () => {
+								healthyStops += 1;
+							};
+						},
+					}),
+				},
+			},
+		);
+		await handlers.get("session_start")?.();
+		assert.equal(healthyStarts, 1);
+		await handlers.get("session_shutdown")?.();
+		assert.equal(healthyStops, 1);
+	} finally {
+		restoreEnv("OUTFITTER_CHANNELS", priorSelection);
+	}
+});
+
+test("closed startup intake bounds staged events at the shared queue limit", async () => {
+	const priorSelection = process.env.OUTFITTER_CHANNELS;
+	const handlers = new Map<string, () => Promise<void> | void>();
+	const admissions: boolean[] = [];
+	let releaseSlow = (): void => {};
+	const slow = new Promise<void>((resolve) => {
+		releaseSlow = resolve;
+	});
+	try {
+		process.env.OUTFITTER_CHANNELS = "flood,slow";
+		channelEventsExtension(
+			{
+				on(event: string, handler: () => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerTool() {},
+				sendUserMessage() {},
+			} as never,
+			{
+				flood: {
+					configured: () => true,
+					load: async () => ({
+						async start(onEvent) {
+							const stage = onEvent as (event: ChannelEvent) => boolean;
+							for (let index = 0; index < MAX_PENDING_EVENTS + 5; index += 1) {
+								admissions.push(
+									stage({
+										channel: "flood",
+										summary: "staged",
+										locator: { key: `flood:v1:${index}` },
+									}),
+								);
+							}
+							return async () => {};
+						},
+					}),
+				},
+				slow: {
+					configured: () => true,
+					load: async () => ({
+						async start() {
+							await slow;
+							return async () => {};
+						},
+					}),
+				},
+			},
+		);
+		const startup = handlers.get("session_start")?.();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(admissions.filter(Boolean).length, MAX_PENDING_EVENTS);
+		assert.equal(admissions.filter((accepted) => !accepted).length, 5);
+		releaseSlow();
+		await startup;
+		await handlers.get("session_shutdown")?.();
 	} finally {
 		restoreEnv("OUTFITTER_CHANNELS", priorSelection);
 	}
