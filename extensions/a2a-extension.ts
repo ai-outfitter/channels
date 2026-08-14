@@ -8,6 +8,7 @@ import {
 	startA2aServer,
 } from "./a2a/server.ts";
 import type { A2aMessage, A2aPart } from "./a2a/types.ts";
+import { taskWakePrompt } from "./task-plane/wake-queue.ts";
 
 export interface A2aExtensionDependencies {
 	readonly enabled?: () => boolean;
@@ -52,10 +53,9 @@ export default function a2aServerExtension(
 		const taskId = controller.task.id;
 		// Body-free wake, same rule as every channel source: an inbound A2A
 		// message is untrusted content and never rides the prompt.
-		const delivery: unknown = pi.sendUserMessage(
-			`[channels] a2a task ${taskId} awaits. Read it with a2a_read_task, then settle it with a2a_complete_task or a2a_require_input.`,
-			{ deliverAs: "followUp" },
-		);
+		const delivery: unknown = pi.sendUserMessage(taskWakePrompt(taskId), {
+			deliverAs: "followUp",
+		});
 		if (delivery && typeof (delivery as PromiseLike<unknown>).then === "function") {
 			void (delivery as Promise<unknown>).catch((error) => {
 				log({ event: "a2a_wake_failed", taskId, error: (error as Error).message });
