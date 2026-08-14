@@ -86,7 +86,8 @@ profile can supply its secret without additional source-selection configuration.
 
 To add a channel, create `sources/<name>.ts`, export its `ChannelSource` and
 optional action adapter, then register it in `extensions/index.ts`. The core
-hooks, queue, and trust boundary remain unchanged.
+hooks, queue, and trust boundary remain unchanged. Add the source's row to
+the [source conformance matrix](./a2a-source-conformance.md).
 
 - **`jmap`** (`extensions/sources/jmap.ts`) — JMAP EventSource (SSE, RFC 8620
   §7.3) on Stalwart; watches the account's `Email` `StateChange` and emits a
