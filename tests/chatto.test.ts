@@ -26,7 +26,6 @@ import {
 import { RoomSummary } from "../extensions/vendor/chatto/chatto/api/v1/rooms_pb.js";
 import { User } from "../extensions/vendor/chatto/chatto/api/v1/users_pb.js";
 import {
-	RealtimeCaughtUp,
 	RealtimeClientFrame,
 	RealtimeProjectionEvent,
 	RealtimeProjectionNotificationAction,
@@ -105,7 +104,7 @@ test("Chatto actions validate the notification and return bounded thread context
 		threadPage: page,
 		onThread: () => calls.push("thread"),
 	});
-	const result = await createChattoActions(config, api).read(locator);
+	const result = await createChattoActions(config, api, unusedTaskSink()).read(locator);
 	assert.equal(result.handled, false);
 	assert.equal(result.messages.length, 10);
 	assert.equal(result.messages[0]?.id, "root-1");
@@ -121,6 +120,7 @@ test("Chatto actions validate the notification and return bounded thread context
 	const emptyResult = await createChattoActions(
 		config,
 		fakeApi({ notification: emptyThread, roomPage: page }),
+		unusedTaskSink(),
 	).read(emptyLocator);
 	assert.equal(emptyResult.handled, false);
 });
@@ -133,25 +133,29 @@ test("Chatto reads dismissed notifications as handled and rejects mismatched loc
 	const handled = await createChattoActions(
 		config,
 		fakeApi({ notification: undefined, roomPage: page }),
+		unusedTaskSink(),
 	).read(locator);
 	assert.equal(handled.handled, true);
 	assert.deepEqual(handled.messages, []);
 
 	const mismatched = mention("notification-1", "room-2", "message-1", "user-1");
 	await assert.rejects(
-		createChattoActions(config, fakeApi({ notification: mismatched, roomPage: page })).read(
-			locator,
-		),
+		createChattoActions(
+			config,
+			fakeApi({ notification: mismatched, roomPage: page }),
+			unusedTaskSink(),
+		).read(locator),
 		/does not match/,
 	);
 	await assert.rejects(
-		createChattoActions(config, fakeApi()).read("chatto:v1:not-json"),
+		createChattoActions(config, fakeApi(), unusedTaskSink()).read("chatto:v1:not-json"),
 		/invalid chatto/i,
 	);
 	await assert.rejects(
 		createChattoActions(
 			{ ...config, roomIds: new Set(["room-2"]) },
 			fakeApi({ notification, roomPage: page }),
+			unusedTaskSink(),
 		).read(locator),
 		/outside CHATTO_ROOM_IDS/,
 	);
@@ -217,6 +221,7 @@ test("Chatto replies into the correct thread and preserves partial success", asy
 				repliedThread = locator.threadRootEventId ?? locator.messageEventId;
 			},
 		}),
+		passthroughTaskSink(),
 	).respond(topLocator, "answer");
 	assert.equal(repliedThread, "message-1");
 	assert.deepEqual(success, {
@@ -241,122 +246,19 @@ test("Chatto replies into the correct thread and preserves partial success", asy
 			},
 			dismissError: new Error("network down"),
 		}),
+		passthroughTaskSink(),
 	).respond(threadedLocator, "answer");
 	assert.equal(replies, 1);
 	assert.equal(partial.replied, true);
 	assert.equal(partial.handled, false);
 	assert.match(partial.warning ?? "", /network down/);
 	await assert.rejects(
-		createChattoActions(config, fakeApi({ notification: undefined })).respond(
+		createChattoActions(config, fakeApi({ notification: undefined }), unusedTaskSink()).respond(
 			topLocator,
 			"duplicate",
 		),
 		/already handled/,
 	);
-});
-
-test("Chatto source negotiates protocol v2, resumes, filters, and shuts down", async (t) => {
-	const sockets: FakeSocket[] = [];
-	const events: string[] = [];
-	let deliveryAttempts = 0;
-	let rejectNextDelivery = true;
-	const source = createChattoSource(
-		config,
-		() => {
-			const socket = new FakeSocket();
-			sockets.push(socket);
-			return socket;
-		},
-		0,
-		fakeApi({ viewer: "bot-1" }),
-	);
-	const stop = await source.start((event) => {
-		deliveryAttempts += 1;
-		if (rejectNextDelivery) {
-			rejectNextDelivery = false;
-			return false;
-		}
-		if (event.locator) events.push(event.locator.key);
-		return true;
-	});
-	t.after(stop);
-	await waitFor(() => sockets.length === 1);
-	const first = sockets[0];
-	assert.ok(first);
-	first.emit("open", {});
-	assert.equal(
-		RealtimeClientFrame.fromBinary(first.sent[0] ?? new Uint8Array()).frame.case,
-		"hello",
-	);
-	first.emit("message", { data: serverHello() });
-	await waitFor(() => first.sent.length >= 2);
-	const subscribe = RealtimeClientFrame.fromBinary(first.sent[1] ?? new Uint8Array());
-	assert.equal(subscribe.frame.case, "subscribeEvents");
-	if (subscribe.frame.case !== "subscribeEvents") throw new Error("expected subscription");
-	assert.equal(subscribe.frame.value.resumeCursor, undefined);
-	first.emit("message", {
-		data: new RealtimeServerFrame({
-			frame: { case: "subscribed", value: new RealtimeSubscribed() },
-		}).toBinary(),
-	});
-	first.emit("message", {
-		data: notificationProjection(
-			"bootstrap-cursor",
-			mention("notification-1", "room-1", "message-1", "user-1"),
-			false,
-		),
-	});
-	await waitFor(() => deliveryAttempts === 1);
-	assert.equal(events.length, 0);
-	first.emit("message", {
-		data: notificationProjection(
-			"cursor-1",
-			mention("notification-1", "room-1", "message-1", "user-1"),
-		),
-	});
-	await waitFor(() => events.length === 1);
-	assert.equal(deliveryAttempts, 2);
-	first.emit("message", {
-		data: notificationProjection(
-			"cursor-1b",
-			mention("notification-1", "room-1", "message-1", "user-1"),
-		),
-	});
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(events.length, 1);
-	assert.equal(deliveryAttempts, 2);
-	first.emit("message", {
-		data: new RealtimeServerFrame({
-			frame: { case: "caughtUp", value: new RealtimeCaughtUp({ cursor: "cursor-2" }) },
-		}).toBinary(),
-	});
-	await new Promise((resolve) => setImmediate(resolve));
-	first.emit("close", { code: 1006 });
-	await waitFor(() => sockets.length === 2);
-	const second = sockets[1];
-	assert.ok(second);
-	second.emit("open", {});
-	second.emit("message", { data: serverHello() });
-	await waitFor(() => second.sent.length >= 2);
-	const resumed = RealtimeClientFrame.fromBinary(second.sent[1] ?? new Uint8Array());
-	if (resumed.frame.case !== "subscribeEvents") throw new Error("expected subscription");
-	assert.equal(resumed.frame.value.resumeCursor, "cursor-2");
-	second.emit("message", {
-		data: new RealtimeServerFrame({
-			frame: { case: "subscribed", value: new RealtimeSubscribed() },
-		}).toBinary(),
-	});
-	second.emit("message", {
-		data: notificationProjection(
-			"cursor-3",
-			mention("notification-1", "room-1", "message-1", "user-1"),
-			false,
-		),
-	});
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(events.length, 1);
-	await stop();
-	assert.equal(second.closed, true);
 });
 
 test("Chatto resumes its durable cursor and dismisses only after Task acceptance", async () => {
@@ -667,4 +569,30 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
 	throw new Error("condition was not met");
+}
+
+function unusedTaskSink(): SourceTaskActivationSink {
+	return {
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+}
+
+function passthroughTaskSink(): SourceTaskActivationSink {
+	return {
+		...unusedTaskSink(),
+		async taskForLocator() {
+			return "task-active";
+		},
+		async taskIsTerminal() {
+			return false;
+		},
+		async deliver(_input, send) {
+			return send();
+		},
+	};
 }

@@ -11,7 +11,7 @@ import {
 import type { A2aMessage, A2aPart, A2aTask } from "./a2a/types.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import type { RuntimeListener } from "./task-plane/runtime.ts";
-import { taskWakePrompt } from "./task-plane/wake-queue.ts";
+import { contentDigest } from "./task-plane/source-activation.ts";
 
 export interface A2aExtensionDependencies {
 	readonly enabled?: () => boolean;
@@ -31,7 +31,6 @@ export interface A2aToolAccess {
 
 /** Compose the optional HTTP listener above the already-open task plane. */
 export function createA2aRuntimeListener(
-	pi: ExtensionAPI,
 	dependencies: A2aExtensionDependencies = {},
 	onRunning: (server: RunningA2aServer | undefined) => void = () => {},
 ): RuntimeListener | undefined {
@@ -41,22 +40,28 @@ export function createA2aRuntimeListener(
 	const start = dependencies.start ?? startA2aServer;
 	const log = dependencies.log ?? ((record) => console.error(JSON.stringify(record)));
 	return {
-		async start(taskPlane) {
+		async start(taskPlane, sink) {
 			const executor: A2aExecutor = async (context) => {
 				const controller = await context.begin();
-				await controller.status("TASK_STATE_WORKING");
-				const delivery: unknown = pi.sendUserMessage(taskWakePrompt(controller.task.id), {
-					deliverAs: "followUp",
-				});
-				if (delivery && typeof (delivery as PromiseLike<unknown>).then === "function") {
-					void (delivery as Promise<unknown>).catch((error) =>
-						log({
-							event: "a2a_wake_failed",
-							taskId: controller.task.id,
-							error: (error as Error).message,
-						}),
-					);
-				}
+				const message = {
+					...context.message,
+					taskId: controller.task.id,
+					contextId: controller.task.contextId,
+				};
+				await sink.claim(
+					{
+						principal: context.principal,
+						source: "a2a",
+						providerEventId: context.message.messageId,
+						nativeLocator: { messageId: context.message.messageId },
+						receivedAt: new Date().toISOString(),
+						providerDedupeKey: context.message.messageId,
+						conversationKey: controller.task.contextId,
+						parts: context.message.parts,
+						contentDigest: contentDigest(message),
+					},
+					controller.task.id,
+				);
 				return undefined;
 			};
 			const server = await start(await loadConfig(), executor, taskPlane.taskStore);

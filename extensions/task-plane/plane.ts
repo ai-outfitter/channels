@@ -57,18 +57,20 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 
 	const project = async (claim: ActivationClaim): Promise<void> => {
 		const relation = claim.intendedRoute;
-		if (relation === "created") {
-			await dependencies.tasks.createTaskWithId(
+		if (!claim.taskAlreadyPersisted) {
+			if (relation === "created") {
+				await dependencies.tasks.createTaskWithId(
+					claim.input.principal,
+					claim.taskId,
+					claim.contextId,
+				);
+			}
+			await dependencies.tasks.appendHistoryIdempotent(
 				claim.input.principal,
 				claim.taskId,
-				claim.contextId,
+				messageFor(claim),
 			);
 		}
-		await dependencies.tasks.appendHistoryIdempotent(
-			claim.input.principal,
-			claim.taskId,
-			messageFor(claim),
-		);
 		await crash(5, claim);
 		await dependencies.origins.project(
 			claim.activationId,
@@ -98,6 +100,7 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 	const submit = async (
 		input: NativeActivation,
 		selectTask?: () => Promise<string | undefined>,
+		taskAlreadyPersisted = false,
 	): Promise<ActivationAcceptance> =>
 		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keeps the reviewed eleven acceptance boundaries visibly in one serialized transaction
 		locked(async () => {
@@ -137,6 +140,7 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 					input: structuredClone(input),
 					contextId,
 					intendedRoute: selectedTaskId ? "continued" : "created",
+					...(taskAlreadyPersisted ? { taskAlreadyPersisted: true } : {}),
 					claimedAt: new Date().toISOString(),
 				};
 				await dependencies.journal.append(claim, () => crash(3, claim));
@@ -187,6 +191,15 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 			}
 			return submit(input);
 		},
+		claim: (input, taskId) =>
+			submit(
+				input,
+				async () => {
+					await dependencies.tasks.getTask(input.principal, taskId);
+					return taskId;
+				},
+				true,
+			),
 		beginNew: (principal, contextId) => dependencies.tasks.beginNew(principal, contextId),
 		async replayIncomplete() {
 			await locked(async () => {

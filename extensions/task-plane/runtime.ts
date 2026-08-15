@@ -23,7 +23,7 @@ export interface RuntimeSource {
 }
 
 export interface RuntimeListener {
-	start(taskPlane: TaskPlane): Promise<() => Promise<void>>;
+	start(taskPlane: TaskPlane, sink: TaskActivationSink): Promise<() => Promise<void>>;
 }
 
 export interface RuntimeDependencies {
@@ -105,6 +105,10 @@ export async function startChannelsRuntime(
 		continue: async (input) => {
 			if (!intakeOpen) throw new Error("channels intake is not ready");
 			return taskPlane.continue(input);
+		},
+		claim: async (input, taskId) => {
+			if (!intakeOpen) throw new Error("channels intake is not ready");
+			return taskPlane.claim(input, taskId);
 		},
 	};
 	const sourceSink: SourceTaskActivationSink = {
@@ -251,16 +255,18 @@ export async function startChannelsRuntime(
 		const failed = sourceResults.find((result) => result.status === "rejected");
 		if (failed?.status === "rejected") throw failed.reason;
 		// 6. External A2A is provider configuration, not local-plane config.
+		// Open guarded intake before the listener binds so a request accepted as
+		// soon as listen() resolves cannot race a closed sink.
+		intakeOpen = true;
 		if (dependencies.listener) {
 			try {
-				stops.push(await dependencies.listener.start(taskPlane));
+				stops.push(await dependencies.listener.start(taskPlane, guardedSink));
 			} catch (error) {
 				listenerHealthy = false;
 				log({ event: "listener_start_failed", error: errorMessage(error) });
 				log({ event: "channels_unhealthy", error: errorMessage(error) });
 			}
 		}
-		intakeOpen = true;
 		for (const report of buffered) report();
 		// Pending durable wakes are not offered until the complete runtime has
 		// started and intake is ready. A failed startup therefore offers none.

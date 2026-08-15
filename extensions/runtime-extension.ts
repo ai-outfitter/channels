@@ -14,9 +14,9 @@ export interface ChannelsRuntimeExtensionDependencies {
 }
 
 /**
- * The package's sole Pi entrypoint. Legacy channel and relay behavior remains
- * registered alongside the task plane for the non-breaking 1.8 release; the
- * entrypoint is intentionally stateless so Jiti reloads with moduleCache:false
+ * The package's sole Pi entrypoint. The relay remains a separate session plane;
+ * every work-producing source is composed with the task plane. The entrypoint
+ * is intentionally stateless so Jiti reloads with moduleCache:false
  * create an independent runtime rather than consulting a module-global owner.
  */
 export default function channelsRuntimeExtension(
@@ -34,7 +34,7 @@ export default function channelsRuntimeExtension(
 	const log =
 		dependencies.log ??
 		((record: Readonly<Record<string, unknown>>): void => console.error(JSON.stringify(record)));
-	const listener = createA2aRuntimeListener(pi, { log }, (server) => {
+	const listener = createA2aRuntimeListener({ log }, (server) => {
 		a2aServer = server;
 	});
 	const taskAccess = (): A2aToolAccess | undefined => {
@@ -70,21 +70,17 @@ export default function channelsRuntimeExtension(
 		registerA2aTools(
 			pi,
 			taskAccess,
-			async (taskId) => {
-				const queue = runtime?.wakeQueue;
-				if (!queue) return false;
-				return !queue.requiresAuthority(taskId) || queue.hasAuthority(taskId);
-			},
+			async (taskId) => runtime?.wakeQueue.hasAuthority(taskId) ?? false,
 			(taskId) => {
 				const queue = runtime?.wakeQueue;
-				return queue !== undefined && queue.sourceForTask(taskId) === undefined;
+				return queue !== undefined && queue.sourceForTask(taskId) === "a2a";
 			},
 		);
 	}
 
 	// Register the task plane first. Pi dispatches lifecycle hooks in
 	// registration order, so the durable local plane is ready before any
-	// compatibility source or optional listener can accept work.
+	// source or optional listener can accept work.
 	if (taskPlaneEnabled || listener) {
 		pi.on("session_start", async () => {
 			if (runtime) {
@@ -107,8 +103,7 @@ export default function channelsRuntimeExtension(
 					storePath: join(taskPlaneRoot, "tasks.json"),
 					originStorePath: join(taskPlaneRoot, "origins.json"),
 					agentInterface: process.env.A2A_PUBLIC_URL?.trim() || "http://127.0.0.1:8788",
-					// Source adapters are injected here by the source-routing commits.
-					// Keeping the list empty preserves all legacy source behavior in 1.8.
+					// Channel sources receive the guarded sink from this runtime after it opens.
 					sources: [],
 					...(listener ? { listener } : {}),
 					log,
@@ -131,8 +126,11 @@ export default function channelsRuntimeExtension(
 
 	const channels = channelEventsExtension(
 		pi,
+		() => {
+			if (!runtime) throw new Error("task plane is not running");
+			return runtime.sourceSink;
+		},
 		dependencies.sources,
-		() => runtime?.sourceSink,
 		async () => {
 			taskPlaneHealthy = false;
 			const loaded = runtime;

@@ -12,18 +12,13 @@ import {
 import { type SlackVerifyClient, verifySlackRoundTrip } from "../dev/slack-verify.ts";
 import { registerChannelTools } from "../extensions/channel-tools.ts";
 import channelEventsExtension, {
-	channelEventKey,
 	locatorChannel,
-	MAX_LOCATORS_PER_WAKE,
-	MAX_PENDING_EVENTS,
 	type SourceRegistration,
-	wakePrompt,
 } from "../extensions/index.ts";
 import {
 	createSlackActions,
 	createSlackSource,
 	mentionEvent,
-	type SlackClientFactories,
 	slackActionsConfigFromEnv,
 	slackConfigFromEnv,
 } from "../extensions/sources/slack.ts";
@@ -232,56 +227,6 @@ test("non-mentions, invalid locators, and non-allowlisted channels are ignored",
 	);
 });
 
-test("Slack source authenticates, acknowledges mentions, emits, and disconnects", async () => {
-	const socket = new FakeSocket();
-	const clients: SlackClientFactories = {
-		socket(appToken) {
-			assert.equal(appToken, "xapp-test");
-			return fakeSocketClient(socket);
-		},
-		web(botToken) {
-			assert.equal(botToken, "xoxb-test");
-			return fakeWebClient({ auth: { test: async () => ({ ok: true, user_id: "UBOT" }) } });
-		},
-	};
-	const source = createSlackSource(
-		{
-			appToken: "xapp-test",
-			botToken: "xoxb-test",
-			channelIds: new Set(["C0123ABCD"]),
-		},
-		clients,
-	);
-	const events: ChannelEvent[] = [];
-	const stop = await source.start((event) => events.push(event));
-	await waitFor(() => socket.started);
-
-	let acknowledgements = 0;
-	socket.emit("slack_event", {
-		ack: async () => {
-			acknowledgements += 1;
-		},
-		type: "events_api",
-		body: {
-			event: {
-				type: "app_mention",
-				channel: "C0123ABCD",
-				ts: "1721840000.123456",
-				text: "<@UBOT> investigate",
-			},
-		},
-	});
-	await new Promise((resolve) => setImmediate(resolve));
-
-	assert.equal(socket.started, true);
-	assert.equal(acknowledgements, 1);
-	assert.equal(events.length, 1);
-	assert.match(events[0]?.locator?.key ?? "", /^slack:v1:/);
-
-	await stop();
-	assert.equal(socket.disconnected, true);
-});
-
 test("Slack thread replies create new Tasks and duplicate provider events keep one identity", async () => {
 	const socket = new FakeSocket();
 	const activations: NativeActivation[] = [];
@@ -454,9 +399,10 @@ test("Slack acknowledges subscribed non-mention envelopes without emitting work"
 			socket: () => fakeSocketClient(socket),
 			web: () => fakeWebClient({ auth: { test: async () => ({ ok: true, user_id: "UBOT" }) } }),
 		},
+		undefined,
+		unusedTaskSink(),
 	);
-	const events: ChannelEvent[] = [];
-	const stop = await source.start((event) => events.push(event));
+	const stop = await source.start(() => {});
 	await waitFor(() => socket.started);
 
 	let acknowledgements = 0;
@@ -477,7 +423,6 @@ test("Slack acknowledges subscribed non-mention envelopes without emitting work"
 	await new Promise((resolve) => setImmediate(resolve));
 
 	assert.equal(acknowledgements, 1);
-	assert.equal(events.length, 0);
 	await stop();
 });
 
@@ -504,6 +449,7 @@ test("Slack retries a transient auth failure before starting Socket Mode", async
 				}),
 		},
 		0,
+		unusedTaskSink(),
 	);
 
 	const stop = await source.start(() => {});
@@ -536,6 +482,7 @@ test("Slack shutdown cancels an authentication retry backoff", async () => {
 				}),
 		},
 		60_000,
+		unusedTaskSink(),
 	);
 
 	const stop = await source.start(() => {});
@@ -648,7 +595,11 @@ test("Slack actions read bounded thread context, reply, and mark the mention han
 			},
 		},
 	});
-	const actions = createSlackActions({ botToken: "xoxb-test", doneEmoji: "white_check_mark" }, web);
+	const actions = createSlackActions(
+		{ botToken: "xoxb-test", doneEmoji: "white_check_mark" },
+		web,
+		passthroughTaskSink(),
+	);
 	const locator = slackLocator("1721840001.000002", "1721840000.000001");
 
 	const context = await actions.read(locator);
@@ -703,7 +654,11 @@ test("Slack actions report a partial result instead of hiding a handled-state fa
 			add: async () => ({ ok: false, error: "missing_scope" }),
 		},
 	});
-	const actions = createSlackActions({ botToken: "xoxb-test", doneEmoji: "white_check_mark" }, web);
+	const actions = createSlackActions(
+		{ botToken: "xoxb-test", doneEmoji: "white_check_mark" },
+		web,
+		passthroughTaskSink(),
+	);
 	const locator = slackLocator("1721840001.000002");
 
 	assert.deepEqual(await actions.respond(locator, "I found the issue."), {
@@ -740,7 +695,11 @@ test("Slack actions retry bot identity after a transient authentication failure"
 			replies: async () => ({ ok: true, messages: [] }),
 		},
 	});
-	const actions = createSlackActions({ botToken: "xoxb-test", doneEmoji: "white_check_mark" }, web);
+	const actions = createSlackActions(
+		{ botToken: "xoxb-test", doneEmoji: "white_check_mark" },
+		web,
+		passthroughTaskSink(),
+	);
 	const locator = slackLocator("1721840001.000002");
 
 	await assert.rejects(actions.read(locator), /temporary auth failure/);
@@ -833,6 +792,7 @@ test("a failed action-adapter import is retried on the next tool call", async ()
 				},
 				sendUserMessage() {},
 			} as never,
+			unusedTaskSink,
 			sources,
 		);
 		const locator = slackLocator("1721840001.000002");
@@ -851,16 +811,15 @@ test("channel registry never statically imports a source implementation", async 
 	assert.doesNotMatch(index, /^import .*\.\/sources\/(?:jmap|signal|github|slack)\.ts/m);
 });
 
-test("a selected source failure rolls back every source before intake opens", async () => {
+test("a selected source failure rolls back every source without a direct wake", async () => {
 	const priorSelection = process.env.OUTFITTER_CHANNELS;
 	const handlers = new Map<string, () => Promise<void> | void>();
 	let healthyStarts = 0;
 	let healthyStops = 0;
 	let wakes = 0;
 	const healthySource: ChannelSource = {
-		async start(onEvent) {
+		async start() {
 			healthyStarts += 1;
-			onEvent({ channel: "healthy", summary: "staged" });
 			return async () => {
 				healthyStops += 1;
 			};
@@ -893,6 +852,7 @@ test("a selected source failure rolls back every source before intake opens", as
 					wakes += 1;
 				},
 			} as never,
+			unusedTaskSink,
 			sources,
 		);
 		await assert.rejects(async () => handlers.get("session_start")?.(), /simulated module failure/);
@@ -919,6 +879,7 @@ test("auto-detect isolates a failed source and keeps healthy sources running", a
 				registerTool() {},
 				sendUserMessage() {},
 			} as never,
+			unusedTaskSink,
 			{
 				broken: {
 					configured: () => true,
@@ -963,6 +924,7 @@ test("auto-detect isolates an asynchronously rejected source start", async () =>
 				registerTool() {},
 				sendUserMessage() {},
 			} as never,
+			unusedTaskSink,
 			{
 				broken: {
 					configured: () => true,
@@ -992,150 +954,39 @@ test("auto-detect isolates an asynchronously rejected source start", async () =>
 	}
 });
 
-test("closed startup intake bounds staged events at the shared queue limit", async () => {
+test("a source cannot send work through the removed legacy wake path", async () => {
 	const priorSelection = process.env.OUTFITTER_CHANNELS;
 	const handlers = new Map<string, () => Promise<void> | void>();
-	const admissions: boolean[] = [];
-	let releaseSlow = (): void => {};
-	const slow = new Promise<void>((resolve) => {
-		releaseSlow = resolve;
-	});
-	try {
-		process.env.OUTFITTER_CHANNELS = "flood,slow";
-		channelEventsExtension(
-			{
-				on(event: string, handler: () => Promise<void> | void) {
-					handlers.set(event, handler);
-				},
-				registerTool() {},
-				sendUserMessage() {},
-			} as never,
-			{
-				flood: {
-					configured: () => true,
-					load: async () => ({
-						async start(onEvent) {
-							const stage = onEvent as (event: ChannelEvent) => boolean;
-							for (let index = 0; index < MAX_PENDING_EVENTS + 5; index += 1) {
-								admissions.push(
-									stage({
-										channel: "flood",
-										summary: "staged",
-										locator: { key: `flood:v1:${index}` },
-									}),
-								);
-							}
-							return async () => {};
-						},
-					}),
-				},
-				slow: {
-					configured: () => true,
-					load: async () => ({
-						async start() {
-							await slow;
-							return async () => {};
-						},
-					}),
-				},
-			},
-		);
-		const startup = handlers.get("session_start")?.();
-		await new Promise((resolve) => setImmediate(resolve));
-		assert.equal(admissions.filter(Boolean).length, MAX_PENDING_EVENTS);
-		assert.equal(admissions.filter((accepted) => !accepted).length, 5);
-		releaseSlow();
-		await startup;
-		await handlers.get("session_shutdown")?.();
-	} finally {
-		restoreEnv("OUTFITTER_CHANNELS", priorSelection);
-	}
-});
-
-test("distinct mention locators survive coalescing and enter a body-free wake", () => {
-	const first = mentionEvent(
-		{
-			type: "app_mention",
-			channel: "C0123ABCD",
-			ts: "1721840000.123456",
-			text: "first untrusted body",
-		},
-		new Set(),
-	);
-	const second = mentionEvent(
-		{
-			type: "app_mention",
-			channel: "C0123ABCD",
-			ts: "1721840001.123456",
-			text: "second untrusted body",
-		},
-		new Set(),
-	);
-	assert.ok(first);
-	assert.ok(second);
-	assert.notEqual(channelEventKey(first), channelEventKey(second));
-
-	const prompt = wakePrompt([first, second]);
-	assert.match(prompt, new RegExp(first.locator?.key ?? "missing"));
-	assert.match(prompt, new RegExp(second.locator?.key ?? "missing"));
-	assert.match(prompt, /channel_read/);
-	assert.match(prompt, /channel_respond/);
-	assert.doesNotMatch(prompt, /channel_id|message_ts|thread_ts|1721840000|1721840001/);
-	assert.doesNotMatch(prompt, /first untrusted body|second untrusted body/);
-});
-
-test("mention floods are bounded in memory and split across wake prompts", async () => {
-	const priorSelection = process.env.OUTFITTER_CHANNELS;
-	const handlers = new Map<string, () => Promise<void> | void>();
-	const prompts: string[] = [];
-	let emit: ((event: ChannelEvent) => void) | undefined;
+	let wakes = 0;
 	const source: ChannelSource = {
 		async start(onEvent) {
-			emit = onEvent;
+			onEvent({ channel: "legacy", summary: "must fail closed" });
 			return async () => {};
 		},
 	};
 
 	try {
-		process.env.OUTFITTER_CHANNELS = "flood";
+		process.env.OUTFITTER_CHANNELS = "legacy";
 		channelEventsExtension(
 			{
 				on(event: string, handler: () => Promise<void> | void) {
 					handlers.set(event, handler);
 				},
 				registerTool() {},
-				sendUserMessage(prompt: string) {
-					prompts.push(prompt);
+				sendUserMessage() {
+					wakes += 1;
 				},
 			} as never,
+			unusedTaskSink,
 			{
-				flood: {
+				legacy: {
 					configured: () => true,
 					load: async () => source,
 				},
 			},
 		);
-		await handlers.get("session_start")?.();
-		assert.ok(emit);
-
-		for (let index = 0; index <= MAX_PENDING_EVENTS + 20; index += 1) {
-			emit({
-				channel: "slack",
-				summary: "new mention",
-				locator: {
-					key: `slack:v1:${Buffer.from(String(index)).toString("base64url")}`,
-				},
-			});
-		}
-
-		for (let turn = 0; turn <= Math.ceil(MAX_PENDING_EVENTS / MAX_LOCATORS_PER_WAKE); turn += 1) {
-			await handlers.get("agent_end")?.();
-		}
-
-		const delivered = prompts.reduce((total, prompt) => total + countLocators(prompt), 0);
-		assert.equal(delivered, MAX_PENDING_EVENTS + 1);
-		assert.ok(prompts.every((prompt) => countLocators(prompt) <= MAX_LOCATORS_PER_WAKE));
-		await handlers.get("session_shutdown")?.();
+		await assert.rejects(async () => handlers.get("session_start")?.(), /removed legacy wake path/);
+		assert.equal(wakes, 0);
 	} finally {
 		restoreEnv("OUTFITTER_CHANNELS", priorSelection);
 	}
@@ -1210,6 +1061,28 @@ function slackLocator(messageTs: string, threadTs?: string): string {
 	return event.locator.key;
 }
 
-function countLocators(prompt: string): number {
-	return prompt.match(/slack:v1:/g)?.length ?? 0;
+function unusedTaskSink(): SourceTaskActivationSink {
+	return {
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+}
+
+function passthroughTaskSink(): SourceTaskActivationSink {
+	return {
+		...unusedTaskSink(),
+		async taskForLocator() {
+			return "task-active";
+		},
+		async taskIsTerminal() {
+			return false;
+		},
+		async deliver(_input, send) {
+			return send();
+		},
+	};
 }

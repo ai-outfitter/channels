@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **All profile authors (breaking):** The channel-name-plus-locator wake and
+  its in-memory notification queue are removed. Every agent wake is now a
+  Task-scoped wake from the durable task-plane queue, and old wake-prompt
+  parsers no longer receive compatibility text.
+- **A2A profile authors (breaking):** Inbound A2A work now receives a durable
+  activation claim and queued Task authority before the agent can use A2A
+  tools. Claim-free resident-owner tool access and direct listener wakes are
+  removed; unclaimed, queued, foreign, and completed Task IDs fail closed.
+- **Source authors (breaking):** Task-producing source loaders and migrated
+  source constructors require a task sink. Emitting through the old
+  `ChannelEvent` wake callback is rejected instead of waking Pi.
 - **All channel profiles and skills:** Every channel source now sends a
   Task-scoped wake prompt instead of the 1.7 channel-and-locator wake. Update any
   profile or skill that matches or parses the old wake text.

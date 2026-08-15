@@ -1258,6 +1258,58 @@ it("keeps sources running when the optional A2A listener cannot start", async ()
 	assert.equal(sourceStopped, 1);
 });
 
+it("claims A2A inbound work before the queue wakes and grants Task authority", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-a2a-claim-"));
+	const prompts: string[] = [];
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	try {
+		const principal = "a2a:caller";
+		const task = await runtime.taskPlane.taskStore.createTask(principal, undefined);
+		const message = {
+			messageId: "message-a2a",
+			taskId: task.id,
+			contextId: task.contextId,
+			role: "ROLE_USER" as const,
+			parts: [{ text: "untrusted inbound work" }],
+		};
+		await runtime.taskPlane.taskStore.appendHistory(principal, task.id, message);
+		const accepted = await runtime.sink.claim(
+			{
+				principal,
+				source: "a2a",
+				providerEventId: message.messageId,
+				nativeLocator: { messageId: message.messageId },
+				receivedAt: "2026-08-15T12:00:00.000Z",
+				providerDedupeKey: message.messageId,
+				conversationKey: task.contextId,
+				parts: message.parts,
+				contentDigest: digest(message.parts[0]?.text ?? ""),
+			},
+			task.id,
+		);
+		for (let attempt = 0; prompts.length === 0 && attempt < 100; attempt += 1) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		assert.equal(accepted.taskId, task.id);
+		assert.deepEqual(prompts, [taskWakePrompt(task.id)]);
+		const journal = await readFile(join(root, "activation-journal.v1.jsonl"), "utf8");
+		assert.match(journal, /"kind":"CLAIM"/);
+		assert.match(journal, /"source":"a2a"/);
+		assert.equal(await runtime.wakeQueue.hasAuthority(task.id), false);
+		await runtime.wakeQueue.beforeAgentStart(prompts[0] ?? "");
+		assert.equal(await runtime.wakeQueue.hasAuthority(task.id), true);
+	} finally {
+		await runtime.close();
+	}
+});
+
 it("publishes one stateless Pi entrypoint that reloads with Jiti moduleCache disabled", async () => {
 	const manifest = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8"));
 	assert.deepEqual(manifest.pi.extensions, ["./extensions/runtime-extension.ts"]);

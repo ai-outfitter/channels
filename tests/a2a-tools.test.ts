@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { configFromEnv } from "../extensions/a2a/server.ts";
+import { type A2aExecutor, configFromEnv } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
 import { createA2aRuntimeListener, registerA2aTools } from "../extensions/a2a-extension.ts";
 
@@ -61,7 +61,9 @@ test("task-plane tools enforce active authority and reject input-required withou
 test("the runtime listener injects the task plane's one shared Task store", async () => {
 	const taskStore = new A2aTaskStore("/unused/shared-task-store.json");
 	let received: A2aTaskStore | undefined;
-	const listener = createA2aRuntimeListener({ sendUserMessage() {} } as never, {
+	let executor: A2aExecutor | undefined;
+	const claims: Array<{ source: string; taskId: string }> = [];
+	const listener = createA2aRuntimeListener({
 		enabled: () => true,
 		loadConfig: async () => ({
 			host: "127.0.0.1",
@@ -73,7 +75,8 @@ test("the runtime listener injects the task plane's one shared Task store", asyn
 			publicUrl: "http://127.0.0.1",
 			agentVersion: "test",
 		}),
-		async start(_config, _executor, sharedStore) {
+		async start(_config, inboundExecutor, sharedStore) {
+			executor = inboundExecutor;
 			received = sharedStore;
 			return {
 				url: "http://127.0.0.1:1",
@@ -88,8 +91,37 @@ test("the runtime listener injects the task plane's one shared Task store", asyn
 		},
 	});
 	assert.ok(listener);
-	const stop = await listener.start({ taskStore } as never);
+	const stop = await listener.start(
+		{ taskStore } as never,
+		{
+			async claim(input: { source: string }, taskId: string) {
+				claims.push({ source: input.source, taskId });
+				return { activationId: "a", taskId, contextId: "context-a2a", disposition: "continued" };
+			},
+		} as never,
+	);
 	assert.equal(received, taskStore);
+	assert.ok(executor);
+	await executor({
+		principal: "a2a:caller",
+		message: { messageId: "message-a2a", role: "ROLE_USER", parts: [{ text: "work" }] },
+		async begin() {
+			return {
+				task: {
+					id: "task-a2a",
+					contextId: "context-a2a",
+					status: { state: "TASK_STATE_SUBMITTED", timestamp: new Date().toISOString() },
+				},
+				async status() {
+					throw new Error("listener must not set working before queue authority");
+				},
+				async artifact() {
+					throw new Error("unused");
+				},
+			};
+		},
+	});
+	assert.deepEqual(claims, [{ source: "a2a", taskId: "task-a2a" }]);
 	await stop();
 });
 

@@ -17,7 +17,8 @@ observation, control, and hosted workload lifecycle.
 
 There are three layers:
 
-1. A **source** detects work and emits a body-free `ChannelEvent`.
+1. A **source** detects work and accepts a content-addressed activation through
+   its required task sink.
 2. The **channel tools** give the agent one stable read/respond interface.
 3. An **adapter** translates that interface to Slack, Chatto, Mattermost, Zulip,
    JMAP, Signal, GitHub, or a future transport.
@@ -120,13 +121,13 @@ Every channel implements the same `ChannelSource` contract:
 2. dynamically import the source only when that channel is selected and
    configured;
 3. start the source during `session_start`;
-4. emit a trusted `ChannelEvent` containing only a channel name, a fixed summary,
-   and an optional opaque locator;
+4. commit a native activation with stable identity, an opaque locator, and no
+   sender-controlled prompt text;
 5. close the source during `session_shutdown`.
 
-Message bodies and other sender-controlled values never belong in
-`ChannelEvent`. The action adapter fetches those values through an authenticated
-client and exposes them only inside the tool's untrusted-content markers.
+Message bodies and other sender-controlled values never belong in a wake prompt.
+The action adapter fetches those values through an authenticated client and
+exposes them only inside the tool's untrusted-content markers.
 
 ## Dynamic-import convention
 
@@ -171,20 +172,13 @@ channel-specific module failure from unrelated sources. They do not avoid
 installing declared dependencies. Separate published channel packages would be
 needed if install or image-size isolation becomes important.
 
-## Notification coalescing
+## Task wake serialization
 
-Channel-only events use their channel name as the queue key, so repeated JMAP,
-Signal, or GitHub notifications coalesce into one sweep. Located events use the
-full opaque locator, preserving distinct Slack mentions while coalescing
-duplicate delivery of the same mention. Chatto, Mattermost, and Zulip exact-item
-events use the same locator-key behavior.
-
-The wake prompt contains the locator string but no decoded native ids or message
-text. It directs the agent to pass each locator unchanged to `channel_read` and
-then `channel_respond`. Each wake contains at most 25 locators. The in-memory
-queue holds at most 500 pending events; under sustained overload, new distinct
-events are dropped with a log message while duplicates continue to coalesce.
-This bounds memory and prompt growth until the channel has durable ingestion.
+Every work-producing source commits through the task plane. Provider identity
+deduplicates redelivery before a wake is queued. The durable queue offers one
+body-free Task prompt at a time, marks that Task `WORKING` when Pi starts the
+matching turn, and grants exactly that Task as active authority. No source,
+protocol listener, or channel registry calls `pi.sendUserMessage` directly.
 
 ## Slack implementation
 
