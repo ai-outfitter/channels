@@ -66,7 +66,7 @@ export default function channelsRuntimeExtension(
 			},
 		};
 	};
-	if (listener) {
+	if (taskPlaneEnabled || listener) {
 		registerA2aTools(
 			pi,
 			taskAccess,
@@ -102,7 +102,9 @@ export default function channelsRuntimeExtension(
 				const loaded = await startRuntime(pi, {
 					storePath: join(taskPlaneRoot, "tasks.json"),
 					originStorePath: join(taskPlaneRoot, "origins.json"),
-					agentInterface: process.env.A2A_PUBLIC_URL?.trim() || "http://127.0.0.1:8788",
+					agentInterface:
+						process.env.A2A_PUBLIC_URL?.trim() ||
+						`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
 					// Channel sources receive the guarded sink from this runtime after it opens.
 					sources: [],
 					...(listener ? { listener } : {}),

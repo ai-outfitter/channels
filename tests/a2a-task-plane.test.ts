@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -10,7 +10,7 @@ import {
 	startA2aServer,
 } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
-import type { A2aSendMessageRequest, A2aTask } from "../extensions/a2a/types.ts";
+import { A2aError, type A2aSendMessageRequest, type A2aTask } from "../extensions/a2a/types.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 after(async () => {
@@ -264,6 +264,41 @@ describe("a2a task plane", () => {
 		assert.equal(snapshot.history?.length, 2);
 	});
 
+	it("a refused continuation of a working task does not persist the caller's message", async () => {
+		const rejectingExecutor: A2aExecutor = async (context) => {
+			if (context.task) {
+				throw new A2aError(400, "INVALID_ARGUMENT", "working task cannot accept supplied input");
+			}
+			const controller = await context.begin();
+			await controller.status("TASK_STATE_WORKING");
+			return undefined;
+		};
+		const server = await launch(rejectingExecutor);
+		const created = await send(server, "token-a", {
+			message: userMessage("m-working", "start work"),
+			configuration: { returnImmediately: true },
+		});
+		const task = ((await created.json()) as { task: A2aTask }).task;
+		assert.equal(task.status.state, "TASK_STATE_WORKING");
+		const before = await fetch(`${server.url}/tasks/${task.id}?historyLength=10`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		const historyBefore = ((await before.json()) as A2aTask).history;
+
+		const refused = await send(server, "token-a", {
+			message: userMessage("m-refused", "interrupt", { taskId: task.id }),
+		});
+		assert.equal(refused.status, 400);
+		const error = (await refused.json()) as { details: [{ reason: string }] };
+		assert.equal(error.details[0].reason, "INVALID_ARGUMENT");
+
+		const responseAfter = await fetch(`${server.url}/tasks/${task.id}?historyLength=10`, {
+			headers: { authorization: "Bearer token-a" },
+		});
+		const historyAfter = ((await responseAfter.json()) as A2aTask).history;
+		assert.deepEqual(historyAfter, historyBefore);
+	});
+
 	it("continuing a terminal task fails, requests without a bearer token fail, and push-notification routes are explicitly unsupported", async () => {
 		const server = await launch(completingExecutor);
 		const created = await send(server, "token-a", { message: userMessage("m-13", "work") });
@@ -403,5 +438,48 @@ describe("a2a task plane", () => {
 		assert.equal(reloaded.status.state, "TASK_STATE_COMPLETED");
 		const prior = await second.priorOutcome("alpha", message);
 		assert.deepEqual(prior, { kind: "task", taskId: task.id });
+	});
+
+	it("rejects artifacts after a Task reaches a terminal state", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-terminal-artifact-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const store = new A2aTaskStore(join(directory, "store.json"));
+		const task = await store.createTask("alpha", undefined);
+		await store.updateStatus("alpha", task.id, { state: "TASK_STATE_COMPLETED" });
+		await assert.rejects(
+			store.addArtifact("alpha", task.id, {
+				artifactId: "late",
+				name: "late",
+				parts: [{ text: "must not land" }],
+			}),
+			/already in terminal state/,
+		);
+	});
+
+	it("reaccepts a duplicate whose referenced Task was pruned", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "a2a-pruned-dedupe-"));
+		cleanups.push(() => rm(directory, { recursive: true, force: true }));
+		const path = join(directory, "store.json");
+		const first = new A2aTaskStore(path);
+		const task = await first.createTask("alpha", undefined);
+		await first.updateStatus("alpha", task.id, { state: "TASK_STATE_COMPLETED" });
+		const message = userMessage("m-pruned", "retry me");
+		await first.recordOutcome("alpha", message, { kind: "task", taskId: task.id });
+		const document = JSON.parse(await readFile(path, "utf8"));
+		const old = "2000-01-01T00:00:00.000Z";
+		document.tasks[task.id].updatedAt = old;
+		document.dedupe[0].createdAt = old;
+		await writeFile(path, JSON.stringify(document));
+		const restarted = new A2aTaskStore(path);
+		assert.equal(await restarted.priorOutcome("alpha", message), undefined);
+		const replacement = await restarted.createTask("alpha", undefined);
+		await restarted.recordOutcome("alpha", message, {
+			kind: "task",
+			taskId: replacement.id,
+		});
+		assert.deepEqual(await restarted.priorOutcome("alpha", message), {
+			kind: "task",
+			taskId: replacement.id,
+		});
 	});
 });

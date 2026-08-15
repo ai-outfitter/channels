@@ -10,6 +10,7 @@ import { errorMessage } from "../sources/util.ts";
 import type { ActivationClaim, ActivationJournal } from "./journal.ts";
 import type { OriginStore } from "./origins.ts";
 import { derivedId, serialize, sha256Hex } from "./serialize.ts";
+import { permanentIntakeFailure } from "./source-activation.ts";
 import type { ActivationEvidenceStore, ContextStore, ReplyAnchorStore } from "./stores.ts";
 import type {
 	ActivationAcceptance,
@@ -32,6 +33,11 @@ export interface TaskPlaneDependencies {
 
 export interface TaskPlane extends TaskActivationSink {
 	readonly taskStore: A2aTaskStore;
+	/** Trusted protocol intake: reuse an owned context exactly, otherwise mint one. */
+	acceptInContext(
+		input: NativeActivation,
+		requestedContextId: string,
+	): Promise<ActivationAcceptance>;
 	beginNew(principal: string, contextId: string): ReturnType<A2aTaskStore["beginNew"]>;
 	replayIncomplete(): Promise<void>;
 	recordReplyAnchor(
@@ -101,6 +107,7 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 		input: NativeActivation,
 		selectTask?: () => Promise<string | undefined>,
 		taskAlreadyPersisted = false,
+		selectContext?: () => Promise<string>,
 	): Promise<ActivationAcceptance> =>
 		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keeps the reviewed eleven acceptance boundaries visibly in one serialized transaction
 		locked(async () => {
@@ -125,12 +132,14 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 				const selectedTaskId = await selectTask?.();
 				const contextId = selectedTaskId
 					? (await dependencies.tasks.getTask(input.principal, selectedTaskId)).contextId
-					: await dependencies.contexts.resolve(
-							input.principal,
-							input.source,
-							input.conversationKey,
-							new Date(input.receivedAt),
-						);
+					: selectContext
+						? await selectContext()
+						: await dependencies.contexts.resolve(
+								input.principal,
+								input.source,
+								input.conversationKey,
+								new Date(input.receivedAt),
+							);
 				await crash(2);
 				claim = {
 					kind: "CLAIM",
@@ -163,6 +172,17 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 	const plane: TaskPlane = {
 		taskStore: dependencies.tasks,
 		accept: (input) => submit(input),
+		acceptInContext: (input, requestedContextId) =>
+			submit(input, undefined, false, async () =>
+				(await dependencies.tasks.ownsContext(input.principal, requestedContextId))
+					? requestedContextId
+					: dependencies.contexts.resolve(
+							input.principal,
+							input.source,
+							undefined,
+							new Date(input.receivedAt),
+						),
+			),
 		async continue(input: NativeContinuation) {
 			if (input.taskId) {
 				return submit(input, async () => {
@@ -208,6 +228,7 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 			),
 		beginNew: (principal, contextId) => dependencies.tasks.beginNew(principal, contextId),
 		async replayIncomplete() {
+			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: replay keeps poison and transient persistence outcomes visibly distinct
 			await locked(async () => {
 				for (const claim of dependencies.journal.claims()) {
 					if (
@@ -220,19 +241,25 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 						validateActivation(claim.input);
 						await project(claim);
 					} catch (error) {
+						if (!permanentIntakeFailure(error)) continue;
 						const message = errorMessage(error);
-						await dependencies.evidence.appendUnhealthy(
-							claim.activationId,
-							claim.taskId,
-							claim.input.source,
-							message,
-						);
-						await dependencies.journal.append({
-							kind: "QUARANTINED",
-							activationId: claim.activationId,
-							error: message,
-							quarantinedAt: new Date().toISOString(),
-						});
+						try {
+							await dependencies.evidence.appendUnhealthy(
+								claim.activationId,
+								claim.taskId,
+								claim.input.source,
+								message,
+							);
+							await dependencies.journal.append({
+								kind: "QUARANTINED",
+								activationId: claim.activationId,
+								error: message,
+								quarantinedAt: new Date().toISOString(),
+							});
+						} catch {
+							// Evidence persistence is itself transient. Leave the claim
+							// incomplete so the next boot can retry the full projection.
+						}
 					}
 				}
 			});

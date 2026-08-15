@@ -67,7 +67,14 @@ export interface A2aExecutorContext {
  * executor is configured at deployment, and nothing in the inbound message
  * selects an agent, tool set, or workflow topology.
  */
-export type A2aExecutor = (context: A2aExecutorContext) => Promise<A2aMessage | undefined>;
+export interface A2aExecutorTask {
+	readonly kind: "task";
+	readonly taskId: string;
+}
+
+export type A2aExecutor = (
+	context: A2aExecutorContext,
+) => Promise<A2aMessage | A2aExecutorTask | undefined>;
 
 export interface RunningA2aServer {
 	readonly url: string;
@@ -170,7 +177,7 @@ export async function startA2aServer(
 		if (message.contextId && message.contextId !== existing.contextId) {
 			throw new A2aError(400, "INVALID_ARGUMENT", "contextId does not match the task's context");
 		}
-		return store.appendHistory(principal, existing.id, message);
+		return existing;
 	};
 
 	const mintTask = async (principal: string, message: A2aMessage): Promise<A2aTask> => {
@@ -185,6 +192,7 @@ export async function startA2aServer(
 	const executeSend = async (
 		principal: string,
 		request: A2aSendMessageRequest,
+		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: protocol outcomes and persistence failures remain explicit in one boundary
 	): Promise<ExecutionOutcome> => {
 		const message = validateMessage(request.message, "ROLE_USER");
 		const replay = await replayPrior(principal, message);
@@ -193,7 +201,9 @@ export async function startA2aServer(
 		let controller: A2aTaskController | undefined;
 		const begin = async (): Promise<A2aTaskController> => {
 			if (controller) return controller;
-			const bound = existing ?? (await mintTask(principal, message));
+			const bound = existing
+				? await store.appendHistory(principal, existing.id, message)
+				: await mintTask(principal, message);
 			controller = controllerFor(principal, bound);
 			emit(bound.id, { task: bound });
 			return controller;
@@ -206,10 +216,17 @@ export async function startA2aServer(
 		};
 		try {
 			const direct = await executor(context);
+			if (isExecutorTask(direct)) {
+				return {
+					response: { task: await store.getTask(principal, direct.taskId) },
+					taskId: direct.taskId,
+				};
+			}
 			if (controller) return recordTaskOutcome(principal, message, controller.task.id);
 			if (!direct) {
 				throw new A2aError(500, "INTERNAL", "executor returned neither a task nor a message");
 			}
+			if (existing) await store.appendHistory(principal, existing.id, message);
 			const reply: A2aMessage = {
 				...direct,
 				messageId: direct.messageId || randomUUID(),
@@ -481,6 +498,10 @@ function authenticate(request: IncomingMessage, credentials: readonly A2aCredent
 		throw new A2aError(401, "UNAUTHENTICATED", "a valid bearer token is required");
 	}
 	return credential.principal;
+}
+
+function isExecutorTask(value: A2aMessage | A2aExecutorTask | undefined): value is A2aExecutorTask {
+	return Boolean(value && "kind" in value && value.kind === "task" && !("parts" in value));
 }
 
 function openEventStream(response: ServerResponse): void {

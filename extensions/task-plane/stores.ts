@@ -266,6 +266,16 @@ export class ReplyAnchorStore extends JsonStore<ReplyAnchorData> {
 				)?.taskId,
 		);
 	}
+
+	async prune(now: number, retainedTaskIds: ReadonlySet<string>): Promise<void> {
+		return this.run(async () => {
+			const cutoff = now - RETENTION_MS;
+			this.data.anchors = this.data.anchors.filter(
+				(entry) => retainedTaskIds.has(entry.taskId) || Date.parse(entry.createdAt) >= cutoff,
+			);
+			await this.persist();
+		});
+	}
 }
 
 interface DeliveryData {
@@ -298,6 +308,19 @@ export class OutboundDeliveryStore extends JsonStore<DeliveryData> {
 			Object.values(this.data.deliveries).filter((delivery) => delivery.state === "sending"),
 		);
 	}
+
+	async prune(now: number, retainedTaskIds: ReadonlySet<string>): Promise<void> {
+		return this.run(async () => {
+			const cutoff = now - RETENTION_MS;
+			this.data.deliveries = Object.fromEntries(
+				Object.entries(this.data.deliveries).filter(
+					([, delivery]) =>
+						retainedTaskIds.has(delivery.taskId) || Date.parse(delivery.updatedAt) >= cutoff,
+				),
+			);
+			await this.persist();
+		});
+	}
 }
 
 interface ActivationEvidenceRecord {
@@ -321,6 +344,8 @@ interface UnhealthyEvidenceRecord {
 interface SourceEvidenceRecord extends SourceEvidenceInput {
 	readonly recordType: "source.evidence";
 	readonly recordedAt: string;
+	count?: number;
+	lastRecordedAt?: string;
 }
 
 type EvidenceRecord = ActivationEvidenceRecord | UnhealthyEvidenceRecord | SourceEvidenceRecord;
@@ -402,16 +427,37 @@ export class ActivationEvidenceStore extends JsonStore<EvidenceData> {
 				if (
 					prior.source !== input.source ||
 					prior.kind !== input.kind ||
+					prior.aggregation !== input.aggregation ||
 					JSON.stringify(prior.detail) !== JSON.stringify(input.detail)
 				) {
 					throw new Error("source evidence conflicts with its durable record");
 				}
+				if (input.aggregation === "counter") {
+					prior.count = (prior.count ?? 1) + 1;
+					prior.lastRecordedAt = new Date().toISOString();
+					await this.persist();
+				}
 				return;
 			}
+			const recordedAt = new Date().toISOString();
 			this.data.records.push({
 				...input,
 				recordType: "source.evidence",
-				recordedAt: new Date().toISOString(),
+				recordedAt,
+				...(input.aggregation === "counter" ? { count: 1, lastRecordedAt: recordedAt } : {}),
+			});
+			await this.persist();
+		});
+	}
+
+	async prune(now: number, retainedTaskIds: ReadonlySet<string>): Promise<void> {
+		return this.run(async () => {
+			const cutoff = now - RETENTION_MS;
+			this.data.records = this.data.records.filter((record) => {
+				const lastRecordedAt =
+					record.recordType === "source.evidence" ? record.lastRecordedAt : undefined;
+				if (Date.parse(lastRecordedAt ?? record.recordedAt) >= cutoff) return true;
+				return "taskId" in record && retainedTaskIds.has(record.taskId);
 			});
 			await this.persist();
 		});

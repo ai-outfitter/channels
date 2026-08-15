@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { A2aTaskStore } from "../a2a/store.ts";
 import { isTerminal } from "../a2a/types.ts";
 import { errorMessage } from "../sources/util.ts";
-import { ActivationJournal } from "./journal.ts";
+import { type ActivationClaim, ActivationJournal } from "./journal.ts";
 import { OriginStore } from "./origins.ts";
 import { createTaskPlane, type TaskPlane } from "./plane.ts";
 import { derivedId } from "./serialize.ts";
@@ -76,7 +76,6 @@ export async function startChannelsRuntime(
 		deliveries.initialize(),
 		journal.initialize(),
 	]);
-	await contexts.prune(Date.now(), await tasks.activeContextIds());
 	const wakeQueue = new DurableWakeQueue(pi, tasks, journal, log);
 	const taskPlane = createTaskPlane({
 		tasks,
@@ -90,6 +89,14 @@ export async function startChannelsRuntime(
 	});
 	// 2. Repair projections before the sink is exposed to any source.
 	await taskPlane.replayIncomplete();
+	const retainedTaskIds = await tasks.retainedTaskIds();
+	await Promise.all([
+		journal.compact(Date.now(), retainedTaskIds),
+		contexts.prune(Date.now(), await tasks.activeContextIds()),
+		evidence.prune(Date.now(), retainedTaskIds),
+		replyAnchors.prune(Date.now(), retainedTaskIds),
+		deliveries.prune(Date.now(), retainedTaskIds),
+	]);
 	// 3-4. The task plane/sink and queue now exist. Hook registration is owned
 	// by the caller's single Pi entrypoint before it invokes this start routine.
 
@@ -97,6 +104,7 @@ export async function startChannelsRuntime(
 	const buffered: Array<() => void> = [];
 	let intakeOpen = false;
 	let listenerHealthy = true;
+	const deliveryOperations = new Map<string, Promise<string | undefined>>();
 	const guardedSink: TaskActivationSink = {
 		accept: async (input) => {
 			if (!intakeOpen) throw new Error("channels intake is not ready");
@@ -123,12 +131,18 @@ export async function startChannelsRuntime(
 		advanceCheckpoint: (principal, source, checkpoint) =>
 			checkpoints.advance(principal, source, checkpoint),
 		async taskForLocator(source, locator) {
-			const claim = [...journal.claims()]
-				.reverse()
-				.find(
-					(entry) =>
-						entry.input.source === source && entry.input.nativeLocator.channelLocator === locator,
-				);
+			let claim: ActivationClaim | undefined;
+			const claims = journal.claims();
+			for (let index = claims.length - 1; index >= 0; index -= 1) {
+				const candidate = claims[index];
+				if (
+					candidate?.input.source === source &&
+					candidate.input.nativeLocator.channelLocator === locator
+				) {
+					claim = candidate;
+					break;
+				}
+			}
 			if (!claim || !(await wakeQueue.hasAuthority(claim.taskId))) {
 				throw new Error("channel locator is not authorized for the active Task");
 			}
@@ -140,94 +154,113 @@ export async function startChannelsRuntime(
 			return isTerminal(stored.task.status.state);
 		},
 		recordEvidence: (input) => evidence.appendSource(input),
-		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep every durable delivery transition visible in one state machine
 		async deliver(input, send, reconcile) {
 			const deliveryId = derivedId(
 				"delivery",
 				`${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
 			);
-			let delivery = await deliveries.get(deliveryId);
-			if (delivery?.state === "delivered") return delivery.providerResponseId;
-			if (delivery?.state === "ambiguous") {
-				log({
-					event: "channels_unhealthy",
-					source: input.source,
-					taskId: input.taskId,
-					deliveryId,
-				});
-				throw new Error("outbound delivery is ambiguous");
-			}
-			if (delivery?.state === "sending") {
-				if (delivery.recovery === "lookup" && reconcile) {
-					const recovered = await reconcile();
-					if (recovered) {
+			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep every durable delivery transition visible in one state machine
+			const run = async (): Promise<string | undefined> => {
+				let delivery = await deliveries.get(deliveryId);
+				if (delivery?.state === "delivered") return delivery.providerResponseId;
+				if (delivery?.state === "ambiguous") {
+					log({
+						event: "channels_unhealthy",
+						source: input.source,
+						taskId: input.taskId,
+						deliveryId,
+					});
+					throw new Error("outbound delivery is ambiguous");
+				}
+				if (delivery?.state === "sending") {
+					if (delivery.recovery === "lookup" && reconcile) {
+						const recovered = await reconcile();
+						if (recovered) {
+							await deliveries.put({
+								...delivery,
+								state: "delivered",
+								providerResponseId: recovered,
+								updatedAt: new Date().toISOString(),
+							});
+							return recovered;
+						}
+					} else if (delivery.recovery === "ambiguous" || delivery.recovery === "lookup") {
+						const message =
+							delivery.recovery === "lookup"
+								? "provider lookup recovery is unavailable after restart"
+								: "provider result could not be reconciled after restart";
 						await deliveries.put({
 							...delivery,
-							state: "delivered",
-							providerResponseId: recovered,
+							state: "ambiguous",
 							updatedAt: new Date().toISOString(),
+							error: message,
 						});
-						return recovered;
+						await evidence.appendUnhealthy(deliveryId, input.taskId, input.source, message);
+						log({
+							event: "channels_unhealthy",
+							source: input.source,
+							taskId: input.taskId,
+							deliveryId,
+							error: message,
+						});
+						throw new Error("outbound delivery became ambiguous after restart");
 					}
-				} else if (delivery.recovery === "ambiguous") {
-					const message = "provider result could not be reconciled after restart";
+				}
+				delivery ??= {
+					...input,
+					deliveryId,
+					state: "prepared",
+					updatedAt: new Date().toISOString(),
+				};
+				await deliveries.put({
+					...delivery,
+					state: "sending",
+					updatedAt: new Date().toISOString(),
+				});
+				try {
+					const providerResponseId = await send();
 					await deliveries.put({
 						...delivery,
-						state: "ambiguous",
+						state: "delivered",
+						...(providerResponseId ? { providerResponseId } : {}),
 						updatedAt: new Date().toISOString(),
-						error: message,
 					});
-					await evidence.appendUnhealthy(
-						derivedId("delivery", deliveryId),
-						input.taskId,
-						input.source,
-						message,
-					);
-					log({
-						event: "channels_unhealthy",
-						source: input.source,
-						taskId: input.taskId,
-						deliveryId,
-						error: message,
-					});
-					throw new Error("outbound delivery became ambiguous after restart");
-				}
-			}
-			delivery ??= { ...input, deliveryId, state: "prepared", updatedAt: new Date().toISOString() };
-			await deliveries.put({ ...delivery, state: "sending", updatedAt: new Date().toISOString() });
-			try {
-				const providerResponseId = await send();
-				await deliveries.put({
-					...delivery,
-					state: "delivered",
-					...(providerResponseId ? { providerResponseId } : {}),
-					updatedAt: new Date().toISOString(),
-				});
-				return providerResponseId;
-			} catch (error) {
-				const ambiguous = input.recovery === "ambiguous" && !isDeterminateProviderRejection(error);
-				await deliveries.put({
-					...delivery,
-					state: ambiguous ? "ambiguous" : "failed",
-					updatedAt: new Date().toISOString(),
-					error: errorMessage(error),
-				});
-				if (ambiguous) {
-					await evidence.appendUnhealthy(
-						derivedId("delivery", deliveryId),
-						input.taskId,
-						input.source,
-						errorMessage(error),
-					);
-					log({
-						event: "channels_unhealthy",
-						source: input.source,
-						taskId: input.taskId,
-						deliveryId,
+					return providerResponseId;
+				} catch (error) {
+					const determinate = isDeterminateProviderRejection(error);
+					const ambiguous = input.recovery === "ambiguous" && !determinate;
+					const indeterminateLookup = input.recovery === "lookup" && !determinate;
+					await deliveries.put({
+						...delivery,
+						state: indeterminateLookup ? "sending" : ambiguous ? "ambiguous" : "failed",
+						updatedAt: new Date().toISOString(),
 						error: errorMessage(error),
 					});
+					if (ambiguous) {
+						await evidence.appendUnhealthy(
+							deliveryId,
+							input.taskId,
+							input.source,
+							errorMessage(error),
+						);
+						log({
+							event: "channels_unhealthy",
+							source: input.source,
+							taskId: input.taskId,
+							deliveryId,
+							error: errorMessage(error),
+						});
+					}
+					throw error;
 				}
-				throw error;
+			};
+			const prior = deliveryOperations.get(deliveryId) ?? Promise.resolve(undefined);
+			const operation = prior.then(run, run);
+			deliveryOperations.set(deliveryId, operation);
+			try {
+				return await operation;
+			} finally {
+				if (deliveryOperations.get(deliveryId) === operation) deliveryOperations.delete(deliveryId);
 			}
 		},
 	};

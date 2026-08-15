@@ -62,7 +62,7 @@ test("the runtime listener injects the task plane's one shared Task store", asyn
 	const taskStore = new A2aTaskStore("/unused/shared-task-store.json");
 	let received: A2aTaskStore | undefined;
 	let executor: A2aExecutor | undefined;
-	const claims: Array<{ source: string; taskId: string }> = [];
+	const activations: Array<{ source: string; contentDigest: string }> = [];
 	const listener = createA2aRuntimeListener({
 		enabled: () => true,
 		loadConfig: async () => ({
@@ -94,15 +94,20 @@ test("the runtime listener injects the task plane's one shared Task store", asyn
 	const stop = await listener.start(
 		{ taskStore } as never,
 		{
-			async claim(input: { source: string }, taskId: string) {
-				claims.push({ source: input.source, taskId });
-				return { activationId: "a", taskId, contextId: "context-a2a", disposition: "continued" };
+			async accept(input: { source: string; contentDigest: string }) {
+				activations.push(input);
+				return {
+					activationId: "a",
+					taskId: "task-a2a",
+					contextId: "context-a2a",
+					disposition: "created",
+				};
 			},
 		} as never,
 	);
 	assert.equal(received, taskStore);
 	assert.ok(executor);
-	await executor({
+	const outcome = await executor({
 		principal: "a2a:caller",
 		message: { messageId: "message-a2a", role: "ROLE_USER", parts: [{ text: "work" }] },
 		async begin() {
@@ -121,8 +126,132 @@ test("the runtime listener injects the task plane's one shared Task store", asyn
 			};
 		},
 	});
-	assert.deepEqual(claims, [{ source: "a2a", taskId: "task-a2a" }]);
+	assert.deepEqual(outcome, { kind: "task", taskId: "task-a2a" });
+	assert.equal(activations.length, 1);
+	assert.equal(activations[0]?.source, "a2a");
 	await stop();
+});
+
+test("A2A journal acceptance survives a crash without minting or conflicting on retry", async () => {
+	let executor: A2aExecutor | undefined;
+	let accepted = false;
+	let calls = 0;
+	const inputs: Array<{ contentDigest: string; conversationKey?: string }> = [];
+	const listener = createA2aRuntimeListener({
+		enabled: () => true,
+		loadConfig: async () => ({
+			host: "127.0.0.1",
+			port: 0,
+			storePath: "",
+			credentials: [],
+			agentName: "test",
+			agentDescription: "test",
+			publicUrl: "http://127.0.0.1",
+			agentVersion: "test",
+		}),
+		async start(_config, inboundExecutor) {
+			executor = inboundExecutor;
+			return {
+				url: "http://127.0.0.1:1",
+				async close() {},
+				async readTask() {
+					return undefined;
+				},
+				async controllerForTask() {
+					return undefined;
+				},
+			};
+		},
+	});
+	assert.ok(listener);
+	await listener.start(
+		{ taskStore: {} } as never,
+		{
+			async accept(input: { contentDigest: string; conversationKey?: string }) {
+				calls += 1;
+				inputs.push(input);
+				if (!accepted) {
+					accepted = true;
+					throw new Error("crash after durable journal claim");
+				}
+				return {
+					activationId: "activation-prior",
+					taskId: "task-prior",
+					contextId: "context-prior",
+					disposition: "duplicate",
+				};
+			},
+		} as never,
+	);
+	assert.ok(executor);
+	const context = {
+		principal: "a2a:caller",
+		message: { messageId: "message-retry", role: "ROLE_USER" as const, parts: [{ text: "work" }] },
+		async begin() {
+			throw new Error("the listener must not mint before journal acceptance");
+		},
+	};
+	await assert.rejects(executor(context), /crash after durable journal claim/);
+	assert.deepEqual(await executor(context), { kind: "task", taskId: "task-prior" });
+	assert.equal(calls, 2);
+	assert.equal(inputs[0]?.contentDigest, inputs[1]?.contentDigest);
+});
+
+test("A2A persistence failure propagates and leaves intake retryable", async () => {
+	let executor: A2aExecutor | undefined;
+	let attempts = 0;
+	const listener = createA2aRuntimeListener({
+		enabled: () => true,
+		loadConfig: async () => ({
+			host: "127.0.0.1",
+			port: 0,
+			storePath: "",
+			credentials: [],
+			agentName: "test",
+			agentDescription: "test",
+			publicUrl: "http://127.0.0.1",
+			agentVersion: "test",
+		}),
+		async start(_config, inboundExecutor) {
+			executor = inboundExecutor;
+			return {
+				url: "http://127.0.0.1:1",
+				async close() {},
+				async readTask() {
+					return undefined;
+				},
+				async controllerForTask() {
+					return undefined;
+				},
+			};
+		},
+	});
+	assert.ok(listener);
+	await listener.start(
+		{ taskStore: {} } as never,
+		{
+			async accept() {
+				attempts += 1;
+				if (attempts === 1) throw new Error("journal fsync failed");
+				return {
+					activationId: "activation-new",
+					taskId: "task-new",
+					contextId: "context-new",
+					disposition: "created",
+				};
+			},
+		} as never,
+	);
+	assert.ok(executor);
+	const context = {
+		principal: "a2a:caller",
+		message: { messageId: "message-fsync", role: "ROLE_USER" as const, parts: [{ text: "work" }] },
+		async begin() {
+			throw new Error("must not mint before persistence");
+		},
+	};
+	await assert.rejects(executor(context), /journal fsync failed/);
+	assert.deepEqual(await executor(context), { kind: "task", taskId: "task-new" });
 });
 
 test("composed A2A configuration does not require the retired standalone store path", async () => {

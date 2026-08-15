@@ -104,9 +104,10 @@ export class A2aTaskStore {
 		message: A2aMessage,
 	): Promise<DedupeRecord["outcome"] | undefined> {
 		return this.#run(async () => {
-			const record = this.#data.dedupe.find(
+			const index = this.#data.dedupe.findIndex(
 				(entry) => entry.principal === principal && entry.messageId === message.messageId,
 			);
+			const record = this.#data.dedupe[index];
 			if (!record) return undefined;
 			if (record.payloadHash !== hashPayload(message)) {
 				throw new A2aError(
@@ -114,6 +115,11 @@ export class A2aTaskStore {
 					"DUPLICATE_MESSAGE_ID",
 					`messageId "${message.messageId}" was already used with a different payload`,
 				);
+			}
+			if (record.outcome.kind === "task" && !this.#data.tasks[record.outcome.taskId]) {
+				this.#data.dedupe.splice(index, 1);
+				await this.#persist();
+				return undefined;
 			}
 			return record.outcome;
 		});
@@ -125,13 +131,18 @@ export class A2aTaskStore {
 		outcome: DedupeRecord["outcome"],
 	): Promise<void> {
 		return this.#run(async () => {
-			this.#data.dedupe.push({
+			const record = {
 				principal,
 				messageId: message.messageId,
 				payloadHash: hashPayload(message),
 				createdAt: new Date().toISOString(),
 				outcome,
-			});
+			} as const;
+			const prior = this.#data.dedupe.findIndex(
+				(entry) => entry.principal === principal && entry.messageId === message.messageId,
+			);
+			if (prior >= 0) this.#data.dedupe[prior] = record;
+			else this.#data.dedupe.push(record);
 			if (this.#data.dedupe.length > MAX_DEDUPE_RECORDS) {
 				this.#data.dedupe.splice(0, this.#data.dedupe.length - MAX_DEDUPE_RECORDS);
 			}
@@ -203,6 +214,14 @@ export class A2aTaskStore {
 		return this.#run(async () => this.#data.tasks[taskId]);
 	}
 
+	async ownsContext(principal: string, contextId: string): Promise<boolean> {
+		return this.#run(async () => {
+			validateIdentifier(principal, "principal");
+			validateIdentifier(contextId, "contextId");
+			return this.#principalOwnsContext(principal, contextId);
+		});
+	}
+
 	/**
 	 * Contexts still referenced by any retained Task, across every principal.
 	 * Terminal Tasks remain durable for TASK_RETENTION_MS and keep their context
@@ -212,6 +231,10 @@ export class A2aTaskStore {
 		return this.#run(
 			async () => new Set(Object.values(this.#data.tasks).map((entry) => entry.task.contextId)),
 		);
+	}
+
+	async retainedTaskIds(): Promise<ReadonlySet<string>> {
+		return this.#run(async () => new Set(Object.keys(this.#data.tasks)));
 	}
 
 	async listTasks(principal: string, filter: ListTasksFilter): Promise<readonly A2aTask[]> {
@@ -289,6 +312,13 @@ export class A2aTaskStore {
 	async addArtifact(principal: string, taskId: string, artifact: A2aArtifact): Promise<A2aTask> {
 		return this.#run(async () => {
 			const stored = this.#owned(principal, taskId);
+			if (isTerminal(stored.task.status.state)) {
+				throw new A2aError(
+					400,
+					"UNSUPPORTED_OPERATION",
+					`task "${taskId}" is already in terminal state ${stored.task.status.state}`,
+				);
+			}
 			const artifacts = [
 				...(stored.task.artifacts ?? []).filter(
 					(entry) => entry.artifactId !== artifact.artifactId,
@@ -352,6 +382,9 @@ export class A2aTaskStore {
 		}
 		const dedupeCutoff = new Date(now - DEDUPE_RETENTION_MS).toISOString();
 		this.#data.dedupe = this.#data.dedupe.filter((entry) => {
+			if (entry.outcome.kind === "task" && !(entry.outcome.taskId in this.#data.tasks)) {
+				return false;
+			}
 			if (entry.createdAt >= dedupeCutoff) return true;
 			// Never expire a dedupe record before its task: the retention
 			// contract is max(window, referenced task lifetime).

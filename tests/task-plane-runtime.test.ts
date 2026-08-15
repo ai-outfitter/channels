@@ -4,8 +4,10 @@ import { appendFile, chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { A2aTaskStore } from "../extensions/a2a/store.ts";
+import type { A2aExecutor } from "../extensions/a2a/server.ts";
+import { A2aTaskStore, TASK_RETENTION_MS } from "../extensions/a2a/store.ts";
 import type { A2aTaskState } from "../extensions/a2a/types.ts";
+import { createA2aRuntimeListener } from "../extensions/a2a-extension.ts";
 import { ActivationJournal } from "../extensions/task-plane/journal.ts";
 import { OriginStore } from "../extensions/task-plane/origins.ts";
 import { createTaskPlane, type TaskPlane } from "../extensions/task-plane/plane.ts";
@@ -195,6 +197,18 @@ it("rolls back a failed journal append before retrying the same claim", async ()
 	assert.equal(restarted.claimByProviderKey(claim.providerKey)?.activationId, claim.activationId);
 });
 
+it("sweeps stale journal compaction temporaries during startup", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-journal-stale-compact-"));
+	const path = join(root, "activation.v1.jsonl");
+	const stale = `${path}.1234.abcd.compact.tmp`;
+	const unrelated = join(root, "other.compact.tmp");
+	await writeFile(stale, "stale");
+	await writeFile(unrelated, "keep");
+	await new ActivationJournal(path).initialize();
+	await assert.rejects(stat(stale), { code: "ENOENT" });
+	assert.equal((await stat(unrelated)).isFile(), true);
+});
+
 // B4's directory fsync is verified by inspection. Node's fs API does not expose
 // a portable behavioral observation for a directory entry reaching stable storage.
 
@@ -333,6 +347,190 @@ it("retains a context while any retained terminal Task still references it", asy
 	await contexts.initialize();
 	await contexts.prune(Date.now(), await tasks.activeContextIds());
 	assert.equal(await contexts.resolve("source:user", "test", "conversation-retained"), contextId);
+});
+
+it("compacts expired task-plane records, retains pending/live state, and reaccepts pruned dedupe", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-retention-"));
+	const old = new Date(Date.now() - TASK_RETENTION_MS - 60_000).toISOString();
+	const activeTaskId = "task-retained";
+	const prunedTaskId = "task-pruned";
+	const taskDocument = {
+		version: 1,
+		tasks: {
+			[activeTaskId]: {
+				principal: "source:user",
+				updatedAt: old,
+				task: {
+					id: activeTaskId,
+					contextId: "context-retained",
+					status: { state: "TASK_STATE_INPUT_REQUIRED", timestamp: old },
+					artifacts: [],
+					history: [],
+				},
+			},
+			[prunedTaskId]: {
+				principal: "source:user",
+				updatedAt: old,
+				task: {
+					id: prunedTaskId,
+					contextId: "context-pruned",
+					status: { state: "TASK_STATE_COMPLETED", timestamp: old },
+					artifacts: [],
+					history: [],
+				},
+			},
+		},
+		dedupe: [],
+	};
+	await writeFile(join(root, "tasks.json"), JSON.stringify(taskDocument));
+	const journal = new ActivationJournal(join(root, "activation-journal.v1.jsonl"));
+	await journal.initialize();
+	const retainedClaim = {
+		kind: "CLAIM" as const,
+		providerKey: "source:user\0test\0retained",
+		activationId: derivedId("activation", "source:user\0test\0retained"),
+		taskId: activeTaskId,
+		input: activation("retained"),
+		contextId: "context-retained",
+		intendedRoute: "created" as const,
+		claimedAt: old,
+	};
+	const prunedClaim = {
+		kind: "CLAIM" as const,
+		providerKey: "source:user\0test\0pruned",
+		activationId: derivedId("activation", "source:user\0test\0pruned"),
+		taskId: prunedTaskId,
+		input: activation("pruned"),
+		contextId: "context-pruned",
+		intendedRoute: "created" as const,
+		claimedAt: old,
+	};
+	for (const claim of [retainedClaim, prunedClaim]) {
+		await journal.append(claim);
+		await journal.append({ kind: "ACCEPTED", activationId: claim.activationId, acceptedAt: old });
+	}
+	await writeFile(
+		join(root, "activation-evidence.v1.json"),
+		JSON.stringify({
+			version: 1,
+			records: [
+				{
+					activationId: retainedClaim.activationId,
+					taskId: activeTaskId,
+					recordType: "task.activation",
+					contentDigest: retainedClaim.input.contentDigest,
+					locator: retainedClaim.input.nativeLocator,
+					recordedAt: old,
+				},
+				{
+					activationId: prunedClaim.activationId,
+					taskId: prunedTaskId,
+					recordType: "task.activation",
+					contentDigest: prunedClaim.input.contentDigest,
+					locator: prunedClaim.input.nativeLocator,
+					recordedAt: old,
+				},
+				{
+					evidenceId: "expired-source-evidence",
+					source: "slack",
+					kind: "permanent-non-work",
+					recordType: "source.evidence",
+					recordedAt: old,
+				},
+			],
+		}),
+	);
+	await writeFile(
+		join(root, "reply-anchors.v1.json"),
+		JSON.stringify({
+			version: 1,
+			anchors: [
+				{
+					principal: "source:user",
+					source: "slack",
+					providerResponseId: "response-retained",
+					taskId: activeTaskId,
+					createdAt: old,
+				},
+				{
+					principal: "source:user",
+					source: "slack",
+					providerResponseId: "response-pruned",
+					taskId: prunedTaskId,
+					createdAt: old,
+				},
+			],
+		}),
+	);
+	await writeFile(
+		join(root, "outbound-deliveries.v1.json"),
+		JSON.stringify({
+			version: 1,
+			deliveries: {
+				"delivery-retained": {
+					deliveryId: "delivery-retained",
+					taskId: activeTaskId,
+					source: "slack",
+					operationId: "reply:retained",
+					payloadDigest: digest("retained"),
+					recovery: "lookup",
+					state: "delivered",
+					updatedAt: old,
+				},
+				"delivery-pruned": {
+					deliveryId: "delivery-pruned",
+					taskId: prunedTaskId,
+					source: "slack",
+					operationId: "reply:pruned",
+					payloadDigest: digest("pruned"),
+					recovery: "lookup",
+					state: "delivered",
+					updatedAt: old,
+				},
+				"delivery-pending": {
+					deliveryId: "delivery-pending",
+					taskId: prunedTaskId,
+					source: "slack",
+					operationId: "reply:pending",
+					payloadDigest: digest("pending"),
+					recovery: "lookup",
+					state: "sending",
+					updatedAt: old,
+				},
+			},
+		}),
+	);
+
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	const compactedJournal = new ActivationJournal(join(root, "activation-journal.v1.jsonl"));
+	await compactedJournal.initialize();
+	assert.deepEqual(
+		compactedJournal.claims().map((claim) => claim.taskId),
+		[activeTaskId],
+	);
+	const evidence = JSON.parse(await readFile(join(root, "activation-evidence.v1.json"), "utf8"));
+	assert.deepEqual(
+		evidence.records.map((record: { taskId?: string }) => record.taskId),
+		[activeTaskId],
+	);
+	const anchors = JSON.parse(await readFile(join(root, "reply-anchors.v1.json"), "utf8"));
+	assert.deepEqual(
+		anchors.anchors.map((anchor: { taskId: string }) => anchor.taskId),
+		[activeTaskId],
+	);
+	const deliveries = JSON.parse(await readFile(join(root, "outbound-deliveries.v1.json"), "utf8"));
+	assert.deepEqual(Object.keys(deliveries.deliveries), ["delivery-retained"]);
+	const reaccepted = await runtime.sink.accept(activation("pruned"));
+	assert.equal(reaccepted.disposition, "created");
+	assert.notEqual(reaccepted.taskId, prunedTaskId);
+	await runtime.close();
 });
 
 describe("verified continuation", () => {
@@ -536,6 +734,36 @@ it("rejects invalid intake before journaling and quarantines poisoned replay cla
 	);
 });
 
+it("leaves a transient projection failure incomplete for the next replay", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-transient-replay-"));
+	const { plane, journal, tasks } = await fixture(root);
+	const claim = {
+		kind: "CLAIM" as const,
+		providerKey: "source:user\0test\0transient-replay",
+		activationId: "activation-transient-replay",
+		taskId: randomUUID(),
+		input: activation("transient-replay"),
+		contextId: randomUUID(),
+		intendedRoute: "created" as const,
+		claimedAt: new Date().toISOString(),
+	};
+	await journal.append(claim);
+	const create = tasks.createTaskWithId.bind(tasks);
+	let fail = true;
+	tasks.createTaskWithId = async (...args) => {
+		if (fail) {
+			fail = false;
+			throw Object.assign(new Error("temporary disk failure"), { code: "EIO" });
+		}
+		return create(...args);
+	};
+	await plane.replayIncomplete();
+	assert.equal(journal.isAccepted(claim.activationId), false);
+	assert.equal(journal.isQuarantined(claim.activationId), false);
+	await plane.replayIncomplete();
+	assert.equal(journal.isAccepted(claim.activationId), true);
+});
+
 it("offers FIFO wakes only after ACCEPTED is durable and skips canceled queued work", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-"));
 	const { plane, tasks, journal } = await fixture(root);
@@ -681,6 +909,167 @@ it("re-offers exactly once after a crash following WOKEN for a non-terminal Task
 	recoveredQueue.stop();
 });
 
+it("crash-after-continuation replay supersedes stale input-required state with the accepted answer", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-input-required-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("question"));
+	const firstPrompts: string[] = [];
+	const firstQueue = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => firstPrompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	firstQueue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await new Promise((resolve) => setImmediate(resolve));
+	await firstQueue.beforeAgentStart(firstPrompts[0] as string);
+	const question = {
+		messageId: "question-1",
+		role: "ROLE_AGENT" as const,
+		parts: [{ text: "Which environment?" }],
+	};
+	await tasks.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_INPUT_REQUIRED",
+		message: question,
+	});
+	firstQueue.stop();
+	const answer = await plane.continue({
+		...activation("answer"),
+		taskId: accepted.taskId,
+	});
+	assert.equal(answer.disposition, "continued");
+
+	const replayedPrompts: string[] = [];
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => replayedPrompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	await replayed.replay();
+	await new Promise((resolve) => setImmediate(resolve));
+	await replayed.beforeAgentStart(replayedPrompts[0] as string);
+	const working = await tasks.getTask("source:user", accepted.taskId);
+	assert.equal(working.status.state, "TASK_STATE_WORKING");
+	assert.equal(working.history?.at(-1)?.messageId, "event-answer");
+	await assert.rejects(
+		plane.continue({ ...activation("second-answer"), taskId: accepted.taskId }),
+		/task cannot accept supplied input/,
+	);
+	replayed.stop();
+});
+
+it("preserves unanswered input-required state when replaying its original wake", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-unanswered-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("unanswered-question"));
+	const firstPrompts: string[] = [];
+	const firstQueue = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => firstPrompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	firstQueue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await new Promise((resolve) => setImmediate(resolve));
+	await firstQueue.beforeAgentStart(firstPrompts[0] as string);
+	const question = {
+		messageId: "question-unanswered",
+		role: "ROLE_AGENT" as const,
+		parts: [{ text: "Which environment should I use?" }],
+	};
+	await tasks.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_INPUT_REQUIRED",
+		message: question,
+	});
+	firstQueue.stop();
+	assert.equal(journal.claims().length, 1, "no answer claim exists before wake replay");
+
+	const replayedPrompts: string[] = [];
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => replayedPrompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	await replayed.replay();
+	await new Promise((resolve) => setImmediate(resolve));
+	await replayed.beforeAgentStart(replayedPrompts[0] as string);
+	const waiting = await tasks.getTask("source:user", accepted.taskId);
+	assert.equal(waiting.status.state, "TASK_STATE_INPUT_REQUIRED");
+	assert.deepEqual(waiting.status.message, question);
+
+	const answer = await plane.continue({
+		...activation("answer-after-replay"),
+		taskId: accepted.taskId,
+	});
+	assert.equal(answer.disposition, "continued");
+	assert.equal(answer.taskId, accepted.taskId);
+	replayed.stop();
+});
+
+it("terminal replay claims do not consume the pending-wake bound", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-terminal-replay-"));
+	const journal = new ActivationJournal(join(root, "activation.jsonl"));
+	await journal.initialize();
+	const liveTaskId = "task-live";
+	for (let index = 0; index <= MAX_PENDING_WAKES; index += 1) {
+		const claim = {
+			kind: "CLAIM" as const,
+			providerKey: `provider-stale-${index}`,
+			activationId: `activation-stale-${index}`,
+			taskId: `task-stale-${index}`,
+			input: activation(`stale-${index}`),
+			contextId: "context",
+			intendedRoute: "created" as const,
+			claimedAt: new Date().toISOString(),
+		};
+		await journal.append(claim);
+		await journal.append({
+			kind: "ACCEPTED",
+			activationId: claim.activationId,
+			acceptedAt: new Date().toISOString(),
+		});
+	}
+	const liveClaim = {
+		kind: "CLAIM" as const,
+		providerKey: "provider-live",
+		activationId: "activation-live",
+		taskId: liveTaskId,
+		input: activation("live"),
+		contextId: "context",
+		intendedRoute: "created" as const,
+		claimedAt: new Date().toISOString(),
+	};
+	await journal.append(liveClaim);
+	await journal.append({
+		kind: "ACCEPTED",
+		activationId: liveClaim.activationId,
+		acceptedAt: new Date().toISOString(),
+	});
+	const prompts: string[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		{
+			async lookup(taskId: string) {
+				return {
+					principal: "source:user",
+					task: {
+						id: taskId,
+						contextId: "context",
+						status: {
+							state: taskId === liveTaskId ? "TASK_STATE_SUBMITTED" : "TASK_STATE_COMPLETED",
+							timestamp: new Date().toISOString(),
+						},
+					},
+				};
+			},
+		} as A2aTaskStore,
+		journal,
+	);
+	await queue.replay();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(prompts, [taskWakePrompt(liveTaskId)]);
+	assert.equal(journal.isWakeFailed(liveClaim.activationId), false);
+	queue.stop();
+});
+
 it("bounds rejecting wake delivery with timer backoff and durable failure evidence", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-reject-"));
 	const { plane, tasks, journal } = await fixture(root);
@@ -770,7 +1159,7 @@ it("bounds the pending wake set and records durable overflow evidence", async ()
 	queue.stop();
 });
 
-it("contains pump I/O failures and retains the wake for a later trigger", async () => {
+it("backs off and automatically retries a transient wake-path I/O failure", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-pump-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
 	await plane.accept(activation("wake-pump-failure"));
@@ -792,15 +1181,13 @@ it("contains pump I/O failures and retains the wake for a later trigger", async 
 		return lookup(taskId);
 	};
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(prompts.length, 0);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(prompts.length, 1);
 	assert.equal(
 		logs.some((record) => record.event === "a2a_wake_pump_failed"),
 		true,
 	);
-	queue.agentEnd();
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(prompts.length, 1);
+	queue.stop();
 });
 
 it("runtime startup is all-or-nothing and store upgrade preserves Tasks and origins", async () => {
@@ -1109,6 +1496,35 @@ it("persists source evidence that is not attached to a Task", async () => {
 	await runtime.close();
 });
 
+it("updates repeated source classification evidence as one bounded durable counter", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-source-evidence-counter-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.recordEvidence);
+	const input = {
+		evidenceId: "evidence-slack-channel-non-work",
+		source: "slack",
+		kind: "permanent-non-work",
+		detail: { reason: "non-work-event", workspace: "T1", channel: "C1" },
+		aggregation: "counter" as const,
+	};
+	await runtime.sourceSink.recordEvidence(input);
+	await runtime.sourceSink.recordEvidence(input);
+	const stored = JSON.parse(await readFile(join(root, "activation-evidence.v1.json"), "utf8")) as {
+		records: Array<{ count?: number; lastRecordedAt?: string }>;
+	};
+	assert.equal(stored.records.length, 1);
+	assert.equal(stored.records[0]?.count, 2);
+	assert.ok(stored.records[0]?.lastRecordedAt);
+	await runtime.close();
+});
+
 it("reconciles outbound delivery crashes before retry and fails closed after an ambiguous send", async () => {
 	for (const recovery of ["idempotent", "ambiguous"] as const) {
 		const root = await mkdtemp(join(tmpdir(), `channels-delivery-${recovery}-`));
@@ -1169,6 +1585,164 @@ it("reconciles outbound delivery crashes before retry and fails closed after an 
 		}
 		await runtime.close();
 	}
+});
+
+it("serializes identical concurrent deliveries by delivery id", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-delivery-concurrent-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.deliver);
+	const input = {
+		taskId: "task-concurrent",
+		source: "slack",
+		operationId: "reply:one",
+		payloadDigest: digest("same reply"),
+		recovery: "lookup" as const,
+	};
+	let sends = 0;
+	let release = (): void => {};
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const send = async () => {
+		sends += 1;
+		await blocked;
+		return "provider-one";
+	};
+	const first = runtime.sourceSink.deliver(input, send, async () => undefined);
+	const second = runtime.sourceSink.deliver(input, send, async () => undefined);
+	for (let attempt = 0; sends === 0 && attempt < 100; attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 2));
+	}
+	assert.equal(sends, 1);
+	release();
+	assert.deepEqual(await Promise.all([first, second]), ["provider-one", "provider-one"]);
+	assert.equal(sends, 1);
+	await runtime.close();
+});
+
+it("fails closed when lookup recovery has no reconciler and records one-prefix evidence", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-delivery-lookup-"));
+	const input = {
+		taskId: "task-lookup",
+		source: "slack",
+		operationId: "reply:lookup",
+		payloadDigest: digest("reply"),
+		recovery: "lookup" as const,
+	};
+	const deliveryId = derivedId(
+		"delivery",
+		`${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
+	);
+	const store = new OutboundDeliveryStore(join(root, "outbound-deliveries.v1.json"));
+	await store.put({
+		...input,
+		deliveryId,
+		state: "sending",
+		updatedAt: new Date().toISOString(),
+	});
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	let sends = 0;
+	assert.ok(runtime.sourceSink.deliver);
+	await assert.rejects(
+		runtime.sourceSink.deliver(input, async () => {
+			sends += 1;
+			return "duplicate";
+		}),
+		/became ambiguous/,
+	);
+	assert.equal(sends, 0);
+	const evidence = JSON.parse(
+		await readFile(join(root, "activation-evidence.v1.json"), "utf8"),
+	) as { records: Array<{ activationId?: string }> };
+	assert.ok(evidence.records.some((record) => record.activationId === deliveryId));
+	assert.ok(
+		evidence.records.every((record) => !record.activationId?.startsWith("delivery-delivery-")),
+	);
+	await runtime.close();
+});
+
+it("keeps indeterminate lookup delivery failures reconcilable but retries determinate rejections", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-delivery-lookup-failures-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.deliver);
+	const base = {
+		taskId: "task-lookup-failures",
+		source: "slack",
+		recovery: "lookup" as const,
+	};
+	const indeterminate = {
+		...base,
+		operationId: "reply:indeterminate",
+		payloadDigest: digest("indeterminate"),
+	};
+	await assert.rejects(
+		runtime.sourceSink.deliver(indeterminate, async () => {
+			throw new Error("socket closed after request");
+		}),
+		/socket closed/,
+	);
+	const indeterminateId = derivedId(
+		"delivery",
+		`${indeterminate.taskId}\0${indeterminate.source}\0${indeterminate.operationId}\0${indeterminate.payloadDigest}`,
+	);
+	const store = new OutboundDeliveryStore(join(root, "outbound-deliveries.v1.json"));
+	assert.equal((await store.get(indeterminateId))?.state, "sending");
+	let indeterminateResends = 0;
+	assert.equal(
+		await runtime.sourceSink.deliver(
+			indeterminate,
+			async () => {
+				indeterminateResends += 1;
+				return "duplicate";
+			},
+			async () => "reconciled-response",
+		),
+		"reconciled-response",
+	);
+	assert.equal(indeterminateResends, 0);
+
+	const determinate = {
+		...base,
+		operationId: "reply:determinate",
+		payloadDigest: digest("determinate"),
+	};
+	await assert.rejects(
+		runtime.sourceSink.deliver(determinate, async () => {
+			throw Object.assign(new Error("invalid_auth"), { status: 400 });
+		}),
+		/invalid_auth/,
+	);
+	const determinateId = derivedId(
+		"delivery",
+		`${determinate.taskId}\0${determinate.source}\0${determinate.operationId}\0${determinate.payloadDigest}`,
+	);
+	assert.equal((await new OutboundDeliveryStore(store.path).get(determinateId))?.state, "failed");
+	assert.equal(
+		await runtime.sourceSink.deliver(determinate, async () => "accepted-after-rejection"),
+		"accepted-after-rejection",
+	);
+	await runtime.close();
 });
 
 it("distinguishes determinate rejection from ambiguous delivery and permits revised text", async () => {
@@ -1367,6 +1941,167 @@ it("claims A2A inbound work before the queue wakes and grants Task authority", a
 	}
 });
 
+it("dedupes A2A intake after a crash-before-response and reuses an owned context exactly", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-a2a-journal-dedupe-"));
+	let executor: A2aExecutor | undefined;
+	const listener = createA2aRuntimeListener({
+		enabled: () => true,
+		loadConfig: async () => ({
+			host: "127.0.0.1",
+			port: 0,
+			storePath: "",
+			credentials: [],
+			agentName: "test",
+			agentDescription: "test",
+			publicUrl: "http://127.0.0.1",
+			agentVersion: "test",
+		}),
+		async start(_config, inboundExecutor) {
+			executor = inboundExecutor;
+			return {
+				url: "http://127.0.0.1:1",
+				async close() {},
+				async readTask() {
+					return undefined;
+				},
+				async controllerForTask() {
+					return undefined;
+				},
+			};
+		},
+	});
+	assert.ok(listener);
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+			listener,
+		},
+	);
+	try {
+		assert.ok(executor);
+		const context = {
+			principal: "a2a:caller",
+			message: {
+				messageId: "message-crash-retry",
+				role: "ROLE_USER" as const,
+				parts: [{ text: "work" }],
+			},
+			async begin() {
+				throw new Error("journal intake must mint the Task");
+			},
+		};
+		const beforeCrash = await executor(context);
+		const retried = await executor(context);
+		assert.deepEqual(retried, beforeCrash);
+		assert.ok(retried && "taskId" in retried);
+		assert.equal(
+			(await runtime.taskPlane.taskStore.listTasks("a2a:caller", { pageSize: 100 })).length,
+			1,
+		);
+		assert.ok(beforeCrash && "taskId" in beforeCrash);
+		const original = await runtime.taskPlane.taskStore.getTask("a2a:caller", beforeCrash.taskId);
+		const sameContext = await executor({
+			...context,
+			message: {
+				...context.message,
+				messageId: "message-same-owned-context",
+				contextId: original.contextId,
+			},
+		});
+		assert.ok(sameContext && "taskId" in sameContext);
+		const sibling = await runtime.taskPlane.taskStore.getTask("a2a:caller", sameContext.taskId);
+		assert.notEqual(sibling.id, original.id);
+		assert.equal(sibling.contextId, original.contextId);
+		assert.equal(
+			(
+				await runtime.taskPlane.taskStore.listTasks("a2a:caller", {
+					contextId: original.contextId,
+					pageSize: 100,
+				})
+			).length,
+			2,
+		);
+		const persisted = await readFile(join(root, "activation-journal.v1.jsonl"), "utf8");
+		assert.equal((persisted.match(/"kind":"CLAIM"/g) ?? []).length, 2);
+	} finally {
+		await runtime.close();
+	}
+});
+
+it("gives production A2A intake a fresh context when the requested context is foreign", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-a2a-foreign-context-"));
+	let executor: A2aExecutor | undefined;
+	const listener = createA2aRuntimeListener({
+		enabled: () => true,
+		loadConfig: async () => ({
+			host: "127.0.0.1",
+			port: 0,
+			storePath: "",
+			credentials: [],
+			agentName: "test",
+			agentDescription: "test",
+			publicUrl: "http://127.0.0.1",
+			agentVersion: "test",
+		}),
+		async start(_config, inboundExecutor) {
+			executor = inboundExecutor;
+			return {
+				url: "http://127.0.0.1:1",
+				async close() {},
+				async readTask() {
+					return undefined;
+				},
+				async controllerForTask() {
+					return undefined;
+				},
+			};
+		},
+	});
+	assert.ok(listener);
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+			listener,
+		},
+	);
+	try {
+		assert.ok(executor);
+		const foreign = await runtime.taskPlane.taskStore.createTask("a2a:other", undefined);
+		const result = await executor({
+			principal: "a2a:caller",
+			message: {
+				messageId: "message-foreign-context",
+				contextId: foreign.contextId,
+				role: "ROLE_USER",
+				parts: [{ text: "new caller work" }],
+			},
+			async begin() {
+				throw new Error("production task-plane intake must not use begin()");
+			},
+		});
+		assert.ok(result && "taskId" in result);
+		const accepted = await runtime.taskPlane.taskStore.getTask("a2a:caller", result.taskId);
+		assert.notEqual(accepted.contextId, foreign.contextId);
+		assert.equal(
+			(
+				await runtime.taskPlane.taskStore.listTasks("a2a:caller", {
+					contextId: foreign.contextId,
+					pageSize: 100,
+				})
+			).length,
+			0,
+		);
+	} finally {
+		await runtime.close();
+	}
+});
+
 it("refuses to claim a WORKING task for a second mid-turn wake", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-claim-working-"));
 	const { plane, tasks } = await fixture(root);
@@ -1377,6 +2112,7 @@ it("refuses to claim a WORKING task for a second mid-turn wake", async () => {
 		plane.claim(activation("working-claim", { principal, source: "a2a" }), task.id),
 		/task cannot accept supplied input/,
 	);
+	assert.deepEqual((await tasks.getTask(principal, task.id)).history, []);
 });
 
 it("publishes one stateless Pi entrypoint that reloads with Jiti moduleCache disabled", async () => {

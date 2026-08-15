@@ -48,9 +48,7 @@ token maps to a principal, and every task and dedupe record is scoped to it.
 
 ## Task and conversation semantics
 
-This section states the target contract for the task-plane milestone. The
-current store holds only tasks and dedupe records; the context and
-reply-anchor mappings below do not exist yet.
+This section states the implemented contract for the task-plane milestone.
 
 Message versus Task is the executor's decision. Work mints a Task. A simple
 interaction returns a direct A2A Message and no Task ever exists. For an
@@ -129,8 +127,14 @@ agent, a tool set, or a workflow topology.
 - **Idempotency is mandatory and stronger than the A2A minimum.** Scope:
   `(authenticated principal, messageId)`. Stored outcome: the full prior
   result — the created Task (a duplicate returns that Task) or the direct
-  Message verbatim. Retention: 30 days, never shorter than the referenced
-  task's life. A duplicate `messageId` with a different payload is an
+  Message verbatim. For work-producing A2A intake, the fsynced activation
+  journal claim is the dedupe authority and supplies the prior Task directly;
+  Task and context IDs minted by the server are excluded from the activation
+  digest. A persistence failure returns an error and records no successful
+  outcome. Retention: 30 days, never shorter than the referenced task's life.
+  Once that Task and its claim have been pruned, the same identity is accepted
+  as new work instead of returning a nonexistent Task. A duplicate `messageId`
+  with a different payload is an
   explicit `409 DUPLICATE_MESSAGE_ID`, never a silent replay. For native
   intake, the source's Event identity fields from the conformance matrix,
   scoped to the intake principal, serve as the `messageId` for this rule.
@@ -140,12 +144,26 @@ agent, a tool set, or a workflow topology.
 - **Wake recovery follows terminal Task state.** `WOKEN` records that Pi began
   a turn, not that the turn completed. On startup, every accepted activation
   whose Task is still non-terminal is offered once to the new runtime, including
-  activations already marked `WOKEN`. A wake transport failure retries three
-  times with timer backoff, then records `WAKE_FAILED` evidence and stops.
+  activations already marked `WOKEN`. Terminal claims are filtered before queue
+  admission and do not count toward the bound. Replaying a historical wake does
+  not replace an unanswered `INPUT_REQUIRED` or `AUTH_REQUIRED` status message
+  with bare `WORKING`; a newly accepted continuation still starts normally. A
+  wake transport failure retries three times with timer backoff, then records
+  `WAKE_FAILED` evidence and stops. Transient store or journal failures during
+  pumping schedule a macrotask retry with capped exponential backoff.
 - **Wake admission is bounded.** At most 128 wakes wait behind the offered or
   active turn. Overflow is logged and recorded as durable `WAKE_FAILED`
   evidence, so a duplicate-prone source cannot grow the resident queue without
   limit or fail silently.
+- **Operational records are compacted at startup.** After incomplete claims
+  replay, the journal keeps pending claims, records for retained Tasks, and the
+  30-day window. Evidence, reply anchors, outbound deliveries, and contexts use
+  the same window while retaining records required by a live Task; an outbound
+  delivery still in `sending` is never pruned.
+- **Outbound delivery is serialized per delivery ID.** Concurrent identical
+  responses share one durable state transition and one provider mutation. A
+  persisted `lookup` delivery without its exact reconciler fails closed as
+  ambiguous instead of sending blindly.
 - **Server-scoped identity.** The server mints every task id. Equal ids from
   two servers cannot collide because identity is the locator (interface URL
   + binding + version + tenant + taskId), carried by the `outfitter-task/v1`
@@ -169,16 +187,20 @@ agent, a tool set, or a workflow topology.
 
 ## Resident-agent bridge
 
-`extensions/a2a-extension.ts` hosts the server inside a resident Pi profile.
-Inert unless `A2A_SERVER=1`; the composed runtime always injects its already-open
-shared store, so `A2A_STORE_PATH` is no longer required. Configuration is
+`extensions/a2a-extension.ts` hosts the optional server inside a resident Pi
+profile. The listener is inert unless `A2A_SERVER=1`; the task tools are
+registered whenever the task plane runs, including native-only deployments.
+The composed runtime always injects its already-open shared store, so
+`A2A_STORE_PATH` is no longer required. Configuration is
 `A2A_CREDENTIALS_PATH` (required, `{"credentials": [{"token", "principal"}]}`),
 `A2A_HOST`/`A2A_PORT` (default loopback:8788), and `A2A_PUBLIC_URL` /
 `A2A_AGENT_NAME` / `A2A_AGENT_DESCRIPTION` / `A2A_AGENT_VERSION` for the Card.
 
-An inbound message creates the protocol Task, then enters the trusted task-plane
-sink. Acceptance writes the journal claim, dedupe projection, evidence, and
-queued **body-free wake** before returning the Task. The wake queue changes the
+An inbound work message first enters the trusted task-plane sink. Acceptance
+writes the journal claim, creates or continues the Task, appends the authorized
+history, projects evidence, and queues a **body-free wake** before returning the
+Task. Explicit continuation is authorized before its caller message is
+persisted. The wake queue changes the
 Task to `WORKING` and grants it as the turn's sole authority. The A2A listener
 never wakes Pi directly. The agent then drives the task with three tools:
 

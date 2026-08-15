@@ -28,6 +28,7 @@ import {
 } from "../extensions/sources/slack-config.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "../extensions/sources/types.ts";
 import { supervise } from "../extensions/sources/util.ts";
+import { derivedId } from "../extensions/task-plane/serialize.ts";
 import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
 test("local Slack preflight defaults to channels the bot has joined", () => {
@@ -387,8 +388,18 @@ test("Slack records and acknowledges a permanently malformed work envelope", asy
 	await stop();
 });
 
-test("Slack acknowledges subscribed non-mention envelopes without emitting work", async () => {
+test("Slack records durable non-work evidence before acknowledging the envelope", async () => {
 	const socket = new FakeSocket();
+	const order: string[] = [];
+	const evidenceIds: string[] = [];
+	const sink: SourceTaskActivationSink = {
+		...unusedTaskSink(),
+		async recordEvidence(input) {
+			evidenceIds.push(input.evidenceId);
+			assert.equal(input.aggregation, "counter");
+			order.push(`evidence:${input.kind}`);
+		},
+	};
 	const source = createSlackSource(
 		{
 			appToken: "xapp-test",
@@ -400,18 +411,20 @@ test("Slack acknowledges subscribed non-mention envelopes without emitting work"
 			web: () => fakeWebClient({ auth: { test: async () => ({ ok: true, user_id: "UBOT" }) } }),
 		},
 		undefined,
-		unusedTaskSink(),
+		sink,
 	);
 	const stop = await source.start(() => {});
 	await waitFor(() => socket.started);
 
 	let acknowledgements = 0;
-	socket.emit("slack_event", {
+	const envelope = () => ({
 		ack: async () => {
 			acknowledgements += 1;
+			order.push("ack");
 		},
 		type: "events_api",
 		body: {
+			team_id: "TWORKSPACE",
 			event: {
 				type: "message",
 				channel: "C0123ABCD",
@@ -420,9 +433,17 @@ test("Slack acknowledges subscribed non-mention envelopes without emitting work"
 			},
 		},
 	});
-	await new Promise((resolve) => setImmediate(resolve));
+	socket.emit("slack_event", envelope());
+	socket.emit("slack_event", envelope());
+	await waitFor(() => acknowledgements === 2);
 
-	assert.equal(acknowledgements, 1);
+	assert.deepEqual(order, [
+		"evidence:permanent-non-work",
+		"evidence:permanent-non-work",
+		"ack",
+		"ack",
+	]);
+	assert.equal(evidenceIds[0], evidenceIds[1], "the channel classification updates one counter");
 	await stop();
 });
 
@@ -622,14 +643,19 @@ test("Slack actions read bounded thread context, reply, and mark the mention han
 		handled: true,
 		responseId: "1721840002.000003",
 	});
-	assert.deepEqual(calls.at(-2), {
-		method: "postMessage",
-		args: {
-			channel: "C0123ABCD",
-			thread_ts: "1721840000.000001",
-			text: "I found the issue.",
-		},
-	});
+	const postCall = calls.at(-2);
+	assert.equal(postCall?.method, "postMessage");
+	const postArgs = postCall?.args as {
+		channel: string;
+		thread_ts: string;
+		text: string;
+		metadata: { event_type: string; event_payload: { delivery_id: string } };
+	};
+	assert.equal(postArgs.channel, "C0123ABCD");
+	assert.equal(postArgs.thread_ts, "1721840000.000001");
+	assert.equal(postArgs.text, "I found the issue.");
+	assert.equal(postArgs.metadata.event_type, "ai_outfitter_delivery");
+	assert.match(postArgs.metadata.event_payload.delivery_id, /^delivery-[a-f0-9]{40}$/);
 	assert.deepEqual(calls.at(-1), {
 		method: "reaction",
 		args: {
@@ -638,6 +664,66 @@ test("Slack actions read bounded thread context, reply, and mark the mention han
 			name: "white_check_mark",
 		},
 	});
+});
+
+test("Slack reconciles a crash-after reply through exact thread metadata", async () => {
+	let deliveryId = "";
+	let posts = 0;
+	let metadataRequested = false;
+	const web = fakeWebClient({
+		auth: { test: async () => ({ ok: true, user_id: "UBOT" }) },
+		conversations: {
+			async replies(args: { include_all_metadata?: boolean }) {
+				metadataRequested = args.include_all_metadata === true;
+				return {
+					ok: true,
+					messages: [
+						{
+							ts: "1721840002.000003",
+							user: "UBOT",
+							...(metadataRequested
+								? {
+										metadata: {
+											event_type: "ai_outfitter_delivery",
+											event_payload: { delivery_id: deliveryId },
+										},
+									}
+								: {}),
+						},
+					],
+				};
+			},
+		},
+		chat: {
+			async postMessage() {
+				posts += 1;
+				return { ok: true, ts: "duplicate" };
+			},
+		},
+		reactions: { add: async () => ({ ok: true }) },
+	});
+	const sink: SourceTaskActivationSink = {
+		...unusedTaskSink(),
+		async taskForLocator() {
+			return "task-active";
+		},
+		async deliver(input, _send, reconcile) {
+			deliveryId = derivedId(
+				"delivery",
+				`${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
+			);
+			return reconcile?.();
+		},
+	};
+	const actions = createSlackActions(
+		{ botToken: "xoxb-test", doneEmoji: "white_check_mark" },
+		web,
+		sink,
+	);
+	const result = await actions.respond(slackLocator("1721840001.000002"), "Recovered reply");
+	assert.equal(result.responseId, "1721840002.000003");
+	assert.equal(metadataRequested, true);
+	assert.equal(posts, 0);
 });
 
 test("Slack actions report a partial result instead of hiding a handled-state failure", async () => {

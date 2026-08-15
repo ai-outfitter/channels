@@ -32,7 +32,13 @@ function isPlainActivationValidationError(message: string): boolean {
 		message === "contentDigest must be a SHA-256 digest" ||
 		message === "nativeLocator is required" ||
 		message === "activation parts are required" ||
-		/^nativeLocator\.[^ ]+ must be a non-empty string of at most 4096 characters$/.test(message)
+		/^nativeLocator\.[^ ]+ must be a non-empty string of at most 4096 characters$/.test(message) ||
+		/^task ".+" conflicts with its activation claim$/.test(message) ||
+		/^message ".+" conflicts with its activation claim$/.test(message) ||
+		message === "activation conflicts with its durable claim" ||
+		message === "origin relation conflicts" ||
+		message === "activation evidence conflicts with its durable claim" ||
+		message === "activation claim was lost"
 	);
 }
 

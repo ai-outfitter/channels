@@ -52,6 +52,14 @@ async function fire(handlers: Map<string, Handler[]>, event: string): Promise<Er
 	return errors;
 }
 
+async function waitFor(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (predicate()) return;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	throw new Error("condition was not met");
+}
+
 function running(onClose: () => Promise<void> | void = () => {}): RunningChannelsRuntime {
 	const sink = {
 		async accept() {
@@ -169,6 +177,8 @@ test("disables task-plane startup when channels are off and never uses A2A_STORE
 	await withEnv(
 		{
 			A2A_SERVER: undefined,
+			A2A_HOST: "0.0.0.0",
+			A2A_PORT: "9444",
 			A2A_STORE_PATH: a2aPath,
 			CHANNELS_TASK_STORE_PATH: taskRoot,
 			OUTFITTER_AGENT_RELAY: undefined,
@@ -186,6 +196,7 @@ test("disables task-plane startup when channels are off and never uses A2A_STORE
 			await fire(handlers, "session_start");
 			assert.equal(captured?.storePath, join(taskRoot, "tasks.json"));
 			assert.equal(captured?.originStorePath, join(taskRoot, "origins.json"));
+			assert.equal(captured?.agentInterface, "http://0.0.0.0:9444");
 			assert.notEqual(captured?.storePath, a2aPath);
 		},
 	);
@@ -281,7 +292,7 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 				"deliberately disabled native channels do not make the A2A-only runtime unhealthy",
 			);
 			assert.ok(captured?.listener, "A2A listener is selected independently of channels");
-			assert.deepEqual([...tools.keys()].sort(), [
+			assert.deepEqual([...tools.keys()].filter((name) => name.startsWith("a2a_")).sort(), [
 				"a2a_complete_task",
 				"a2a_read_task",
 				"a2a_require_input",
@@ -354,6 +365,63 @@ test("real wake-queue source wiring denies continuation for a native Task", asyn
 			await assert.rejects(
 				requireInput.execute("call", { taskId: accepted.taskId, question: "more?" }),
 				/source has no continuation method/,
+			);
+			await fire(handlers, "session_shutdown");
+		},
+	);
+});
+
+test("native-only deployment registers task tools and settles a Task end to end", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-native-tools-"));
+	await withEnv(
+		{
+			OUTFITTER_CHANNELS: "",
+			A2A_SERVER: undefined,
+			CHANNELS_TASK_STORE_PATH: root,
+			OUTFITTER_AGENT_RELAY: undefined,
+		},
+		async () => {
+			const { pi, handlers, tools } = fakePi();
+			const prompts: string[] = [];
+			Object.assign(pi, { sendUserMessage: (prompt: string) => prompts.push(prompt) });
+			let runtime: RunningChannelsRuntime | undefined;
+			channelsRuntimeExtension(pi, {
+				startRuntime: async (runtimePi, dependencies) => {
+					runtime = await startChannelsRuntime(runtimePi, dependencies);
+					return runtime;
+				},
+			});
+			await fire(handlers, "session_start");
+			assert.deepEqual([...tools.keys()].filter((name) => name.startsWith("a2a_")).sort(), [
+				"a2a_complete_task",
+				"a2a_read_task",
+				"a2a_require_input",
+			]);
+			const accepted = await runtime?.sourceSink.accept({
+				principal: "slack:test",
+				source: "slack",
+				providerEventId: "event:native-only",
+				nativeLocator: { channelLocator: "slack:v1:native-only" },
+				receivedAt: "2026-08-15T12:00:00.000Z",
+				providerDedupeKey: "event:native-only",
+				parts: [{ text: "work" }],
+				contentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			});
+			assert.ok(accepted && runtime);
+			await waitFor(() => prompts.length === 1);
+			const before = handlers.get("before_agent_start")?.[0];
+			assert.ok(before);
+			await (before as unknown as (event: { prompt: string }) => Promise<void>)({
+				prompt: prompts[0] as string,
+			});
+			await tools.get("a2a_complete_task")?.execute("call", {
+				taskId: accepted.taskId,
+				response: "done",
+				outcome: "completed",
+			});
+			assert.equal(
+				(await runtime.taskPlane.taskStore.lookup(accepted.taskId))?.task.status.state,
+				"TASK_STATE_COMPLETED",
 			);
 			await fire(handlers, "session_shutdown");
 		},
