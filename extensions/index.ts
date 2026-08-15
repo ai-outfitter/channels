@@ -57,12 +57,6 @@ export type StreamForwarder = ((event: MessageUpdateEvent) => void) & {
 	turnEnd?(): void;
 };
 
-/** Run a source module's env-config probe and construct it when configured. */
-function configure<C, T>(fromEnv: () => C | undefined, create: (cfg: C) => T): T | undefined {
-	const cfg = fromEnv();
-	return cfg ? create(cfg) : undefined;
-}
-
 /**
  * The source registry. Keep configuration probes dependency-free and dynamically
  * import every implementation so unused channel SDKs are never evaluated.
@@ -79,9 +73,10 @@ const SOURCES: Record<string, SourceRegistration> = {
 	},
 	signal: {
 		configured: () => Boolean(process.env.SIGNAL_NUMBER || process.env.SIGNAL_CLI_CONFIG),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/signal.ts");
-			return configure(m.signalConfigFromEnv, m.createSignalSource);
+			const cfg = m.signalConfigFromEnv();
+			return cfg ? m.createSignalSource(cfg, taskSink) : undefined;
 		},
 	},
 	github: {
@@ -94,9 +89,10 @@ const SOURCES: Record<string, SourceRegistration> = {
 	},
 	forgejo: {
 		configured: () => Boolean(process.env.FORGEJO_TOKEN),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/forgejo.ts");
-			return configure(m.forgejoConfigFromEnv, m.createForgejoSource);
+			const cfg = m.forgejoConfigFromEnv();
+			return cfg ? m.createForgejoSource(cfg, taskSink) : undefined;
 		},
 	},
 	slack: {
@@ -120,15 +116,17 @@ const SOURCES: Record<string, SourceRegistration> = {
 					process.env.AGENT_RELAY_URL ||
 					process.env.AGENT_RELAY_TOKEN,
 			),
-		async load(journal) {
+		async load(journal, taskSink) {
 			const m = await import("./sources/agent.ts");
 			const config = m.agentConfigFromEnv();
-			return config ? m.createAgentSource(config, undefined, journal) : undefined;
+			return config
+				? m.createAgentSource(config, undefined, journal, undefined, taskSink)
+				: undefined;
 		},
-		async loadActions(journal) {
+		async loadActions(journal, taskSink) {
 			const m = await import("./sources/agent.ts");
 			const config = m.agentConfigFromEnv();
-			return config ? m.createAgentActions(config, undefined, journal) : undefined;
+			return config ? m.createAgentActions(config, undefined, journal, taskSink) : undefined;
 		},
 		async loadAgentActions(journal) {
 			const m = await import("./sources/agent.ts");
@@ -164,13 +162,17 @@ const SOURCES: Record<string, SourceRegistration> = {
 					process.env.MATTERMOST_BOT_TOKEN ||
 					process.env.MATTERMOST_CHANNEL_IDS,
 			),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/mattermost.ts");
-			return configure(m.mattermostConfigFromEnv, m.createMattermostSource);
+			const cfg = m.mattermostConfigFromEnv();
+			return cfg
+				? m.createMattermostSource(cfg, undefined, undefined, undefined, taskSink)
+				: undefined;
 		},
-		async loadActions() {
+		async loadActions(_journal, taskSink) {
 			const m = await import("./sources/mattermost.ts");
-			return configure(m.mattermostConfigFromEnv, m.createMattermostActions);
+			const cfg = m.mattermostConfigFromEnv();
+			return cfg ? m.createMattermostActions(cfg, undefined, taskSink) : undefined;
 		},
 	},
 	zulip: {
@@ -181,13 +183,15 @@ const SOURCES: Record<string, SourceRegistration> = {
 					process.env.ZULIP_API_KEY ||
 					process.env.ZULIP_CHANNEL_IDS,
 			),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/zulip.ts");
-			return configure(m.zulipConfigFromEnv, m.createZulipSource);
+			const cfg = m.zulipConfigFromEnv();
+			return cfg ? m.createZulipSource(cfg, undefined, undefined, taskSink) : undefined;
 		},
-		async loadActions() {
+		async loadActions(_journal, taskSink) {
 			const m = await import("./sources/zulip.ts");
-			return configure(m.zulipConfigFromEnv, m.createZulipActions);
+			const cfg = m.zulipConfigFromEnv();
+			return cfg ? m.createZulipActions(cfg, undefined, taskSink) : undefined;
 		},
 	},
 };

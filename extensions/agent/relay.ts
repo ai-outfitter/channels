@@ -50,7 +50,7 @@ export class RelayAgentTransport implements AgentTransport {
 	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	#incoming: Promise<void> = Promise.resolve();
 	readonly #requests = new Map<string, PendingRequest>();
-	readonly #listeners = new Set<(messageId: string) => void>();
+	readonly #listeners = new Set<(message: AgentMessageV1) => Promise<void>>();
 
 	constructor(config: RelayAgentConfig, journal = new AgentSessionJournal()) {
 		const url = new URL(config.url);
@@ -230,7 +230,9 @@ export class RelayAgentTransport implements AgentTransport {
 		}
 	}
 
-	async subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>> {
+	async subscribe(
+		onMessage: (message: AgentMessageV1) => Promise<void>,
+	): Promise<() => Promise<void>> {
 		this.#listeners.add(onMessage);
 		try {
 			await this.#ensureConnected();
@@ -365,10 +367,16 @@ export class RelayAgentTransport implements AgentTransport {
 			if (cursor < checkpoint || (cursor === checkpoint && !existing)) {
 				throw new Error("agent relay delivery cursor is invalid");
 			}
-			const stored = this.#journal.recordMessage(message, "delivered");
+			if (this.#listeners.size === 0) {
+				// The relay queue is the only durable copy until a source listener
+				// accepts this message. Closing without an ack requests redelivery.
+				socket.close();
+				return;
+			}
+			await Promise.all([...this.#listeners].map((listener) => listener(message)));
+			this.#journal.recordMessage(message, "delivered");
 			this.#journal.recordRelayCheckpoint(this.endpoint.id, cursor);
 			socket.send(JSON.stringify({ type: "ack", cursor } satisfies RelayClientFrame));
-			for (const listener of this.#listeners) listener(stored.message.id);
 			return;
 		}
 		if (frame.type === "session_query") {

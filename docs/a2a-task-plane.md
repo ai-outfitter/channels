@@ -142,6 +142,10 @@ agent, a tool set, or a workflow topology.
   whose Task is still non-terminal is offered once to the new runtime, including
   activations already marked `WOKEN`. A wake transport failure retries three
   times with timer backoff, then records `WAKE_FAILED` evidence and stops.
+- **Wake admission is bounded.** At most 128 wakes wait behind the offered or
+  active turn. Overflow is logged and recorded as durable `WAKE_FAILED`
+  evidence, so a duplicate-prone source cannot grow the resident queue without
+  limit or fail silently.
 - **Server-scoped identity.** The server mints every task id. Equal ids from
   two servers cannot collide because identity is the locator (interface URL
   + binding + version + tenant + taskId), carried by the `outfitter-task/v1`

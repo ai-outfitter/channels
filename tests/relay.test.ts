@@ -346,13 +346,13 @@ test("WSS client transport satisfies the same two-agent read/respond contract", 
 		bobJournal,
 	);
 	try {
-		let receiveBob = (_id: string): void => {};
+		let receiveBob = async (_message: { id: string }): Promise<void> => {};
 		const bobDelivery = new Promise<string>((resolve) => {
-			receiveBob = resolve;
+			receiveBob = async (message) => resolve(message.id);
 		});
-		let receiveAlice = (_id: string): void => {};
+		let receiveAlice = async (_message: { id: string }): Promise<void> => {};
 		const aliceDelivery = new Promise<string>((resolve) => {
-			receiveAlice = resolve;
+			receiveAlice = async (message) => resolve(message.id);
 		});
 		await bob.subscribe(receiveBob);
 		await alice.subscribe(receiveAlice);
@@ -368,6 +368,7 @@ test("WSS client transport satisfies the same two-agent read/respond contract", 
 		});
 		assert.equal(sent.duplicate, false);
 		assert.equal(await bobDelivery, "client-request");
+		await waitFor(async () => bobJournal.message("client-request") !== undefined);
 		assert.equal((await bob.read("client-request")).target.state, "read");
 		const response = await bob.respond("client-request", "transport contract response");
 		bobJournal.recordMessage(
@@ -400,6 +401,124 @@ test("WSS client transport satisfies the same two-agent read/respond contract", 
 			(await alice.read(response.response.message.id)).target.message.body,
 			"transport contract response",
 		);
+	} finally {
+		await alice.close();
+		await bob.close();
+		await relay.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("relay acknowledgment waits for durable listener acceptance", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-acceptance-"));
+	const storePath = join(root, "relay.json");
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath,
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		logger: () => {},
+	});
+	const alice = new RelayAgentTransport({
+		url: relay.url,
+		token: "alice-secret",
+		endpointId: "alice-web",
+		principalId: "operator:alice",
+	});
+	const journal = new AgentSessionJournal();
+	const bob = new RelayAgentTransport(
+		{
+			url: relay.url,
+			token: "bob-secret",
+			endpointId: "bob-agent",
+			principalId: "agent:bob",
+		},
+		journal,
+	);
+	let release = (): void => {};
+	const accepted = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let offered = false;
+	try {
+		await alice.subscribe(async () => {});
+		await alice.send({
+			id: "accept-before-ack",
+			recipient: "bob-agent",
+			conversationId: "ordering",
+			body: "must remain queued",
+		});
+		await bob.subscribe(async () => {
+			offered = true;
+			await accepted;
+		});
+		await waitFor(async () => offered);
+		assert.match(await readFile(storePath, "utf8"), /must remain queued/);
+		assert.equal(journal.relayCheckpoint("bob-agent"), 0);
+		release();
+		await waitFor(async () => journal.relayCheckpoint("bob-agent") > 0);
+		await waitFor(async () => !(await readFile(storePath, "utf8")).includes("must remain queued"));
+	} finally {
+		release();
+		await alice.close();
+		await bob.close();
+		await relay.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("relay leaves a delivery queued when no source listener is subscribed", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-relay-no-listener-"));
+	const storePath = join(root, "relay.json");
+	const relay = await startRelayServer({
+		host: "127.0.0.1",
+		port: 0,
+		storePath,
+		credentials: CREDENTIALS,
+		allowInsecureLoopback: true,
+		logger: () => {},
+	});
+	const alice = new RelayAgentTransport({
+		url: relay.url,
+		token: "alice-secret",
+		endpointId: "alice-web",
+		principalId: "operator:alice",
+	});
+	const journal = new AgentSessionJournal();
+	const bob = new RelayAgentTransport(
+		{
+			url: relay.url,
+			token: "bob-secret",
+			endpointId: "bob-agent",
+			principalId: "agent:bob",
+			reconnectMs: 0,
+		},
+		journal,
+	);
+	let delivered = 0;
+	try {
+		await alice.subscribe(async () => {});
+		const unsubscribe = await bob.subscribe(async () => {
+			throw new Error("unsubscribed listener was called");
+		});
+		await unsubscribe();
+		await alice.send({
+			id: "wait-for-listener",
+			recipient: "bob-agent",
+			conversationId: "listener-window",
+			body: "must remain queued without a listener",
+		});
+		await waitFor(async () => (await readFile(storePath, "utf8")).includes("must remain queued"));
+		assert.equal(journal.message("wait-for-listener"), undefined);
+		assert.equal(journal.relayCheckpoint("bob-agent"), 0);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await bob.subscribe(async (message) => {
+			if (message.id === "wait-for-listener") delivered += 1;
+		});
+		await waitFor(async () => delivered === 1);
+		await waitFor(async () => !(await readFile(storePath, "utf8")).includes("must remain queued"));
+		assert.equal(journal.message("wait-for-listener")?.state, "delivered");
 	} finally {
 		await alice.close();
 		await bob.close();

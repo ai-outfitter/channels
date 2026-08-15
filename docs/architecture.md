@@ -88,9 +88,11 @@ The common tools own:
 - the invariant that a partial result (`replied: true`, `handled: false`) must not
   cause a duplicate reply.
 
-Slack, Chatto, Mattermost, and Zulip implement exact-item action adapters. JMAP,
-Signal, and GitHub still wake their existing skills without exact-item locators
-until their action adapters are added.
+Slack, Chatto, Mattermost, Zulip, and the agent relay implement exact-item action
+adapters. Signal stores its exact receive envelope in Task history before the
+CLI stream advances; sending is performed by an external skill, not an in-repo
+responder. JMAP and GitHub expose exact Task locators to their existing
+operations without channel action adapters.
 
 ## Evaluation against real channels
 

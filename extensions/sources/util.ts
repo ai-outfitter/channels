@@ -44,6 +44,21 @@ export const RECONNECT_DELAY_MS = 5000;
 /** Maximum time shutdown waits for a source attempt to honor its abort signal. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
 
+/** Wait before retrying one retained source item, returning early on shutdown. */
+export async function retryDelay(ms: number, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
+	await new Promise<void>((resolve) => {
+		const timer = setTimeout(done, ms);
+		const abort = (): void => done();
+		function done(): void {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", abort);
+			resolve();
+		}
+		signal.addEventListener("abort", abort, { once: true });
+	});
+}
+
 /**
  * Run a push connection and keep it alive: call `attempt`, and whenever it
  * returns or throws, wait `delayMs` and run it again — until the returned stop

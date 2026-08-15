@@ -19,6 +19,12 @@
  * - `assigned_issue`   — an issue assigned to you.
  * - `assigned_pr`      — a pull request assigned to you.
  */
+import {
+	contentDigest,
+	permanentIntakeFailure,
+	sourceIdentifier,
+} from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import type { ChannelSource } from "./types.ts";
 import { errorMessage, parseList, scopedLog, sinceFrom, trimTrailingSlash } from "./util.ts";
 
@@ -93,7 +99,15 @@ type Reason = "review_requested" | "assigned_pr" | "assigned_issue";
 /** An authenticated, abort-aware request against the forge API. */
 type Request_ = (url: string, init?: RequestInit) => Promise<Response>;
 
-export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
+interface ForgejoCheckpoint {
+	readonly since: string;
+	readonly seen: readonly string[];
+}
+
+export function createForgejoSource(
+	cfg: ForgejoConfig,
+	taskSink: SourceTaskActivationSink,
+): ChannelSource {
 	const api = `${cfg.url}/api/v1`;
 	const headers = {
 		Authorization: `token ${cfg.token}`,
@@ -101,7 +115,7 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 	};
 
 	return {
-		async start(onEvent) {
+		async start() {
 			const controller = new AbortController();
 			// Keys seen in the previous poll only — `since` already excludes
 			// anything older, so this just dedups threads sharing the
@@ -143,15 +157,28 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 			};
 
 			/** One poll. Returns false when it should count toward backoff. */
+			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: cursor recovery and acceptance ordering are one atomic poll state machine
 			const poll = async (): Promise<boolean> => {
 				const me = await resolveLogin();
 				if (!me) return false;
+				const principal = sourceIdentifier("forgejo", `${cfg.url}\0${me}`);
+				if (since === undefined && taskSink.checkpoint) {
+					const checkpoint = await taskSink.checkpoint<ForgejoCheckpoint>(principal, "forgejo");
+					if (checkpoint) {
+						since = checkpoint.since;
+						seen = new Set(checkpoint.seen);
+					}
+				}
 				const polled = await pollThreads(api, get, since);
 				if (!polled) return false;
 				if (since === undefined) {
 					// First contact: anchor the cursor to the forge's clock and emit
 					// nothing — everything currently listed predates start-up.
 					since = polled.since;
+					await taskSink.advanceCheckpoint?.(principal, "forgejo", {
+						since,
+						seen: [],
+					} satisfies ForgejoCheckpoint);
 					return true;
 				}
 				const { batch, complete } = await emitNew(
@@ -162,7 +189,8 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 					api,
 					request,
 					controller.signal,
-					onEvent,
+					taskSink,
+					principal,
 				);
 				// Advance the cursor only after every thread in the window was
 				// classified. A failed subject lookup keeps the old cursor so the
@@ -171,6 +199,10 @@ export function createForgejoSource(cfg: ForgejoConfig): ChannelSource {
 				if (complete) {
 					seen = batch;
 					since = polled.since;
+					await taskSink.advanceCheckpoint?.(principal, "forgejo", {
+						since,
+						seen: [...seen],
+					} satisfies ForgejoCheckpoint);
 				}
 				return complete;
 			};
@@ -260,6 +292,7 @@ async function pollThreads(
  * `summary` is one of our own `Reason` values — deliberately never the issue or
  * pull-request title, which is attacker-controlled text.
  */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: every per-item permanent and transient outcome must remain explicit
 async function emitNew(
 	list: Thread[],
 	seen: Set<string>,
@@ -268,7 +301,8 @@ async function emitNew(
 	api: string,
 	request: Request_,
 	signal: AbortSignal,
-	onEvent: (event: { channel: string; summary: string }) => void,
+	taskSink: SourceTaskActivationSink,
+	principal: string,
 ): Promise<{ batch: Set<string>; complete: boolean }> {
 	const batch = new Set<string>();
 	let complete = true;
@@ -281,11 +315,50 @@ async function emitNew(
 		try {
 			const reason = await classify(thread, login, api, request);
 			if (reason && cfg.filters.has(reason)) {
-				onEvent({ channel: "forgejo", summary: reason });
-				if (cfg.markRead) await markRead(thread, api, request);
+				const path = subjectPath(thread.subject?.url);
+				if (!path) throw new Error("classified Forgejo subject has no exact path");
+				const acceptance = await taskSink.accept({
+					principal,
+					source: "forgejo",
+					providerEventId: sourceIdentifier("event", key),
+					providerDedupeKey: sourceIdentifier("event", key),
+					nativeLocator: {
+						threadId: String(thread.id),
+						revision: thread.updated_at,
+						subjectPath: path,
+						repository: thread.repository?.full_name ?? "",
+						reason,
+					},
+					receivedAt: thread.updated_at,
+					conversationKey: sourceIdentifier("conversation", path),
+					parts: [{ data: { threadId: thread.id, revision: thread.updated_at, path, reason } }],
+					contentDigest: contentDigest({ thread, reason }),
+				});
+				if (cfg.markRead) {
+					await deliverMarkRead(taskSink, acceptance.taskId, thread, api, request);
+				}
+			} else {
+				await taskSink.recordEvidence?.({
+					evidenceId: sourceIdentifier("evidence", `${principal}\0${key}`),
+					source: "forgejo",
+					kind: "permanent-non-work",
+					detail: { threadId: String(thread.id), revision: thread.updated_at },
+				});
 			}
 		} catch (err) {
 			if (signal.aborted) return { batch, complete: false };
+			const permanent = permanentIntakeFailure(err);
+			if (permanent) {
+				await taskSink.recordEvidence?.({
+					evidenceId: sourceIdentifier("evidence", `${principal}\0${key}`),
+					source: "forgejo",
+					kind: permanent.kind,
+					detail: { threadId: String(thread.id), revision: thread.updated_at },
+				});
+				batch.add(key);
+				seen.add(key);
+				continue;
+			}
 			complete = false;
 			log(`subject lookup failed for thread ${thread.id}: ${errorMessage(err)}`);
 			continue;
@@ -368,7 +441,7 @@ function includesLogin(
 	return (users ?? []).some((user) => user?.login === login);
 }
 
-/** Best-effort: a failed mark-read must not drop the event that was emitted. */
+/** Exact idempotent acknowledgment, invoked only after Task acceptance. */
 async function markRead(thread: Thread, api: string, request: Request_): Promise<void> {
 	// `id` is typed as a number but arrives as unvalidated JSON; a string value
 	// would path-traverse out of this endpoint.
@@ -376,13 +449,37 @@ async function markRead(thread: Thread, api: string, request: Request_): Promise
 		log(`ignoring a notification with a non-numeric id`);
 		return;
 	}
-	try {
-		const res = await request(`${api}/notifications/threads/${thread.id}?to-status=read`, {
-			method: "PATCH",
+	const res = await request(`${api}/notifications/threads/${thread.id}?to-status=read`, {
+		method: "PATCH",
+	});
+	drain(res);
+	if (res.status === 404) return;
+	if (res.status >= 400) {
+		throw Object.assign(new Error(`mark-read returned HTTP ${res.status}`), {
+			status: res.status,
 		});
-		drain(res);
-		if (res.status >= 400) log(`mark-read returned HTTP ${res.status}`);
-	} catch (err) {
-		log(`mark-read failed: ${errorMessage(err)}`);
 	}
+}
+
+async function deliverMarkRead(
+	taskSink: SourceTaskActivationSink,
+	taskId: string,
+	thread: Thread,
+	api: string,
+	request: Request_,
+): Promise<void> {
+	if (!taskSink.deliver) throw new Error("Forgejo task delivery is not configured");
+	await taskSink.deliver(
+		{
+			taskId,
+			source: "forgejo",
+			operationId: `mark-read:${thread.id}`,
+			payloadDigest: contentDigest({ status: "read" }),
+			recovery: "idempotent",
+		},
+		async () => {
+			await markRead(thread, api, request);
+			return String(thread.id);
+		},
+	);
 }

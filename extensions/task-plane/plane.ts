@@ -195,7 +195,13 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 			submit(
 				input,
 				async () => {
-					await dependencies.tasks.getTask(input.principal, taskId);
+					const task = await dependencies.tasks.getTask(input.principal, taskId);
+					if (
+						task.status.state !== "TASK_STATE_SUBMITTED" &&
+						!canAcceptInput(task.status.state, task.status.message)
+					) {
+						throw new A2aError(400, "UNSUPPORTED_OPERATION", "task cannot accept supplied input");
+					}
 					return taskId;
 				},
 				true,

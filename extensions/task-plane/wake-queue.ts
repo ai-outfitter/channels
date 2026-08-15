@@ -12,6 +12,7 @@ interface PendingWake {
 
 const MAX_WAKE_ATTEMPTS = 3;
 const WAKE_RETRY_BASE_MS = 10;
+export const MAX_PENDING_WAKES = 128;
 
 export class DurableWakeQueue {
 	readonly #pi: Pick<ExtensionAPI, "sendUserMessage">;
@@ -59,6 +60,32 @@ export class DurableWakeQueue {
 			this.#pending.some((wake) => wake.claim.activationId === claim.activationId) ||
 			this.#offered?.claim.activationId === claim.activationId
 		) {
+			return;
+		}
+		if (this.#pending.length >= MAX_PENDING_WAKES) {
+			const error = `wake queue pending limit ${MAX_PENDING_WAKES} reached`;
+			this.#log({
+				event: "a2a_wake_overflow",
+				taskId: claim.taskId,
+				activationId: claim.activationId,
+				limit: MAX_PENDING_WAKES,
+			});
+			void this.#journal
+				.append({
+					kind: "WAKE_FAILED",
+					activationId: claim.activationId,
+					attempts: 0,
+					error,
+					failedAt: new Date().toISOString(),
+				})
+				.catch((appendError) => {
+					this.#log({
+						event: "a2a_wake_overflow_evidence_failed",
+						taskId: claim.taskId,
+						activationId: claim.activationId,
+						error: errorMessage(appendError),
+					});
+				});
 			return;
 		}
 		this.#pending.push({ claim, prompt: taskWakePrompt(claim.taskId), attempts: 0 });
@@ -147,7 +174,7 @@ export class DurableWakeQueue {
 			}
 			this.#offered = wake;
 			try {
-				await this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" });
+				await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
 			} catch (error) {
 				this.#offered = undefined;

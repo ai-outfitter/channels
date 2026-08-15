@@ -3,9 +3,14 @@ import test, { mock } from "node:test";
 import type { ForgejoConfig } from "../extensions/sources/forgejo.ts";
 import {
 	backoffDelayMs,
-	createForgejoSource,
+	createForgejoSource as createForgejoSourceImpl,
 	forgejoConfigFromEnv,
 } from "../extensions/sources/forgejo.ts";
+import type {
+	NativeActivation,
+	SourceEvidenceInput,
+	SourceTaskActivationSink,
+} from "../extensions/task-plane/types.ts";
 
 const BASE = "https://forge.example";
 const API = `${BASE}/api/v1`;
@@ -20,7 +25,7 @@ interface Route {
  * Stub `fetch` with a URL-prefix routing table, recording every call. Any route
  * may be a function to vary the response per call.
  */
-function stubFetch(routes: Record<string, Route | (() => Route)>): {
+function stubFetch(routes: Record<string, Route | ((url: string) => Route)>): {
 	calls: { url: string; method: string }[];
 	restore: () => void;
 } {
@@ -32,7 +37,7 @@ function stubFetch(routes: Record<string, Route | (() => Route)>): {
 		const key = Object.keys(routes).find((prefix) => url.startsWith(prefix));
 		const entry = key ? routes[key] : undefined;
 		if (!entry) return new Response("no route", { status: 404 });
-		const route = typeof entry === "function" ? entry() : entry;
+		const route = typeof entry === "function" ? entry(url) : entry;
 		return new Response(JSON.stringify(route.body), {
 			status: route.status ?? 200,
 			headers: { date: "Tue, 28 Jul 2026 12:00:00 GMT", ...route.headers },
@@ -59,6 +64,43 @@ const config: ForgejoConfig = {
 };
 
 const settle = async (ms = 60) => await new Promise((r) => setTimeout(r, ms));
+
+/** Observe activations only after they traverse the source's task sink. */
+function createForgejoSource(cfg: ForgejoConfig) {
+	return {
+		async start(onEvent: (event: { channel: string; summary: string }) => unknown) {
+			const checkpoints = new Map<string, unknown>();
+			const sink: SourceTaskActivationSink = {
+				async accept(input: NativeActivation) {
+					const data = input.parts[0]?.data as { reason?: string } | undefined;
+					onEvent({ channel: input.source, summary: data?.reason ?? "unknown" });
+					return {
+						activationId: input.providerEventId,
+						taskId: `task-${input.providerEventId}`,
+						contextId: input.conversationKey ?? "context",
+						disposition: "created",
+					};
+				},
+				async continue() {
+					throw new Error("unused");
+				},
+				async checkpoint(_principal, source) {
+					return checkpoints.get(source) as never;
+				},
+				async advanceCheckpoint(_principal, source, checkpoint) {
+					checkpoints.set(source, checkpoint);
+				},
+				async recordEvidence() {},
+				async deliver(_input, send) {
+					return send();
+				},
+			};
+			return createForgejoSourceImpl(cfg, sink).start(() => {
+				throw new Error("legacy onEvent must not be used");
+			});
+		},
+	};
+}
 
 function thread(id: number, type: string, n = 1) {
 	return {
@@ -339,6 +381,119 @@ test("a failed subject lookup retries the thread without re-waking for delivered
 	// The pull request wakes exactly once even though its window is re-listed,
 	// and the issue is retried rather than lost or repeated.
 	assert.deepEqual(events.map((e) => e.summary).sort(), ["assigned_issue", "review_requested"]);
+});
+
+test("a failed Task acceptance holds the Forgejo checkpoint and retries the exact revision", async () => {
+	let probes = 0;
+	const { restore } = stubFetch({
+		[`${API}/notifications/new`]: () => ({
+			body: { new: 1 },
+			headers: { date: `Tue, 28 Jul 2026 12:0${probes++}:00 GMT` },
+		}),
+		[`${API}/notifications?`]: (url) => ({
+			body: url.includes(encodeURIComponent("2026-07-28T12:00:00.000Z"))
+				? [thread(12, "Pull")]
+				: [],
+		}),
+		[`${API}/repos/o/r/pulls/1`]: {
+			body: { requested_reviewers: [{ login: "drago" }], assignees: [] },
+		},
+	});
+	let checkpoint: unknown;
+	let attempts = 0;
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			attempts += 1;
+			if (attempts === 1) throw new Error("task store unavailable");
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-1",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint() {
+			return checkpoint as never;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value;
+		},
+		async recordEvidence() {},
+	};
+	const stop = await createForgejoSourceImpl(config, sink).start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		for (let wait = 0; attempts < 2 && wait < 100; wait += 1) await settle(5);
+		assert.equal(attempts, 2);
+		assert.ok(checkpoint);
+	} finally {
+		await stop();
+		restore();
+	}
+});
+
+test("permanent Forgejo intake failure records evidence and does not block a later thread", async () => {
+	const invalid = { ...thread(13, "Pull"), repository: undefined };
+	const { restore } = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 2 } },
+		[`${API}/notifications?`]: { body: [invalid, thread(14, "Pull", 2)] },
+		[`${API}/repos/o/r/pulls/1`]: { body: { requested_reviewers: [{ login: "drago" }] } },
+		[`${API}/repos/o/r/pulls/2`]: { body: { requested_reviewers: [{ login: "drago" }] } },
+	});
+	const accepted: string[] = [];
+	const evidence: SourceEvidenceInput[] = [];
+	let checkpoint: unknown;
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			if (!input.nativeLocator.repository) {
+				throw new Error(
+					"nativeLocator.repository must be a non-empty string of at most 4096 characters",
+				);
+			}
+			accepted.push(input.nativeLocator.threadId as string);
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-1",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint() {
+			return checkpoint as never;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value;
+		},
+		async recordEvidence(input) {
+			evidence.push(input);
+		},
+	};
+	const stop = await createForgejoSourceImpl(config, sink).start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		for (let wait = 0; accepted.length < 1 && wait < 100; wait += 1) await settle(5);
+		assert.deepEqual(accepted, ["14"]);
+		assert.deepEqual(evidence, [
+			{
+				kind: "permanent-invalid-activation",
+				detail: { threadId: "13", revision: "2026-07-28T11:59:00Z" },
+				evidenceId: evidence[0]?.evidenceId,
+				source: "forgejo",
+			},
+		]);
+		assert.ok(checkpoint);
+	} finally {
+		await stop();
+		restore();
+	}
 });
 
 test("backoffDelayMs doubles per consecutive failure and caps", () => {

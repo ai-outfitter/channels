@@ -79,7 +79,8 @@ export interface AgentTransport {
 	 * offline.
 	 */
 	stream?(messageId: string, event: RelayStreamEvent): Promise<void>;
-	subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>>;
+	/** Acknowledge a delivery only after every listener durably accepts it. */
+	subscribe(onMessage: (message: AgentMessageV1) => Promise<void>): Promise<() => Promise<void>>;
 	close(): Promise<void>;
 }
 

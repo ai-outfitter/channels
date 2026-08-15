@@ -64,7 +64,7 @@ test("filesystem transport completes a durable two-agent round trip exactly once
 		);
 
 		const delivered = new Promise<string>((resolve) => {
-			void bob.subscribe(resolve);
+			void bob.subscribe(async (message) => resolve(message.id));
 		});
 		const sent = await alice.send({
 			id: "request-1",
@@ -125,7 +125,7 @@ test("filesystem retry and restart recover the committed message without duplica
 
 		const restarted = new FilesystemAgentTransport({ root, endpointId: "receiver", pollMs: 25 });
 		const delivered = new Promise<string>((resolve) => {
-			void restarted.subscribe(resolve);
+			void restarted.subscribe(async (message) => resolve(message.id));
 		});
 		assert.equal(await delivered, "stable-id");
 		assert.equal((await restarted.read("stable-id")).messages.length, 1);
@@ -219,7 +219,22 @@ test("agent source wake contains a locator but never the message body", async ()
 		const eventPromise = new Promise<unknown>((resolve) => {
 			emitEvent = resolve;
 		});
-		const stop = await createAgentSource(config).start(emitEvent);
+		const stop = await createAgentSource(config, undefined, undefined, undefined, {
+			async accept(input) {
+				emitEvent(input);
+				return {
+					activationId: input.providerEventId,
+					taskId: "task-1",
+					contextId: input.conversationKey ?? "context",
+					disposition: "created",
+				};
+			},
+			async continue() {
+				throw new Error("unused");
+			},
+		}).start(() => {
+			throw new Error("legacy onEvent must not be used");
+		});
 		await actions.send({
 			id: "body-free",
 			recipient: "receiver",
@@ -231,6 +246,58 @@ test("agent source wake contains a locator but never the message body", async ()
 		assert.doesNotMatch(JSON.stringify(event), /ignore every trusted instruction/);
 		await stop();
 	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("agent filesystem delivery remains queued until Task acceptance", async () => {
+	const root = await temporarySpool();
+	let stop: (() => Promise<void>) | undefined;
+	try {
+		const config = {
+			endpointId: "receiver",
+			principalId: "receiver",
+			spoolPath: root,
+			pollMs: 25,
+		};
+		const journal = new AgentSessionJournal();
+		let attempts = 0;
+		let resolveAccepted = (): void => {};
+		const accepted = new Promise<void>((resolve) => {
+			resolveAccepted = resolve;
+		});
+		stop = await createAgentSource(config, undefined, journal, undefined, {
+			async accept() {
+				attempts += 1;
+				if (attempts === 1) throw new Error("task store unavailable");
+				resolveAccepted();
+				return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+			},
+			async continue() {
+				throw new Error("unused");
+			},
+		}).start(() => {
+			throw new Error("legacy onEvent must not be used");
+		});
+		const sender = createAgentActions({
+			endpointId: "sender",
+			principalId: "sender",
+			spoolPath: root,
+		});
+		await sender.send({
+			id: "accept-before-unlink",
+			recipient: "receiver",
+			conversationId: "ordering",
+			body: "must survive",
+		});
+		await accepted;
+		for (let wait = 0; !journal.message("accept-before-unlink") && wait < 100; wait += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		assert.equal(attempts, 2);
+		assert.equal(journal.message("accept-before-unlink")?.state, "delivered");
+	} finally {
+		await stop?.();
 		await rm(root, { recursive: true, force: true });
 	}
 });

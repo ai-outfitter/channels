@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { A2aError } from "../extensions/a2a/types.ts";
 import {
-	createMattermostActions,
-	createMattermostSource,
+	createMattermostActions as createMattermostActionsImpl,
+	createMattermostSource as createMattermostSourceImpl,
 	type MattermostApi,
 	type MattermostConfig,
 	type MattermostPost,
@@ -10,12 +11,66 @@ import {
 	mattermostConfigFromEnv,
 	mattermostMentionEvent,
 } from "../extensions/sources/mattermost.ts";
+import type {
+	NativeActivation,
+	SourceEvidenceInput,
+	SourceTaskActivationSink,
+} from "../extensions/task-plane/types.ts";
 
 const config: MattermostConfig = {
 	baseUrl: "https://mattermost.example.com",
 	token: "token",
 	channelIds: new Set(),
 };
+
+const actionSink: SourceTaskActivationSink = {
+	async accept() {
+		throw new Error("unused");
+	},
+	async continue() {
+		throw new Error("unused");
+	},
+	async taskForLocator() {
+		return "task-1";
+	},
+	async deliver(_input, send) {
+		return send();
+	},
+};
+
+function createMattermostActions(cfg: MattermostConfig, api?: MattermostApi) {
+	return createMattermostActionsImpl(cfg, api, actionSink);
+}
+
+function createMattermostSource(
+	cfg: MattermostConfig,
+	socketFactory?: Parameters<typeof createMattermostSourceImpl>[1],
+	retryMs?: number,
+	api?: MattermostApi,
+) {
+	return {
+		async start(onEvent: (event: { locator?: { key: string } }) => unknown) {
+			const sink: SourceTaskActivationSink = {
+				async accept(input: NativeActivation) {
+					onEvent({ locator: { key: input.nativeLocator.channelLocator as string } });
+					return {
+						activationId: input.providerEventId,
+						taskId: "task-1",
+						contextId: input.conversationKey ?? "context",
+						disposition: "created",
+					};
+				},
+				async continue() {
+					throw new Error("unused");
+				},
+				async advanceCheckpoint() {},
+			};
+			return createMattermostSourceImpl(cfg, socketFactory, retryMs, api, sink).start(() => {
+				throw new Error("legacy onEvent must not be used");
+			});
+		},
+	};
+}
 
 test("Mattermost configuration validates the URL and channel boundary", () => {
 	const prior = snapshot("MATTERMOST_BASE_URL", "MATTERMOST_BOT_TOKEN", "MATTERMOST_CHANNEL_IDS");
@@ -212,6 +267,126 @@ test("Mattermost source authenticates, reconnects, filters, and shuts down", asy
 	assert.equal(JSON.parse(second.sent[0] ?? "{}").action, "authentication_challenge");
 	await stop();
 	assert.equal(second.closed, true);
+});
+
+test("Mattermost retains an unaccepted mention and never calls legacy onEvent", async () => {
+	const sockets: FakeSocket[] = [];
+	let attempts = 0;
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			attempts += 1;
+			if (attempts === 1) throw new Error("task store unavailable");
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-1",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async advanceCheckpoint() {},
+	};
+	const source = createMattermostSourceImpl(
+		config,
+		() => {
+			const socket = new FakeSocket();
+			sockets.push(socket);
+			return socket;
+		},
+		0,
+		fakeApi(),
+		sink,
+	);
+	const stop = await source.start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		const frame = JSON.stringify(
+			postedFrame({
+				id: "post-retry",
+				channel_id: "channel-1",
+				user_id: "user-1",
+				message: "untrusted",
+			}),
+		);
+		await waitFor(() => sockets.length === 1);
+		sockets[0]?.emit("open", {});
+		sockets[0]?.emit("message", { data: JSON.stringify({ status: "OK", seq_reply: 1 }) });
+		sockets[0]?.emit("message", { data: frame });
+		await waitFor(() => attempts === 2);
+		assert.equal(sockets.length, 1);
+	} finally {
+		await stop();
+	}
+});
+
+test("Mattermost records a permanent 4xx intake failure and processes the next frame", async () => {
+	const sockets: FakeSocket[] = [];
+	const accepted: string[] = [];
+	const checkpoints: string[] = [];
+	const evidence: SourceEvidenceInput[] = [];
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			const postId = input.nativeLocator.postId as string;
+			if (postId === "post-invalid") {
+				throw new A2aError(400, "INVALID_ARGUMENT", "invalid activation");
+			}
+			accepted.push(postId);
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-1",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async advanceCheckpoint(_principal, _source, checkpoint) {
+			checkpoints.push((checkpoint as { postId: string }).postId);
+		},
+		async recordEvidence(input) {
+			evidence.push(input);
+		},
+	};
+	const source = createMattermostSourceImpl(
+		config,
+		() => {
+			const socket = new FakeSocket();
+			sockets.push(socket);
+			return socket;
+		},
+		0,
+		fakeApi(),
+		sink,
+	);
+	const stop = await source.start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		await waitFor(() => sockets.length === 1);
+		const socket = sockets[0];
+		assert.ok(socket);
+		socket.emit("open", {});
+		socket.emit("message", { data: JSON.stringify({ status: "OK", seq_reply: 1 }) });
+		for (const id of ["post-invalid", "post-next"]) {
+			socket.emit("message", {
+				data: JSON.stringify(
+					postedFrame({ id, channel_id: "channel-1", user_id: "user-1", message: "work" }),
+				),
+			});
+		}
+		await waitFor(() => accepted.length === 1);
+		assert.deepEqual(accepted, ["post-next"]);
+		assert.deepEqual(checkpoints, ["post-invalid", "post-next"]);
+		assert.equal(evidence.length, 1);
+		assert.equal(evidence[0]?.kind, "permanent-invalid-activation");
+		assert.deepEqual(evidence[0]?.detail, { postId: "post-invalid" });
+	} finally {
+		await stop();
+	}
 });
 
 function postedFrame(

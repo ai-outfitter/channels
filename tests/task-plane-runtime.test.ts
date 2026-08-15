@@ -18,7 +18,11 @@ import {
 	ReplyAnchorStore,
 } from "../extensions/task-plane/stores.ts";
 import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
-import { DurableWakeQueue, taskWakePrompt } from "../extensions/task-plane/wake-queue.ts";
+import {
+	DurableWakeQueue,
+	MAX_PENDING_WAKES,
+	taskWakePrompt,
+} from "../extensions/task-plane/wake-queue.ts";
 
 const digest = (value: string): string =>
 	`sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -713,6 +717,59 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	queue.stop();
 });
 
+it("bounds the pending wake set and records durable overflow evidence", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-overflow-"));
+	const journal = new ActivationJournal(join(root, "activation.jsonl"));
+	await journal.initialize();
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	let release = (): void => {};
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: async () => blocked },
+		{
+			async lookup(taskId: string) {
+				return {
+					principal: "source:user",
+					task: {
+						id: taskId,
+						contextId: "context",
+						status: { state: "TASK_STATE_SUBMITTED", timestamp: new Date().toISOString() },
+					},
+				};
+			},
+		} as A2aTaskStore,
+		journal,
+		(record) => logs.push(record),
+	);
+	const count = MAX_PENDING_WAKES + 2;
+	for (let index = 0; index < count; index += 1) {
+		queue.enqueue({
+			kind: "CLAIM",
+			providerKey: `provider-${index}`,
+			activationId: `activation-${index}`,
+			taskId: `task-${index}`,
+			input: activation(`overflow-${index}`),
+			contextId: "context",
+			intendedRoute: "created",
+			claimedAt: new Date().toISOString(),
+		});
+	}
+	for (let attempt = 0; logs.length === 0 && attempt < 100; attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	const overflow = logs.find((record) => record.event === "a2a_wake_overflow");
+	assert.ok(overflow);
+	const overflowId = overflow.activationId as string;
+	for (let attempt = 0; !journal.isWakeFailed(overflowId) && attempt < 200; attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.ok(journal.isWakeFailed(overflowId));
+	release();
+	queue.stop();
+});
+
 it("contains pump I/O failures and retains the wake for a later trigger", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-pump-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
@@ -1308,6 +1365,18 @@ it("claims A2A inbound work before the queue wakes and grants Task authority", a
 	} finally {
 		await runtime.close();
 	}
+});
+
+it("refuses to claim a WORKING task for a second mid-turn wake", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-claim-working-"));
+	const { plane, tasks } = await fixture(root);
+	const principal = "source:user";
+	const task = await tasks.createTask(principal, undefined);
+	await tasks.updateStatus(principal, task.id, { state: "TASK_STATE_WORKING" });
+	await assert.rejects(
+		plane.claim(activation("working-claim", { principal, source: "a2a" }), task.id),
+		/task cannot accept supplied input/,
+	);
 });
 
 it("publishes one stateless Pi entrypoint that reloads with Jiti moduleCache disabled", async () => {

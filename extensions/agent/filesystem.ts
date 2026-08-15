@@ -184,15 +184,23 @@ export class FilesystemAgentTransport implements AgentTransport {
 		return { target: updated, response: sent };
 	}
 
-	async subscribe(onMessage: (messageId: string) => void): Promise<() => Promise<void>> {
+	async subscribe(
+		onMessage: (message: AgentMessageV1) => Promise<void>,
+	): Promise<() => Promise<void>> {
 		await this.initialize();
 		const controller = new AbortController();
 		const scan = async (): Promise<void> => {
 			for (const message of await this.#queuedMessages(this.endpoint.id)) {
 				const path = this.#messagePath(this.endpoint.id, message.id);
-				const stored = this.#journal.recordMessage(message, "delivered");
+				try {
+					await onMessage(message);
+				} catch {
+					// Leave this exact spool file in place and retry it before later
+					// messages. Durable Task acceptance is the delivery boundary.
+					break;
+				}
+				this.#journal.recordMessage(message, "delivered");
 				await durableUnlink(path);
-				onMessage(stored.message.id);
 			}
 		};
 		await scan();

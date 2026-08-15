@@ -10,6 +10,7 @@ import type {
 	RunningChannelsRuntime,
 	RuntimeDependencies,
 } from "../extensions/task-plane/runtime.ts";
+import { startChannelsRuntime } from "../extensions/task-plane/runtime.ts";
 
 type Handler = (...args: never[]) => Promise<void> | void;
 
@@ -296,6 +297,65 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 				outcome: "completed",
 			});
 			assert.deepEqual(states, ["active:TASK_STATE_COMPLETED"]);
+		},
+	);
+});
+
+test("real wake-queue source wiring denies continuation for a native Task", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-real-authority-"));
+	await withEnv(
+		{
+			OUTFITTER_CHANNELS: "off",
+			A2A_SERVER: "1",
+			CHANNELS_TASK_STORE_PATH: root,
+			OUTFITTER_AGENT_RELAY: undefined,
+		},
+		async () => {
+			const { pi, handlers, tools } = fakePi();
+			const prompts: string[] = [];
+			Object.assign(pi, {
+				sendUserMessage(prompt: string) {
+					prompts.push(prompt);
+				},
+			});
+			let runtime: RunningChannelsRuntime | undefined;
+			channelsRuntimeExtension(pi, {
+				startRuntime: async (runtimePi, dependencies) => {
+					const { listener: _listener, ...withoutListener } = dependencies;
+					runtime = await startChannelsRuntime(runtimePi, {
+						...withoutListener,
+					});
+					return runtime;
+				},
+			});
+			await fire(handlers, "session_start");
+			assert.ok(runtime);
+			const accepted = await runtime.sourceSink.accept({
+				principal: "slack:test",
+				source: "slack",
+				providerEventId: "event:test",
+				nativeLocator: { channelLocator: "slack:v1:test" },
+				receivedAt: "2026-08-15T12:00:00.000Z",
+				providerDedupeKey: "event:test",
+				conversationKey: "conversation:test",
+				parts: [{ text: "untrusted" }],
+				contentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			});
+			for (let attempt = 0; prompts.length === 0 && attempt < 100; attempt += 1) {
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			const before = handlers.get("before_agent_start")?.[0];
+			assert.ok(before && prompts[0]);
+			await (before as unknown as (event: { prompt: string }) => Promise<void>)({
+				prompt: prompts[0],
+			});
+			const requireInput = tools.get("a2a_require_input");
+			assert.ok(requireInput);
+			await assert.rejects(
+				requireInput.execute("call", { taskId: accepted.taskId, question: "more?" }),
+				/source has no continuation method/,
+			);
+			await fire(handlers, "session_shutdown");
 		},
 	);
 });
