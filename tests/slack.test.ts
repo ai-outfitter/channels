@@ -894,7 +894,10 @@ test("a failed action-adapter import is retried on the next tool call", async ()
 
 test("channel registry never statically imports a source implementation", async () => {
 	const index = await readFile(new URL("../extensions/index.ts", import.meta.url), "utf8");
-	assert.doesNotMatch(index, /^import .*\.\/sources\/(?:jmap|signal|github|slack)\.ts/m);
+	assert.doesNotMatch(
+		index,
+		/^import (?!type ).*["']\.\/sources\/(?:jmap|signal|github|forgejo|slack|agent|chatto|mattermost|zulip)\.ts["'];?$/m,
+	);
 });
 
 test("a selected source failure rolls back every source without a direct wake", async () => {

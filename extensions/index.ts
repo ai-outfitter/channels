@@ -61,145 +61,177 @@ export type StreamForwarder = ((event: MessageUpdateEvent) => void) & {
  * The source registry. Keep configuration probes dependency-free and dynamically
  * import every implementation so unused channel SDKs are never evaluated.
  */
-const SOURCES: Record<string, SourceRegistration> = {
-	jmap: {
-		configured: () =>
-			Boolean(process.env.XIN_BASE_URL || process.env.XIN_BASIC_USER || process.env.XIN_BASIC_PASS),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/jmap.ts");
-			const cfg = m.jmapConfigFromEnv();
-			return cfg ? m.createJmapSource(cfg, undefined, taskSink) : undefined;
+export type SourceModuleEvaluator = <T>(
+	specifier: string,
+	evaluate: () => Promise<T>,
+) => Promise<T>;
+
+const evaluateSourceModule: SourceModuleEvaluator = (_specifier, evaluate) => evaluate();
+
+/** Build one registry whose source modules are each evaluated at most once. */
+export function createSourceRegistry(
+	evaluate: SourceModuleEvaluator = evaluateSourceModule,
+): Record<string, SourceRegistration> {
+	const imports = new Map<string, Promise<unknown>>();
+	const importOnce = <T>(specifier: string, load: () => Promise<T>): Promise<T> => {
+		let loaded = imports.get(specifier) as Promise<T> | undefined;
+		if (!loaded) {
+			loaded = evaluate(specifier, load);
+			imports.set(specifier, loaded);
+		}
+		return loaded;
+	};
+
+	return {
+		jmap: {
+			configured: () =>
+				Boolean(
+					process.env.XIN_BASE_URL || process.env.XIN_BASIC_USER || process.env.XIN_BASIC_PASS,
+				),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/jmap.ts", () => import("./sources/jmap.ts"));
+				const cfg = m.jmapConfigFromEnv();
+				return cfg ? m.createJmapSource(cfg, undefined, taskSink) : undefined;
+			},
 		},
-	},
-	signal: {
-		configured: () => Boolean(process.env.SIGNAL_NUMBER || process.env.SIGNAL_CLI_CONFIG),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/signal.ts");
-			const cfg = m.signalConfigFromEnv();
-			return cfg ? m.createSignalSource(cfg, taskSink) : undefined;
+		signal: {
+			configured: () => Boolean(process.env.SIGNAL_NUMBER || process.env.SIGNAL_CLI_CONFIG),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/signal.ts", () => import("./sources/signal.ts"));
+				const cfg = m.signalConfigFromEnv();
+				return cfg ? m.createSignalSource(cfg, taskSink) : undefined;
+			},
 		},
-	},
-	github: {
-		configured: () => Boolean(process.env.GITHUB_NOTIFY_TOKEN || process.env.GITHUB_TOKEN),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/github.ts");
-			const cfg = m.githubConfigFromEnv();
-			return cfg ? m.createGithubSource(cfg, taskSink) : undefined;
+		github: {
+			configured: () => Boolean(process.env.GITHUB_NOTIFY_TOKEN || process.env.GITHUB_TOKEN),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/github.ts", () => import("./sources/github.ts"));
+				const cfg = m.githubConfigFromEnv();
+				return cfg ? m.createGithubSource(cfg, taskSink) : undefined;
+			},
 		},
-	},
-	forgejo: {
-		configured: () => Boolean(process.env.FORGEJO_TOKEN),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/forgejo.ts");
-			const cfg = m.forgejoConfigFromEnv();
-			return cfg ? m.createForgejoSource(cfg, taskSink) : undefined;
+		forgejo: {
+			configured: () => Boolean(process.env.FORGEJO_TOKEN),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/forgejo.ts", () => import("./sources/forgejo.ts"));
+				const cfg = m.forgejoConfigFromEnv();
+				return cfg ? m.createForgejoSource(cfg, taskSink) : undefined;
+			},
 		},
-	},
-	slack: {
-		configured: () => Boolean(process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/slack.ts");
-			const cfg = m.slackConfigFromEnv();
-			return cfg ? m.createSlackSource(cfg, undefined, undefined, taskSink) : undefined;
+		slack: {
+			configured: () => Boolean(process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/slack.ts", () => import("./sources/slack.ts"));
+				const cfg = m.slackConfigFromEnv();
+				return cfg ? m.createSlackSource(cfg, undefined, undefined, taskSink) : undefined;
+			},
+			async loadActions(_journal, taskSink) {
+				const m = await importOnce("./sources/slack.ts", () => import("./sources/slack.ts"));
+				const cfg = m.slackActionsConfigFromEnv();
+				return cfg ? m.createSlackActions(cfg, undefined, taskSink) : undefined;
+			},
 		},
-		async loadActions(_journal, taskSink) {
-			const m = await import("./sources/slack.ts");
-			const cfg = m.slackActionsConfigFromEnv();
-			return cfg ? m.createSlackActions(cfg, undefined, taskSink) : undefined;
+		agent: {
+			configured: () =>
+				Boolean(
+					process.env.AGENT_ENDPOINT_ID ||
+						process.env.AGENT_SPOOL_PATH ||
+						process.env.AGENT_RELAY_URL ||
+						process.env.AGENT_RELAY_TOKEN,
+				),
+			async load(journal, taskSink) {
+				const m = await importOnce("./sources/agent.ts", () => import("./sources/agent.ts"));
+				const config = m.agentConfigFromEnv();
+				return config
+					? m.createAgentSource(config, undefined, journal, undefined, taskSink)
+					: undefined;
+			},
+			async loadActions(journal, taskSink) {
+				const m = await importOnce("./sources/agent.ts", () => import("./sources/agent.ts"));
+				const config = m.agentConfigFromEnv();
+				return config ? m.createAgentActions(config, undefined, journal, taskSink) : undefined;
+			},
+			async loadAgentActions(journal) {
+				const m = await importOnce("./sources/agent.ts", () => import("./sources/agent.ts"));
+				const config = m.agentConfigFromEnv();
+				return config ? m.createAgentActions(config, undefined, journal) : undefined;
+			},
+			async loadStreamForwarder(journal) {
+				const m = await importOnce("./sources/agent.ts", () => import("./sources/agent.ts"));
+				const config = m.agentConfigFromEnv();
+				return config ? m.createAgentStreamForwarder(config, undefined, journal) : undefined;
+			},
 		},
-	},
-	agent: {
-		configured: () =>
-			Boolean(
-				process.env.AGENT_ENDPOINT_ID ||
-					process.env.AGENT_SPOOL_PATH ||
-					process.env.AGENT_RELAY_URL ||
-					process.env.AGENT_RELAY_TOKEN,
-			),
-		async load(journal, taskSink) {
-			const m = await import("./sources/agent.ts");
-			const config = m.agentConfigFromEnv();
-			return config
-				? m.createAgentSource(config, undefined, journal, undefined, taskSink)
-				: undefined;
+		chatto: {
+			configured: () =>
+				Boolean(
+					process.env.CHATTO_BASE_URL || process.env.CHATTO_TOKEN || process.env.CHATTO_ROOM_IDS,
+				),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/chatto.ts", () => import("./sources/chatto.ts"));
+				const cfg = m.chattoConfigFromEnv();
+				return cfg
+					? m.createChattoSource(cfg, undefined, undefined, undefined, taskSink)
+					: undefined;
+			},
+			async loadActions(_journal, taskSink) {
+				const m = await importOnce("./sources/chatto.ts", () => import("./sources/chatto.ts"));
+				const cfg = m.chattoConfigFromEnv();
+				return cfg ? m.createChattoActions(cfg, undefined, taskSink) : undefined;
+			},
 		},
-		async loadActions(journal, taskSink) {
-			const m = await import("./sources/agent.ts");
-			const config = m.agentConfigFromEnv();
-			return config ? m.createAgentActions(config, undefined, journal, taskSink) : undefined;
+		mattermost: {
+			configured: () =>
+				Boolean(
+					process.env.MATTERMOST_BASE_URL ||
+						process.env.MATTERMOST_BOT_TOKEN ||
+						process.env.MATTERMOST_CHANNEL_IDS,
+				),
+			async load(_journal, taskSink) {
+				const m = await importOnce(
+					"./sources/mattermost.ts",
+					() => import("./sources/mattermost.ts"),
+				);
+				const cfg = m.mattermostConfigFromEnv();
+				return cfg
+					? m.createMattermostSource(cfg, undefined, undefined, undefined, taskSink)
+					: undefined;
+			},
+			async loadActions(_journal, taskSink) {
+				const m = await importOnce(
+					"./sources/mattermost.ts",
+					() => import("./sources/mattermost.ts"),
+				);
+				const cfg = m.mattermostConfigFromEnv();
+				return cfg ? m.createMattermostActions(cfg, undefined, taskSink) : undefined;
+			},
 		},
-		async loadAgentActions(journal) {
-			const m = await import("./sources/agent.ts");
-			const config = m.agentConfigFromEnv();
-			return config ? m.createAgentActions(config, undefined, journal) : undefined;
+		zulip: {
+			configured: () =>
+				Boolean(
+					process.env.ZULIP_ORGANIZATION_URL ||
+						process.env.ZULIP_BOT_EMAIL ||
+						process.env.ZULIP_API_KEY ||
+						process.env.ZULIP_CHANNEL_IDS,
+				),
+			async load(_journal, taskSink) {
+				const m = await importOnce("./sources/zulip.ts", () => import("./sources/zulip.ts"));
+				const cfg = m.zulipConfigFromEnv();
+				return cfg ? m.createZulipSource(cfg, undefined, undefined, taskSink) : undefined;
+			},
+			async loadActions(_journal, taskSink) {
+				const m = await importOnce("./sources/zulip.ts", () => import("./sources/zulip.ts"));
+				const cfg = m.zulipConfigFromEnv();
+				return cfg ? m.createZulipActions(cfg, undefined, taskSink) : undefined;
+			},
 		},
-		async loadStreamForwarder(journal) {
-			const m = await import("./sources/agent.ts");
-			const config = m.agentConfigFromEnv();
-			return config ? m.createAgentStreamForwarder(config, undefined, journal) : undefined;
-		},
-	},
-	chatto: {
-		configured: () =>
-			Boolean(
-				process.env.CHATTO_BASE_URL || process.env.CHATTO_TOKEN || process.env.CHATTO_ROOM_IDS,
-			),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/chatto.ts");
-			const cfg = m.chattoConfigFromEnv();
-			return cfg ? m.createChattoSource(cfg, undefined, undefined, undefined, taskSink) : undefined;
-		},
-		async loadActions(_journal, taskSink) {
-			const m = await import("./sources/chatto.ts");
-			const cfg = m.chattoConfigFromEnv();
-			return cfg ? m.createChattoActions(cfg, undefined, taskSink) : undefined;
-		},
-	},
-	mattermost: {
-		configured: () =>
-			Boolean(
-				process.env.MATTERMOST_BASE_URL ||
-					process.env.MATTERMOST_BOT_TOKEN ||
-					process.env.MATTERMOST_CHANNEL_IDS,
-			),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/mattermost.ts");
-			const cfg = m.mattermostConfigFromEnv();
-			return cfg
-				? m.createMattermostSource(cfg, undefined, undefined, undefined, taskSink)
-				: undefined;
-		},
-		async loadActions(_journal, taskSink) {
-			const m = await import("./sources/mattermost.ts");
-			const cfg = m.mattermostConfigFromEnv();
-			return cfg ? m.createMattermostActions(cfg, undefined, taskSink) : undefined;
-		},
-	},
-	zulip: {
-		configured: () =>
-			Boolean(
-				process.env.ZULIP_ORGANIZATION_URL ||
-					process.env.ZULIP_BOT_EMAIL ||
-					process.env.ZULIP_API_KEY ||
-					process.env.ZULIP_CHANNEL_IDS,
-			),
-		async load(_journal, taskSink) {
-			const m = await import("./sources/zulip.ts");
-			const cfg = m.zulipConfigFromEnv();
-			return cfg ? m.createZulipSource(cfg, undefined, undefined, taskSink) : undefined;
-		},
-		async loadActions(_journal, taskSink) {
-			const m = await import("./sources/zulip.ts");
-			const cfg = m.zulipConfigFromEnv();
-			return cfg ? m.createZulipActions(cfg, undefined, taskSink) : undefined;
-		},
-	},
-};
+	};
+}
 
 export default function channelEventsExtension(
 	pi: ExtensionAPI,
 	taskSink: () => SourceTaskActivationSink,
-	sources: Readonly<Record<string, SourceRegistration>> = SOURCES,
+	sources: Readonly<Record<string, SourceRegistration>> = createSourceRegistry(),
 	onTransactionalFailure: () => void | Promise<void> = () => {},
 ): ChannelEventsLifecycle | undefined {
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
