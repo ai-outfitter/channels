@@ -120,10 +120,6 @@ export class DurableWakeQueue {
 		return true;
 	}
 
-	requiresAuthority(taskId: string): boolean {
-		return this.#journal.claims().some((claim) => claim.taskId === taskId);
-	}
-
 	sourceForTask(taskId: string): string | undefined {
 		return this.#journal.claims().find((claim) => claim.taskId === taskId)?.input.source;
 	}

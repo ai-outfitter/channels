@@ -6,9 +6,20 @@ import {
 	githubConfigFromEnv,
 	nextIntervalMs,
 } from "../extensions/sources/github.ts";
-import type { SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
+import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
 const API = "https://api.github.com";
+
+function unusedTaskSink(): SourceTaskActivationSink {
+	return {
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+}
 
 interface Route {
 	body: unknown;
@@ -96,7 +107,21 @@ async function run(
 }> {
 	const fetchStub = stubFetch(routes);
 	const events: { channel: string; summary: string }[] = [];
-	const stop = await createGithubSource(cfg, taskSink).start((e) => events.push(e));
+	const sink =
+		taskSink ??
+		({
+			async accept(input: NativeActivation) {
+				events.push({ channel: "github", summary: input.nativeLocator.reason ?? "activity" });
+				return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" as const };
+			},
+			async continue() {
+				throw new Error("unused");
+			},
+			async deliver(_input, send) {
+				return send();
+			},
+		} satisfies SourceTaskActivationSink);
+	const stop = await createGithubSource(cfg, sink).start(() => {});
 	await settle();
 	return { events, calls: fetchStub.calls, stop, restore: fetchStub.restore };
 }
@@ -189,23 +214,17 @@ test("never requests a URL outside the configured API base", async () => {
 	);
 });
 
-test("does not mark a thread read by default", async () => {
-	// Marking read in the poll that emits the wake deletes the evidence the woken
-	// agent goes looking for, and it reports that it has no work.
+test("marks a thread read after default task-plane acceptance", async () => {
 	const { calls, stop, restore } = await run(config, {
 		[`${API}/user`]: { body: { login: "bot", id: 123 } },
 		[`${API}/notifications`]: { body: [note("1", "review_requested")] },
 	});
 	await stop();
 	restore();
-	assert.equal(
-		calls.filter((c) => c.method === "PATCH").length,
-		0,
-		"default configuration must not PATCH notification threads",
-	);
+	assert.equal(calls.filter((c) => c.method === "PATCH").length, 1);
 });
 
-test("ignores the retired mark-read flag outside task-plane acceptance", async () => {
+test("ignores the retired mark-read flag and still acknowledges accepted work", async () => {
 	const { calls, stop, restore } = await run(
 		{ ...config, markRead: true },
 		{
@@ -217,7 +236,7 @@ test("ignores the retired mark-read flag outside task-plane acceptance", async (
 	await stop();
 	restore();
 	const patches = calls.filter((c) => c.method === "PATCH");
-	assert.equal(patches.length, 0);
+	assert.equal(patches.length, 1);
 });
 
 test("accepts the exact revision before mark-read and checkpoint advancement", async () => {
@@ -547,7 +566,7 @@ test("does not intake under an unknown identity", async () => {
 	});
 	let stop: (() => Promise<void>) | undefined;
 	try {
-		stop = await createGithubSource({ ...config, pollMs: 10 }).start(() => {});
+		stop = await createGithubSource({ ...config, pollMs: 10 }, unusedTaskSink()).start(() => {});
 		await waitFor(() => fetchStub.calls.filter((call) => call.url.endsWith("/user")).length >= 2);
 		assert.equal(
 			fetchStub.calls.some((call) => call.url.includes("/notifications?")),
@@ -570,7 +589,7 @@ test("a transient GitHub identity failure does not fail startup and retries", as
 	});
 	let stop: (() => Promise<void>) | undefined;
 	try {
-		stop = await createGithubSource({ ...config, pollMs: 10 }).start(() => {});
+		stop = await createGithubSource({ ...config, pollMs: 10 }, unusedTaskSink()).start(() => {});
 		assert.equal(typeof stop, "function", "startup returns before identity succeeds");
 		await waitFor(() => fetchStub.calls.some((call) => call.url.includes("/notifications?")));
 		assert.equal(identityCalls, 2);

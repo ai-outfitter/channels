@@ -4,10 +4,10 @@ A [Pi](https://github.com/earendil-works/pi) extension that watches email,
 Signal, GitHub notifications, and mentions in Slack, Chatto, Mattermost, and
 Zulip, then wakes the running session only when a source detects matching work.
 Sources may use push connections, local daemons, or lightweight polling.
-Multiple channels share one notification queue.
+Multiple channels share one durable Task wake queue.
 
-The wake is a trusted, body-free ping ("there's new activity on `github`").
-Wake prompts contain no message content. For exact items, `channel_read` returns
+The wake is a trusted, body-free Task reference. Wake prompts contain no message
+content. For exact items, `channel_read` returns
 fetched content inside explicit untrusted-content markers.
 
 ## Versioning
@@ -400,9 +400,9 @@ extension in an agent's loadout instead of `pi install` — see
 ## How it works
 
 Connection lifecycle runs on **inference-free** pi hooks (`session_start` opens
-each push stream; `session_shutdown` closes them). Only a real event calls
-`pi.sendUserMessage` (a turn), idle-gated and coalesced across channels into one
-sweep. Full design, the pi primitives, and verification are in
+each push stream; `session_shutdown` closes them). Sources commit work to the
+task plane; only its durable wake queue calls `pi.sendUserMessage`, with one
+active Task authority per turn. Full design, the pi primitives, and verification are in
 [docs/channel-events.md](docs/channel-events.md). Source boundaries and the
 channel tool boundary, library evaluation, and per-channel dynamic-import
 convention are in
@@ -425,7 +425,7 @@ source's row to the
 
 ```text
 extensions/
-  index.ts            # hooks, notification queue, lazy adapter routing
+  index.ts            # hooks, required task intake, lazy adapter routing
   channel-tools.ts    # channel_read / channel_respond
   sources/
     types.ts          # source, event, locator, and action contracts

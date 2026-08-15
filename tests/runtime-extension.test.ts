@@ -59,6 +59,9 @@ function running(onClose: () => Promise<void> | void = () => {}): RunningChannel
 		async continue() {
 			throw new Error("unused");
 		},
+		async claim() {
+			throw new Error("unused");
+		},
 	};
 	return {
 		healthy: true,
@@ -258,9 +261,8 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 				},
 			});
 			Object.assign(loaded.wakeQueue, {
-				requiresAuthority: (id: string) => id !== "legacy",
 				hasAuthority: async (id: string) => id === "active",
-				sourceForTask: () => undefined,
+				sourceForTask: () => "a2a",
 			});
 			channelsRuntimeExtension(pi, {
 				log: (record) => logs.push(record),
@@ -287,7 +289,7 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 			const completeTool = tools.get("a2a_complete_task");
 			assert.ok(readTool && completeTool);
 			await assert.rejects(readTool.execute("call", { taskId: "foreign" }), /not authorized/);
-			await readTool.execute("call", { taskId: "legacy" });
+			await assert.rejects(readTool.execute("call", { taskId: "legacy" }), /not authorized/);
 			await completeTool.execute("call", {
 				taskId: "active",
 				response: "done",
@@ -324,9 +326,8 @@ test("A2A tools fail closed after a channel failure clears the runtime", async (
 				},
 			});
 			Object.assign(loaded.wakeQueue, {
-				requiresAuthority: () => false,
 				hasAuthority: async () => true,
-				sourceForTask: () => undefined,
+				sourceForTask: () => "a2a",
 			});
 			channelsRuntimeExtension(pi, {
 				sources: {

@@ -134,9 +134,10 @@ interface DecodedSlackLocator {
 
 export function createSlackActions(
 	cfg: SlackActionsConfig,
-	web: WebClient = new WebClient(cfg.botToken),
-	taskSink?: SourceTaskActivationSink,
+	web: WebClient | undefined,
+	taskSink: SourceTaskActivationSink,
 ): ChannelActions {
+	web ??= new WebClient(cfg.botToken);
 	let botUserId: Promise<string> | undefined;
 	const getBotUserId = (): Promise<string> => {
 		botUserId ??= authenticateBot(web).catch((error) => {
@@ -178,26 +179,20 @@ export function createSlackActions(
 				if (!posted.ts) throw new Error("chat.postMessage returned no response timestamp");
 				return posted.ts;
 			};
-			const taskForLocator = taskSink?.taskForLocator?.bind(taskSink);
-			const deliver = taskSink?.deliver?.bind(taskSink);
-			let activeTaskId: string | undefined;
-			const responseId =
-				taskForLocator && deliver
-					? await (async () => {
-							const taskId = await taskForLocator("slack", locator);
-							activeTaskId = taskId;
-							return deliver(
-								{
-									taskId,
-									source: "slack",
-									operationId: `reply:${locator}`,
-									payloadDigest: contentDigest(response),
-									recovery: "ambiguous",
-								},
-								post,
-							);
-						})()
-					: await post();
+			if (!taskSink.taskForLocator || !taskSink.deliver) {
+				throw new Error("Slack task delivery is not configured");
+			}
+			const activeTaskId = await taskSink.taskForLocator("slack", locator);
+			const responseId = await taskSink.deliver(
+				{
+					taskId: activeTaskId,
+					source: "slack",
+					operationId: `reply:${locator}`,
+					payloadDigest: contentDigest(response),
+					recovery: "ambiguous",
+				},
+				post,
+			);
 			if (!responseId) throw new Error("chat.postMessage returned no response timestamp");
 			const replied = {
 				channel: "slack",
@@ -216,18 +211,16 @@ export function createSlackActions(
 					assertSlackOk(handled, "reactions.add");
 					return decoded.messageTs;
 				};
-				if (activeTaskId && deliver) {
-					await deliver(
-						{
-							taskId: activeTaskId,
-							source: "slack",
-							operationId: `handled:${locator}`,
-							payloadDigest: contentDigest({ emoji: cfg.doneEmoji }),
-							recovery: "idempotent",
-						},
-						addReaction,
-					);
-				} else await addReaction();
+				await taskSink.deliver(
+					{
+						taskId: activeTaskId,
+						source: "slack",
+						operationId: `handled:${locator}`,
+						payloadDigest: contentDigest({ emoji: cfg.doneEmoji }),
+						recovery: "idempotent",
+					},
+					addReaction,
+				);
 				return { ...replied, handled: true };
 			} catch (error) {
 				if (slackErrorCode(error) === "already_reacted") {
@@ -393,17 +386,15 @@ function slackErrorCode(error: unknown): string | undefined {
 
 export function createSlackSource(
 	cfg: SlackConfig,
-	clients: SlackClientFactories = defaultClients,
-	retryMs: number = RECONNECT_DELAY_MS,
-	taskSink?: SourceTaskActivationSink,
+	clients: SlackClientFactories | undefined,
+	retryMs: number | undefined,
+	taskSink: SourceTaskActivationSink,
 ): ChannelSource {
+	clients ??= defaultClients;
+	retryMs ??= RECONNECT_DELAY_MS;
 	return {
-		async start(onEvent) {
-			return supervise(
-				(signal) => runSlackAttempt(cfg, clients, signal, onEvent, taskSink),
-				log,
-				retryMs,
-			);
+		async start() {
+			return supervise((signal) => runSlackAttempt(cfg, clients, signal, taskSink), log, retryMs);
 		},
 	};
 }
@@ -412,8 +403,7 @@ async function runSlackAttempt(
 	cfg: SlackConfig,
 	clients: SlackClientFactories,
 	signal: AbortSignal,
-	onEvent: (event: ChannelEvent) => void,
-	taskSink?: SourceTaskActivationSink,
+	taskSink: SourceTaskActivationSink,
 ): Promise<void> {
 	const botUserId = await authenticateBot(clients.web(cfg.botToken));
 
@@ -422,7 +412,7 @@ async function runSlackAttempt(
 		log(`socket mode error: ${errorMessage(error)}`);
 	});
 	socket.on("slack_event", (payload) => {
-		void handleSlackEnvelope(payload, cfg.channelIds, onEvent, taskSink).catch((error) => {
+		void handleSlackEnvelope(payload, cfg.channelIds, taskSink).catch((error) => {
 			log(`Slack activation failed: ${errorMessage(error)}`);
 		});
 	});
@@ -448,8 +438,7 @@ function untilAborted(signal: AbortSignal): Promise<void> {
 async function handleSlackEnvelope(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
-	onEvent: (event: ChannelEvent) => void,
-	taskSink?: SourceTaskActivationSink,
+	taskSink: SourceTaskActivationSink,
 ): Promise<void> {
 	if (!isRecord(raw)) return;
 	const envelope = raw as SlackEnvelope;
@@ -470,11 +459,6 @@ async function handleSlackEnvelope(
 	}
 	const event = mentionEvent(envelope.body.event, channelIds);
 	if (!event) {
-		await acknowledge();
-		return;
-	}
-	if (!taskSink) {
-		onEvent(event);
 		await acknowledge();
 		return;
 	}

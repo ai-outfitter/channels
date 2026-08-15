@@ -11,6 +11,8 @@ export interface ActivationClaim {
 	readonly input: NativeActivation;
 	readonly contextId: string;
 	readonly intendedRoute: "created" | "continued";
+	/** The trusted protocol binding persisted this Task and message before claiming it. */
+	readonly taskAlreadyPersisted?: true;
 	readonly claimedAt: string;
 }
 

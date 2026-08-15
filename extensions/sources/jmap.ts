@@ -59,13 +59,14 @@ export function jmapConfigFromEnv(): JmapConfig | undefined {
 
 export function createJmapSource(
 	cfg: JmapConfig,
-	retryMs: number = RECONNECT_DELAY_MS,
-	taskSink?: SourceTaskActivationSink,
+	retryMs: number | undefined,
+	taskSink: SourceTaskActivationSink,
 ): ChannelSource {
+	retryMs ??= RECONNECT_DELAY_MS;
 	const auth = `Basic ${Buffer.from(`${cfg.user}:${cfg.pass}`).toString("base64")}`;
 
 	return {
-		async start(onEvent) {
+		async start() {
 			return supervise(
 				async (signal) => {
 					const session = await fetchSession(cfg.baseUrl, auth, signal);
@@ -73,25 +74,19 @@ export function createJmapSource(
 					const principal = sourceIdentifier("jmap", `${cfg.baseUrl}\0${cfg.user}`);
 					let changes = Promise.resolve();
 					const reconcile = (): void => {
-						if (!taskSink) return;
 						changes = changes
 							.then(() =>
 								reconcileEmailsWithRetry(session, auth, principal, taskSink, signal, retryMs),
 							)
 							.catch((error) => log(`email reconcile failed: ${errorMessage(error)}`));
 					};
-					if (taskSink) reconcile();
+					reconcile();
 					await streamStateChanges(
 						session,
 						auth,
 						signal,
-						(wake) => {
-							onEvent({ channel: "jmap", ...wake });
-						},
-						() => {
-							if (taskSink) reconcile();
-							else onEvent({ channel: "jmap", summary: "new mail" });
-						},
+						(wake) => acceptJmapSignal(taskSink, principal, { channel: "jmap", ...wake }),
+						reconcile,
 					);
 					await changes;
 				},
@@ -100,6 +95,26 @@ export function createJmapSource(
 			);
 		},
 	};
+}
+
+async function acceptJmapSignal(
+	taskSink: SourceTaskActivationSink,
+	principal: string,
+	wake: ChannelEvent,
+): Promise<void> {
+	const identity = wake.dedupeKey ?? wake.summary;
+	await taskSink.accept({
+		principal,
+		source: "jmap-calendar",
+		providerEventId: sourceIdentifier("event", identity),
+		providerDedupeKey: sourceIdentifier("event", identity),
+		nativeLocator: { signal: identity },
+		receivedAt: new Date().toISOString(),
+		parts: [
+			{ data: { summary: wake.summary, ...(wake.dedupeKey ? { dedupeKey: wake.dedupeKey } : {}) } },
+		],
+		contentDigest: contentDigest(wake),
+	});
 }
 
 /** A trusted wake signal: the summary plus an optional queue-coalescing key. */
@@ -235,7 +250,7 @@ async function streamStateChanges(
 	session: JmapSession,
 	auth: string,
 	parentSignal: AbortSignal,
-	onWake: (wake: JmapWake) => void,
+	onWake: (wake: JmapWake) => void | Promise<void>,
 	onMailChange: () => void,
 ): Promise<void> {
 	// A derived controller: aborts when the supervisor stops us OR when the
@@ -312,11 +327,11 @@ async function streamStateChanges(
 				// Normalize CRLF on the whole buffer so a \r\n split across read
 				// boundaries can't hide an SSE frame separator.
 				buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
-				buffer = emitFrames(buffer, accounts, onWake, onMailChange);
+				buffer = await emitFrames(buffer, accounts, onWake, onMailChange);
 			}
 			// Flush a trailing complete frame the server sent right before EOF.
 			buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
-			if (buffer.trim()) emitFrame(buffer, accounts, onWake, onMailChange);
+			if (buffer.trim()) await emitFrame(buffer, accounts, onWake, onMailChange);
 		} finally {
 			await reader.cancel().catch(() => {});
 		}
@@ -327,28 +342,28 @@ async function streamStateChanges(
 }
 
 /** Consume every complete `\n\n`-terminated SSE frame; return the remainder. */
-function emitFrames(
+async function emitFrames(
 	buffer: string,
 	accounts: JmapAccounts,
-	onWake: (wake: JmapWake) => void,
+	onWake: (wake: JmapWake) => void | Promise<void>,
 	onMailChange: () => void,
-): string {
+): Promise<string> {
 	let rest = buffer;
 	let sep = rest.indexOf("\n\n");
 	while (sep !== -1) {
-		emitFrame(rest.slice(0, sep), accounts, onWake, onMailChange);
+		await emitFrame(rest.slice(0, sep), accounts, onWake, onMailChange);
 		rest = rest.slice(sep + 2);
 		sep = rest.indexOf("\n\n");
 	}
 	return rest;
 }
 
-function emitFrame(
+async function emitFrame(
 	frame: string,
 	accounts: JmapAccounts,
-	onWake: (wake: JmapWake) => void,
+	onWake: (wake: JmapWake) => void | Promise<void>,
 	onMailChange: () => void,
-): void {
+): Promise<void> {
 	// Per SSE, the last `event:` line names the frame and `data:` lines rejoin
 	// with "\n".
 	let event: string | undefined;
@@ -372,7 +387,7 @@ function emitFrame(
 	// server that names the frame differently must still wake the agent.
 	if (isCalendarAlert(payload, event)) {
 		const wake = calendarAlertWake(payload, accounts);
-		if (wake) onWake(wake);
+		if (wake) await onWake(wake);
 		return;
 	}
 	if (isMailStateChange(payload, accounts.mailAccountId)) onMailChange();

@@ -26,20 +26,19 @@ pi separates side-effect hooks from model-waking injection (see
 | Wake the agent on a real event | `pi.sendUserMessage(text, { deliverAs })` | **Yes** |
 | External process → session | resident `--mode rpc` stdin: `prompt` / `steer` / `follow_up` | Yes |
 
-This extension uses **inference-free lifecycle hooks** for the connection and
-`sendUserMessage` (a turn) only on a real event.
+This extension uses **inference-free lifecycle hooks** for the connection.
+Sources accept real work through the task plane. Only the durable wake queue
+uses `sendUserMessage`, after acceptance has committed a Task claim.
 
 ## Design
 
 - **`session_start`** (no inference): read config from env, open the source's push
   connection, keep the returned `stop` handle.
-- **On event** (no inference until it wakes): the source calls back with a
-  **trusted ping** (`{ channel, summary, locator? }` — *never* the untrusted
-  body). The
-  extension sends one `sendUserMessage(..., { deliverAs: "followUp" })`: idle →
-  runs now; streaming → runs after the current turn (never interrupts). Events are
-  queued by channel or exact locator and drained after `agent_end`, so a burst
-  folds into as few turns as possible without losing distinct exact items.
+- **On event** (no inference until it wakes): the source sends a content-addressed
+  activation to its required task sink. Acceptance commits the Task, journal
+  claim, dedupe projection, and evidence. The durable queue then sends one
+  body-free `sendUserMessage(..., { deliverAs: "followUp" })` and grants that
+  Task as the turn's authority.
 - **`session_shutdown`** (no inference): call `stop()` — idempotent, closes the
   connection.
 - **Trust boundary:** the wake prompt is trusted and body-free. For located
@@ -53,9 +52,9 @@ This extension uses **inference-free lifecycle hooks** for the connection and
 
 ## Multiple channels at once
 
-The extension runs **every configured channel** simultaneously; all their events
-feed one shared **notification queue** (`pending`) drained after each turn. This is
-what lets one personal agent be assigned to email *and* Slack *and* Signal.
+The extension runs **every configured channel** simultaneously; accepted work
+feeds one durable Task wake queue. This is what lets one personal agent be
+assigned to email *and* Slack *and* Signal without competing wake authorities.
 
 Channel selection:
 
@@ -180,7 +179,7 @@ Loadout entries are resolved by slug and merged by ID across layers. A personal
 agent can combine channel profiles while loading each skill once and
 deduplicating the shared extension. For example, a `personal-assistant` profile
 can select `gmail`, `slack-responder`, and `signal-responder` and process all
-three through one notification queue. Configure `OUTFITTER_CHANNELS`, or let
+three through one Task wake queue. Configure `OUTFITTER_CHANNELS`, or let
 credential auto-detection select the available channels.
 
 ## Verifying against the Stalwart demo

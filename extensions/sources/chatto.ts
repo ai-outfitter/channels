@@ -120,14 +120,15 @@ export function chattoConfigFromEnv(): ChattoConfig | undefined {
 
 export function createChattoActions(
 	cfg: ChattoConfig,
-	api: ChattoApi = createConnectChattoApi(cfg),
-	taskSink?: SourceTaskActivationSink,
+	api: ChattoApi | undefined,
+	taskSink: SourceTaskActivationSink,
 ): ChannelActions {
+	api ??= createConnectChattoApi(cfg);
 	return {
 		async read(locator): Promise<ChannelReadResult> {
 			const decoded = decodeChattoLocator(locator);
 			assertAllowedRoom(decoded, cfg.roomIds);
-			const taskForLocator = taskSink?.taskForLocator?.bind(taskSink);
+			const taskForLocator = taskSink.taskForLocator?.bind(taskSink);
 			const notification = await api.getNotification(decoded.notificationId);
 			if (!notification && !taskForLocator) {
 				return {
@@ -140,7 +141,7 @@ export function createChattoActions(
 			if (notification) assertMatchingMention(notification, decoded);
 			const taskId = taskForLocator ? await taskForLocator("chatto", locator) : undefined;
 			const handled =
-				taskId && taskSink?.taskIsTerminal ? await taskSink.taskIsTerminal(taskId) : false;
+				taskId && taskSink.taskIsTerminal ? await taskSink.taskIsTerminal(taskId) : false;
 			const page = decoded.threadRootEventId
 				? await api.getThreadContext({
 						...decoded,
@@ -164,27 +165,21 @@ export function createChattoActions(
 			assertAllowedRoom(decoded, cfg.roomIds);
 			const notification = await api.getNotification(decoded.notificationId);
 			if (notification) assertMatchingMention(notification, decoded);
-			else if (!taskSink?.taskForLocator) throw new Error("Chatto notification is already handled");
-			const taskForLocator = taskSink?.taskForLocator?.bind(taskSink);
-			const deliver = taskSink?.deliver?.bind(taskSink);
-			let activeTaskId: string | undefined;
-			const responseId =
-				taskForLocator && deliver
-					? await (async () => {
-							const taskId = await taskForLocator("chatto", locator);
-							activeTaskId = taskId;
-							return deliver(
-								{
-									taskId,
-									source: "chatto",
-									operationId: `reply:${locator}`,
-									payloadDigest: contentDigest(response),
-									recovery: "ambiguous",
-								},
-								() => api.createReply(decoded, response),
-							);
-						})()
-					: await api.createReply(decoded, response);
+			else if (!taskSink.taskForLocator) throw new Error("Chatto notification is already handled");
+			if (!taskSink.taskForLocator || !taskSink.deliver) {
+				throw new Error("Chatto task delivery is not configured");
+			}
+			const activeTaskId = await taskSink.taskForLocator("chatto", locator);
+			const responseId = await taskSink.deliver(
+				{
+					taskId: activeTaskId,
+					source: "chatto",
+					operationId: `reply:${locator}`,
+					payloadDigest: contentDigest(response),
+					recovery: "ambiguous",
+				},
+				() => api.createReply(decoded, response),
+			);
 			if (!responseId) throw new Error("Chatto returned no response message id");
 			const replied = {
 				channel: "chatto",
@@ -193,24 +188,22 @@ export function createChattoActions(
 				responseId,
 			} as const;
 			try {
-				if (activeTaskId && deliver) {
-					await deliver(
-						{
-							taskId: activeTaskId,
-							source: "chatto",
-							operationId: `dismiss:${decoded.notificationId}`,
-							payloadDigest: contentDigest({
-								notificationId: decoded.notificationId,
-								dismissed: true,
-							}),
-							recovery: "idempotent",
-						},
-						async () => {
-							await api.dismiss(decoded.notificationId);
-							return decoded.notificationId;
-						},
-					);
-				} else await api.dismiss(decoded.notificationId);
+				await taskSink.deliver(
+					{
+						taskId: activeTaskId,
+						source: "chatto",
+						operationId: `dismiss:${decoded.notificationId}`,
+						payloadDigest: contentDigest({
+							notificationId: decoded.notificationId,
+							dismissed: true,
+						}),
+						recovery: "idempotent",
+					},
+					async () => {
+						await api.dismiss(decoded.notificationId);
+						return decoded.notificationId;
+					},
+				);
 				return { ...replied, handled: true };
 			} catch (error) {
 				return {
@@ -225,20 +218,23 @@ export function createChattoActions(
 
 export function createChattoSource(
 	cfg: ChattoConfig,
-	socketFactory: ChattoSocketFactory = defaultSocketFactory,
-	retryMs: number = RECONNECT_DELAY_MS,
-	api: ChattoApi = createConnectChattoApi(cfg),
-	taskSink?: SourceTaskActivationSink,
+	socketFactory: ChattoSocketFactory | undefined,
+	retryMs: number | undefined,
+	api: ChattoApi | undefined,
+	taskSink: SourceTaskActivationSink,
 ): ChannelSource {
+	socketFactory ??= defaultSocketFactory;
+	retryMs ??= RECONNECT_DELAY_MS;
+	api ??= createConnectChattoApi(cfg);
 	let resumeCursor: string | undefined;
 	const emittedNotificationIds = new Set<string>();
 	return {
-		async start(onEvent) {
+		async start() {
 			return supervise(
 				async (signal) => {
 					const viewerId = await api.viewerId();
 					const principal = sourceIdentifier("chatto", viewerId);
-					const checkpoint = taskSink?.checkpoint
+					const checkpoint = taskSink.checkpoint
 						? await taskSink.checkpoint<{ cursor: string }>(principal, "chatto")
 						: undefined;
 					resumeCursor = checkpoint?.cursor ?? resumeCursor;
@@ -250,13 +246,10 @@ export function createChattoSource(
 						resumeCursor,
 						async (cursor) => {
 							resumeCursor = cursor;
-							await taskSink?.advanceCheckpoint?.(principal, "chatto", { cursor });
+							await taskSink.advanceCheckpoint?.(principal, "chatto", { cursor });
 						},
 						emittedNotificationIds,
-						async (event) => {
-							if (!taskSink) return onEvent(event);
-							return acceptChattoEvent(taskSink, principal, api, event);
-						},
+						(event) => acceptChattoEvent(taskSink, principal, api, event),
 					);
 				},
 				log,
@@ -321,21 +314,20 @@ async function acceptChattoEvent(
 		}
 		return decoded.notificationId;
 	};
-	if (taskSink.deliver) {
-		await taskSink.deliver(
-			{
-				taskId: acceptance.taskId,
-				source: "chatto",
-				operationId: `dismiss:${decoded.notificationId}`,
-				payloadDigest: contentDigest({
-					notificationId: decoded.notificationId,
-					dismissed: true,
-				}),
-				recovery: "idempotent",
-			},
-			dismiss,
-		);
-	} else await dismiss();
+	if (!taskSink.deliver) throw new Error("Chatto task delivery is not configured");
+	await taskSink.deliver(
+		{
+			taskId: acceptance.taskId,
+			source: "chatto",
+			operationId: `dismiss:${decoded.notificationId}`,
+			payloadDigest: contentDigest({
+				notificationId: decoded.notificationId,
+				dismissed: true,
+			}),
+			recovery: "idempotent",
+		},
+		dismiss,
+	);
 	return true;
 }
 

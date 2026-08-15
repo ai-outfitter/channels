@@ -36,6 +36,8 @@ export interface ActivationAcceptance {
 export interface TaskActivationSink {
 	accept(input: NativeActivation): Promise<ActivationAcceptance>;
 	continue(input: NativeContinuation): Promise<ActivationAcceptance>;
+	/** Journal and queue a Task already created by a trusted protocol binding. */
+	claim(input: NativeActivation, taskId: string): Promise<ActivationAcceptance>;
 }
 
 /** The deliberately narrower sink injected into untrusted provider sources. */

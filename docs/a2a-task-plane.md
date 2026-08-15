@@ -159,8 +159,9 @@ agent, a tool set, or a workflow topology.
   settles the task before returning (a fast inline executor) emits its
   updates before the `message:stream` forwarder attaches, so the client
   receives only the final `{task}` frame — the durable state carries
-  everything regardless. The resident-agent bridge returns at `working`, so
-  its status and artifact updates stream live.
+  everything regardless. The resident-agent bridge returns the submitted Task
+  after its activation claim is durable; later status and artifact updates
+  stream live.
 
 ## Resident-agent bridge
 
@@ -171,9 +172,11 @@ shared store, so `A2A_STORE_PATH` is no longer required. Configuration is
 `A2A_HOST`/`A2A_PORT` (default loopback:8788), and `A2A_PUBLIC_URL` /
 `A2A_AGENT_NAME` / `A2A_AGENT_DESCRIPTION` / `A2A_AGENT_VERSION` for the Card.
 
-An inbound message becomes a durable task plus a **body-free wake** — the
-same untrusted-content rule as every channel source. The agent then drives
-the task with three tools:
+An inbound message creates the protocol Task, then enters the trusted task-plane
+sink. Acceptance writes the journal claim, dedupe projection, evidence, and
+queued **body-free wake** before returning the Task. The wake queue changes the
+Task to `WORKING` and grants it as the turn's sole authority. The A2A listener
+never wakes Pi directly. The agent then drives the task with three tools:
 
 - `a2a_read_task` — read the task's history inside untrusted-content markers.
 - `a2a_complete_task` — record the response as an artifact and complete, or
@@ -183,7 +186,7 @@ the task with three tools:
   explicit `taskId` follow-up; the runtime commits add verified reply
   anchors, and make this tool fail for a Task whose source declares no
   continuation method in the conformance matrix — the executor completes or
-rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
+  rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
   a new wake for that Task. This tool is the protocol-native structured-question
 surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
 
@@ -198,10 +201,9 @@ New and continued work after the upgrade uses
 `${XDG_DATA_HOME:-$HOME/.local/share}/outfitter/channels/task-plane/tasks.json`
 unless `CHANNELS_TASK_STORE_PATH` selects another task-plane root.
 
-For a wake accepted through the durable task-plane queue, all three tools require
-the exact Task to be the active turn authority. A task ID from another queued or
-completed Task is rejected. Legacy A2A listener wakes do not pass through that
-queue and retain the resident-owner access convention. For a native Task whose
+All three tools require the exact Task to be the active turn authority. A task
+ID from another queued or completed Task, or a Task with no activation claim,
+is rejected. There is no claim-free resident-owner path. For a native Task whose
 source declares no continuation method, `a2a_require_input` fails and the
 executor must complete or reject the Task.
 

@@ -141,7 +141,7 @@ export function nextIntervalMs(floorMs: number, res: Response): number {
 
 export function createGithubSource(
 	cfg: GithubConfig,
-	taskSink?: SourceTaskActivationSink,
+	taskSink: SourceTaskActivationSink,
 ): ChannelSource {
 	const headers = {
 		Authorization: `Bearer ${cfg.token}`,
@@ -150,7 +150,7 @@ export function createGithubSource(
 	};
 
 	return {
-		async start(onEvent) {
+		async start() {
 			if (process.env.GITHUB_NOTIFY_MARK_READ !== undefined) {
 				log(
 					"GITHUB_NOTIFY_MARK_READ is retired and ignored; see docs/a2a-source-conformance.md#migration-note-github-acknowledgment",
@@ -171,7 +171,7 @@ export function createGithubSource(
 
 					const identity = await authenticatedIdentity(request);
 					const principal = sourceIdentifier("github", `${cfg.api}\0${identity.id}`);
-					const checkpoint = taskSink?.checkpoint
+					const checkpoint = taskSink.checkpoint
 						? await taskSink.checkpoint<GithubCheckpoint>(principal, "github")
 						: undefined;
 					const state: PollState = {
@@ -189,7 +189,7 @@ export function createGithubSource(
 					};
 					const tick = async (): Promise<void> => {
 						try {
-							await pollOnce({ cfg, signal, onEvent, request, taskSink, principal }, state);
+							await pollOnce({ cfg, signal, request, taskSink, principal }, state);
 						} catch (err) {
 							if (signal.aborted) return;
 							log(`poll error: ${errorMessage(err)}`);
@@ -245,9 +245,8 @@ interface GithubCheckpoint {
 interface PollDeps {
 	cfg: GithubConfig;
 	signal: AbortSignal;
-	onEvent: (event: { channel: string; summary: string }) => void;
 	request: Request_;
-	taskSink: SourceTaskActivationSink | undefined;
+	taskSink: SourceTaskActivationSink;
 	principal: string;
 }
 
@@ -282,7 +281,7 @@ async function pollOnce(deps: PollDeps, state: PollState): Promise<void> {
 	if (!emitted.complete) return;
 	const nextSeen = emitted.seen;
 	const nextSince = sinceFrom(res);
-	await deps.taskSink?.advanceCheckpoint?.(deps.principal, "github", {
+	await deps.taskSink.advanceCheckpoint?.(deps.principal, "github", {
 		pollWindow: state.since,
 		since: nextSince,
 		...(nextLastModified ? { lastModified: nextLastModified } : {}),
@@ -317,13 +316,12 @@ function announceIdentity(cfg: GithubConfig, who: string): void {
  * seen in this batch (the next poll's dedup set). `summary` stays trusted — it
  * is a `Reason` this source chose, never the attacker-controlled issue/PR title.
  */
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: selection, durable acceptance, acknowledgment, and legacy fallback stay in provider order
 async function emitNew(
 	list: Notification[],
 	seen: Set<string>,
 	deps: PollDeps,
 ): Promise<{ seen: Set<string>; complete: boolean }> {
-	const { cfg, signal, onEvent, request, taskSink, principal } = deps;
+	const { cfg, signal, request, taskSink, principal } = deps;
 	const batch = new Set<string>();
 	let complete = true;
 	for (const n of list) {
@@ -339,11 +337,6 @@ async function emitNew(
 			continue;
 		}
 		try {
-			if (!taskSink) {
-				onEvent({ channel: "github", summary: reason });
-				batch.add(key);
-				continue;
-			}
 			const locator = notificationLocator(n, cfg.api, reason);
 			const acceptance = await taskSink.accept({
 				principal,
@@ -372,22 +365,7 @@ async function emitNew(
 				],
 				contentDigest: contentDigest({ id: n.id, revision: n.updated_at, locator }),
 			});
-			if (!taskSink.deliver) await markRead(n, request);
-			else {
-				await taskSink.deliver(
-					{
-						taskId: acceptance.taskId,
-						source: "github",
-						operationId: `mark-read:${n.id}@${n.updated_at}`,
-						payloadDigest: contentDigest({ notificationId: n.id, read: true }),
-						recovery: "idempotent",
-					},
-					async () => {
-						await markRead(n, request);
-						return n.id;
-					},
-				);
-			}
+			await deliverMarkRead(taskSink, acceptance.taskId, n, request);
 			batch.add(key);
 		} catch (error) {
 			if (error instanceof PermanentNotificationError) {
@@ -400,6 +378,28 @@ async function emitNew(
 		}
 	}
 	return { seen: batch, complete };
+}
+
+async function deliverMarkRead(
+	taskSink: SourceTaskActivationSink,
+	taskId: string,
+	notification: Notification,
+	request: Request_,
+): Promise<void> {
+	if (!taskSink.deliver) throw new Error("GitHub task delivery is not configured");
+	await taskSink.deliver(
+		{
+			taskId,
+			source: "github",
+			operationId: `mark-read:${notification.id}@${notification.updated_at}`,
+			payloadDigest: contentDigest({ notificationId: notification.id, read: true }),
+			recovery: "idempotent",
+		},
+		async () => {
+			await markRead(notification, request);
+			return notification.id;
+		},
+	);
 }
 
 /** Exact acknowledgment after durable acceptance; failure preserves the checkpoint. */

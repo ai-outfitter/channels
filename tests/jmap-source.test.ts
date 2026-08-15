@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import channelEventsExtension, { MAX_SIGNAL_ENTRIES_PER_WAKE } from "../extensions/index.ts";
 import { createJmapSource } from "../extensions/sources/jmap.ts";
-import type { ChannelEvent, ChannelSource } from "../extensions/sources/types.ts";
+import type { ChannelEvent } from "../extensions/sources/types.ts";
 import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
 const ACCOUNT_ID = "account-1";
@@ -79,7 +78,9 @@ async function streamEvents(chunks: string[]): Promise<ChannelEvent[]> {
 		return sseResponse(chunks);
 	}) as typeof fetch;
 	try {
-		const stop = await createJmapSource(CONFIG).start((event) => events.push(event));
+		const stop = await createJmapSource(CONFIG, undefined, collectingCalendarSink(events)).start(
+			() => {},
+		);
 		await settle();
 		await stop();
 	} finally {
@@ -585,11 +586,11 @@ test("a uid outside the conservative charset falls back to the generic summary",
 	assert.equal(new Set(events.map((event) => event.dedupeKey)).size, 1, "one queue entry");
 });
 
-test("an Email StateChange wakes regardless of the SSE event name", async () => {
-	assert.deepEqual(await summariesOf([`event: state\ndata: ${STATE_CHANGE}\n\n`]), ["new mail"]);
-	assert.deepEqual(await summariesOf([`data: ${STATE_CHANGE}\n\n`]), ["new mail"]);
+test("an Email StateChange never uses the removed generic wake", async () => {
+	assert.deepEqual(await summariesOf([`event: state\ndata: ${STATE_CHANGE}\n\n`]), []);
+	assert.deepEqual(await summariesOf([`data: ${STATE_CHANGE}\n\n`]), []);
 	// The payload's @type/changed shape is the discriminator, not the frame name.
-	assert.deepEqual(await summariesOf([`event: ping\ndata: ${STATE_CHANGE}\n\n`]), ["new mail"]);
+	assert.deepEqual(await summariesOf([`event: ping\ndata: ${STATE_CHANGE}\n\n`]), []);
 });
 
 test("a calendar alert wakes regardless of the SSE event name", async () => {
@@ -622,9 +623,7 @@ test("a calendar alert wakes regardless of the SSE event name", async () => {
 test("a mail StateChange is never routed to the alert path", async () => {
 	// `@type` is authoritative in both directions: even under the alert frame
 	// name, a StateChange stays mail.
-	assert.deepEqual(await summariesOf([`event: calendarAlert\ndata: ${STATE_CHANGE}\n\n`]), [
-		"new mail",
-	]);
+	assert.deepEqual(await summariesOf([`event: calendarAlert\ndata: ${STATE_CHANGE}\n\n`]), []);
 	// A StateChange carrying `changed` but no `@type` is not structurally an alert.
 	const untyped = JSON.stringify({
 		accountId: ACCOUNT_ID,
@@ -715,7 +714,7 @@ test("a calendars account found only by accountCapabilities wakes", async () => 
 	}) as typeof fetch;
 
 	const events: ChannelEvent[] = [];
-	const stop = await createJmapSource(CONFIG, 20).start((event) => events.push(event));
+	const stop = await createJmapSource(CONFIG, 20, collectingCalendarSink(events)).start(() => {});
 	try {
 		await waitFor(() => events.length >= 1);
 	} finally {
@@ -751,7 +750,7 @@ test("a calendarAlert split across read boundaries parses after completion", asy
 	]);
 });
 
-test("streams calendar-alert and mail events through the public fetch path", async () => {
+test("streams calendar alerts through task intake and never emits a generic mail wake", async () => {
 	// CRLF line endings, per the wire: the reader must normalize them.
 	const events = await streamEvents([
 		`event: calendarAlert\r\ndata: ${JSON.stringify({ accountId: ACCOUNT_ID, uid: "task-123" })}\r\n\r\n`,
@@ -765,149 +764,10 @@ test("streams calendar-alert and mail events through the public fetch path", asy
 		{ channel: "jmap", summary: "calendar alert: task-123", dedupeKey: "calendar-alert:task-123" },
 		{ channel: "jmap", summary: "calendar alert: task-456", dedupeKey: "calendar-alert:task-456" },
 		{ channel: "jmap", summary: "calendar alert: task-789", dedupeKey: "calendar-alert:task-789" },
-		{ channel: "jmap", summary: "new mail" },
 	]);
 });
 
 /** Start the extension over stub sources and hand back its wake plumbing. */
-function startExtension(channels: string[]): {
-	emit: (event: ChannelEvent) => boolean;
-	prompts: string[];
-	fire: (event: string) => Promise<void>;
-} {
-	const handlers = new Map<string, () => Promise<void> | void>();
-	const prompts: string[] = [];
-	const emitters = new Map<string, (event: ChannelEvent) => boolean>();
-	const sources = Object.fromEntries(
-		channels.map((channel) => [
-			channel,
-			{
-				configured: () => true,
-				load: async (): Promise<ChannelSource> => ({
-					async start(onEvent) {
-						emitters.set(channel, onEvent as (event: ChannelEvent) => boolean);
-						return async () => {};
-					},
-				}),
-			},
-		]),
-	);
-	channelEventsExtension(
-		{
-			on(event: string, handler: () => Promise<void> | void) {
-				handlers.set(event, handler);
-			},
-			registerTool() {},
-			sendUserMessage(prompt: string) {
-				prompts.push(prompt);
-			},
-		} as never,
-		sources,
-	);
-	return {
-		emit: (event) => {
-			const send = emitters.get(event.channel);
-			assert.ok(send, `channel "${event.channel}" is not started`);
-			return send(event);
-		},
-		prompts,
-		fire: async (event) => {
-			await handlers.get(event)?.();
-		},
-	};
-}
-
-/** Run `body` with OUTFITTER_CHANNELS pinned to `selection`. */
-async function withChannels(selection: string, body: () => Promise<void>): Promise<void> {
-	const prior = process.env.OUTFITTER_CHANNELS;
-	try {
-		process.env.OUTFITTER_CHANNELS = selection;
-		await body();
-	} finally {
-		if (prior === undefined) delete process.env.OUTFITTER_CHANNELS;
-		else process.env.OUTFITTER_CHANNELS = prior;
-	}
-}
-
-test("distinct alerts stay distinct and redelivery coalesces in the real queue", async () => {
-	await withChannels("jmap", async () => {
-		const { emit, prompts, fire } = startExtension(["jmap"]);
-		await fire("session_start");
-
-		// The first event wakes immediately; the alert burst lands while that
-		// wake is still in flight and must queue behind it.
-		emit({ channel: "jmap", summary: "new mail" });
-		assert.equal(prompts.length, 1);
-
-		const alert = (uid: string): ChannelEvent => ({
-			channel: "jmap",
-			summary: `calendar alert: ${uid}`,
-			dedupeKey: `calendar-alert:${uid}`,
-		});
-		emit(alert("task-123"));
-		emit(alert("task-456"));
-		// Redelivery of a pending alert coalesces onto its entry.
-		emit(alert("task-123"));
-		emit({ channel: "jmap", summary: "new mail" });
-		assert.equal(prompts.length, 1);
-
-		await fire("agent_end");
-		assert.equal(prompts.length, 2);
-		const prompt = prompts[1] ?? "";
-		assert.equal(prompt.match(/calendar alert: task-123/g)?.length, 1);
-		assert.equal(prompt.match(/calendar alert: task-456/g)?.length, 1);
-		// The bare-channel-key mail event rides the wake. Its coalesced summary is
-		// not positively claimed, but a neutral marker keeps it from being
-		// silently dropped while the agent services the named alerts.
-		assert.equal(prompt.match(/new mail/g), null);
-		assert.ok(prompt.includes("other activity"));
-		await fire("session_shutdown");
-	});
-});
-
-test("an alarm storm is bounded per channel and cannot evict another channel", async () => {
-	await withChannels("jmap,github", async () => {
-		const { emit, prompts, fire } = startExtension(["jmap", "github"]);
-		await fire("session_start");
-
-		// The first event wakes immediately; the storm of distinct dedupe keys
-		// lands while that wake is still in flight.
-		emit({ channel: "jmap", summary: "new mail" });
-		assert.equal(prompts.length, 1);
-		for (let i = 0; i < MAX_SIGNAL_ENTRIES_PER_WAKE + 5; i += 1) {
-			emit({
-				channel: "jmap",
-				summary: `calendar alert: storm-${i}`,
-				dedupeKey: `calendar-alert:storm-${i}`,
-			});
-		}
-		// Another channel's event is still enqueueable behind the storm.
-		assert.equal(emit({ channel: "github", summary: "review_requested" }), true);
-
-		// The first drain carries exactly the cap of keyed jmap entries — and
-		// github's event alongside them. The per-wake bound is counted per channel,
-		// so jmap's storm spends jmap's allowance, not github's: a quiet channel is
-		// never deferred a whole wake by a noisy one.
-		await fire("agent_end");
-		assert.equal(prompts.length, 2);
-		const first = prompts[1] ?? "";
-		assert.equal(first.match(/calendar alert: storm-/g)?.length, MAX_SIGNAL_ENTRIES_PER_WAKE);
-		assert.match(first, /sent no item locator: jmap \(.*\), github\./);
-
-		// The overflow past the cap collapsed onto one bare `jmap` entry rather
-		// than minting 5 more keys, and rides the next wake alone.
-		await fire("agent_end");
-		assert.equal(prompts.length, 3);
-		const remainder = prompts[2] ?? "";
-		assert.equal(remainder.match(/calendar alert: storm-/g), null);
-		assert.match(remainder, /sent no item locator: jmap\./);
-
-		await fire("agent_end");
-		assert.equal(prompts.length, 3, "an empty queue wakes nothing");
-		await fire("session_shutdown");
-	});
-});
-
 /**
  * Classify a subscription URL, asserting its shape rather than inferring it:
  * "email" must be an exact `types=Email`, and no `{…}` template placeholder
@@ -928,7 +788,7 @@ const kindOf = (url: string): "session" | "wide" | "email" => {
 // transient failure would silence calendar alarms — which push at most once —
 // for as long as the healthy mail stream lasts.
 for (const status of [400, 404, 422, 501]) {
-	test(`a ${status} on the wider subscription downgrades and mail wakes survive`, async () => {
+	test(`a ${status} on the wider subscription downgrades and email reconcile survives`, async () => {
 		const originalFetch = globalThis.fetch;
 		const originalError = console.error;
 		const logged: string[] = [];
@@ -943,15 +803,12 @@ for (const status of [400, 404, 422, 501]) {
 			return sseResponse([`event: state\r\ndata: ${STATE_CHANGE}\r\n\r\n`]);
 		}) as typeof fetch;
 
-		const summaries: string[] = [];
-		const stop = await createJmapSource(CONFIG, 20).start((event) => {
-			summaries.push(event.summary);
-		});
+		const stop = await createJmapSource(CONFIG, 20, unusedTaskSink()).start(() => {});
 		try {
 			// Within the same attempt: the wider subscription is refused, the
 			// Email-only stream opens without waiting for a reconnect, and a mail
-			// StateChange delivered on it still wakes after the downgrade.
-			await waitFor(() => summaries.includes("new mail"));
+			// StateChange delivered on it still reaches task-plane reconciliation.
+			await waitFor(() => calls.length >= 3);
 			assert.deepEqual(calls.slice(0, 3).map(kindOf), ["session", "wide", "email"]);
 			// The docs promise the downgrade is logged, and the verification
 			// checklist tells the reader to look for it.
@@ -994,7 +851,7 @@ for (const status of [401, 403, 429, 503]) {
 			return new Response("refused", { status });
 		}) as typeof fetch;
 
-		const stop = await createJmapSource(CONFIG, 20).start(() => {});
+		const stop = await createJmapSource(CONFIG, 20, unusedTaskSink()).start(() => {});
 		try {
 			await waitFor(() => calls.length >= 4);
 			// No Email-only attempt at all — every retry asks for the full
@@ -1025,7 +882,7 @@ test("a failure on both subscriptions throws so the supervisor reconnects", asyn
 		return new Response("refused", { status: 400 });
 	}) as typeof fetch;
 
-	const stop = await createJmapSource(CONFIG, 20).start(() => {});
+	const stop = await createJmapSource(CONFIG, 20, unusedTaskSink()).start(() => {});
 	try {
 		// Nothing is left to narrow to: the attempt throws and the supervisor
 		// reconnects the wider subscription from scratch.
@@ -1073,7 +930,7 @@ test("the captured live-Stalwart alert frame wakes with its uid", async () => {
 	}) as typeof fetch;
 
 	const events: ChannelEvent[] = [];
-	const stop = await createJmapSource(CONFIG, 20).start((event) => events.push(event));
+	const stop = await createJmapSource(CONFIG, 20, collectingCalendarSink(events)).start(() => {});
 	try {
 		await waitFor(() => events.length >= 1);
 	} finally {
@@ -1086,3 +943,31 @@ test("the captured live-Stalwart alert frame wakes with its uid", async () => {
 		dedupeKey: "calendar-alert:vega-cron-probe-001",
 	});
 });
+
+function unusedTaskSink(): SourceTaskActivationSink {
+	return {
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+}
+
+function collectingCalendarSink(events: ChannelEvent[]): SourceTaskActivationSink {
+	return {
+		async accept(input) {
+			const data = input.parts[0]?.data as { summary?: string; dedupeKey?: string } | undefined;
+			events.push({
+				channel: "jmap",
+				summary: data?.summary ?? "calendar alert",
+				...(data?.dedupeKey ? { dedupeKey: data.dedupeKey } : {}),
+			});
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+}
