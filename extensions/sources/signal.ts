@@ -91,7 +91,8 @@ function runCli(
 		let intake = Promise.resolve();
 		rl.on("line", (line) => {
 			if (signal.aborted) return;
-			intake = intake
+			rl.pause();
+			const next = intake
 				.then(async () => {
 					const activation = signalActivation(line, principal);
 					if (!activation) return;
@@ -122,6 +123,11 @@ function runCli(
 					log(`intake failed: ${errorMessage(error)}`);
 					child.kill();
 				});
+			let settled: Promise<void>;
+			settled = next.finally(() => {
+				if (intake === settled && !signal.aborted) rl.resume();
+			});
+			intake = settled;
 		});
 		stderr.on("data", (b: Buffer) => {
 			const s = b.toString().trim();

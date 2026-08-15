@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { A2aTaskStore } from "../a2a/store.ts";
-import { isTerminal } from "../a2a/types.ts";
+import { INTERRUPTED_TASK_STATES, isTerminal } from "../a2a/types.ts";
 import { errorMessage } from "../sources/util.ts";
 import type { ActivationClaim, ActivationJournal } from "./journal.ts";
 
@@ -23,6 +23,8 @@ export class DurableWakeQueue {
 	#offered: PendingWake | undefined;
 	#activeTaskId: string | undefined;
 	#pumping = false;
+	#pumpFailures = 0;
+	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	#stopped = false;
 
 	constructor(
@@ -43,6 +45,11 @@ export class DurableWakeQueue {
 				this.#journal.isAccepted(claim.activationId) &&
 				!this.#journal.isWakeFailed(claim.activationId)
 			) {
+				const stored = await this.#tasks.lookup(claim.taskId);
+				if (!stored || isTerminal(stored.task.status.state)) {
+					await this.#consumeSettled(claim);
+					continue;
+				}
 				this.#enqueue(claim, true);
 			}
 		}
@@ -103,9 +110,15 @@ export class DurableWakeQueue {
 				return;
 			}
 			try {
-				await this.#tasks.updateStatus(stored.principal, stored.task.id, {
-					state: "TASK_STATE_WORKING",
-				});
+				const preservingInterruptedState =
+					INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
+					this.#journal.isWoken(wake.claim.activationId) &&
+					!this.#hasLaterAcceptedClaim(wake.claim);
+				if (!preservingInterruptedState) {
+					await this.#tasks.updateStatus(stored.principal, stored.task.id, {
+						state: "TASK_STATE_WORKING",
+					});
+				}
 			} catch {
 				// Cancellation can win between lookup and transition. Re-read before
 				// granting authority; terminal work is consumed without a turn.
@@ -123,6 +136,24 @@ export class DurableWakeQueue {
 			void this.#pump();
 			throw error;
 		}
+	}
+
+	#hasLaterAcceptedClaim(claim: ActivationClaim): boolean {
+		let found = false;
+		for (const candidate of this.#journal.claims()) {
+			if (candidate.activationId === claim.activationId) {
+				found = true;
+				continue;
+			}
+			if (
+				found &&
+				candidate.taskId === claim.taskId &&
+				this.#journal.isAccepted(candidate.activationId)
+			) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	agentEnd(): void {
@@ -153,11 +184,14 @@ export class DurableWakeQueue {
 
 	stop(): void {
 		this.#stopped = true;
+		if (this.#retryTimer) clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
 		this.#pending = [];
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
 	}
 
+	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: wake delivery and durable retry transitions remain one state machine
 	async #pump(): Promise<void> {
 		if (this.#pumping || this.#stopped || this.#offered || this.#activeTaskId) return;
 		this.#pumping = true;
@@ -175,6 +209,7 @@ export class DurableWakeQueue {
 			this.#offered = wake;
 			try {
 				await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
+				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
 			} catch (error) {
 				this.#offered = undefined;
@@ -209,14 +244,23 @@ export class DurableWakeQueue {
 		} catch (error) {
 			failed = true;
 			if (wake) this.#restore(wake);
+			this.#pumpFailures += 1;
 			this.#log({
 				event: "a2a_wake_pump_failed",
 				taskId: wake?.claim.taskId,
 				error: errorMessage(error),
 			});
+			const retryDelayMs = Math.min(WAKE_RETRY_BASE_MS * 2 ** (this.#pumpFailures - 1), 1_000);
+			if (!this.#stopped && !this.#retryTimer) {
+				this.#retryTimer = setTimeout(() => {
+					this.#retryTimer = undefined;
+					void this.#pump();
+				}, retryDelayMs);
+			}
 		} finally {
 			this.#pumping = false;
 			if (!failed && !this.#offered && !this.#activeTaskId && this.#pending.length > 0) {
+				this.#pumpFailures = 0;
 				void this.#pump();
 			}
 		}

@@ -64,6 +64,8 @@ export interface SourceEvidenceInput {
 	readonly source: string;
 	readonly kind: string;
 	readonly detail?: Readonly<Record<string, string>>;
+	/** Update one bounded durable counter instead of appending per-envelope evidence. */
+	readonly aggregation?: "counter";
 }
 
 export interface OutboundDelivery {

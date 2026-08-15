@@ -42,27 +42,29 @@ export function createA2aRuntimeListener(
 	return {
 		async start(taskPlane, sink) {
 			const executor: A2aExecutor = async (context) => {
-				const controller = await context.begin();
-				const message = {
-					...context.message,
-					taskId: controller.task.id,
-					contextId: controller.task.contextId,
-				};
-				await sink.claim(
-					{
-						principal: context.principal,
-						source: "a2a",
-						providerEventId: context.message.messageId,
-						nativeLocator: { messageId: context.message.messageId },
-						receivedAt: new Date().toISOString(),
-						providerDedupeKey: context.message.messageId,
-						conversationKey: controller.task.contextId,
+				const activation = {
+					principal: context.principal,
+					source: "a2a",
+					providerEventId: context.message.messageId,
+					nativeLocator: { messageId: context.message.messageId },
+					receivedAt: new Date().toISOString(),
+					providerDedupeKey: context.message.messageId,
+					...(context.task ? { conversationKey: context.task.contextId } : {}),
+					parts: context.message.parts,
+					// A retry must not conflict merely because the HTTP binding minted
+					// different local identifiers before the activation claim landed.
+					contentDigest: contentDigest({
+						role: context.message.role,
 						parts: context.message.parts,
-						contentDigest: contentDigest(message),
-					},
-					controller.task.id,
-				);
-				return undefined;
+						referenceTaskIds: context.message.referenceTaskIds ?? [],
+					}),
+				};
+				const accepted = context.task
+					? await sink.continue({ ...activation, taskId: context.task.id })
+					: context.message.contextId
+						? await taskPlane.acceptInContext(activation, context.message.contextId)
+						: await sink.accept(activation);
+				return { kind: "task", taskId: accepted.taskId };
 			};
 			const server = await start(await loadConfig(), executor, taskPlane.taskStore);
 			onRunning(server);

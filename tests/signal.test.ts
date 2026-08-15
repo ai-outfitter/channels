@@ -67,6 +67,50 @@ test("Signal retains task-intake failures instead of throwing from readline", as
 	}
 });
 
+test("Signal pauses stdout while one durable acceptance is in flight", async () => {
+	const child = new FakeChild();
+	const spawn = (() =>
+		child as unknown as ChildProcess) as typeof import("node:child_process").spawn;
+	let accepted = 0;
+	let release = (): void => {};
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			accepted += 1;
+			if (accepted === 1) await blocked;
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+	const stop = await createSignalSource(
+		{ number: "+15555550100", configDir: "/tmp/signal-test" },
+		sink,
+		spawn,
+		0,
+	).start(() => {});
+	try {
+		child.stdout.write(`${line}\n`);
+		await waitFor(() => accepted === 1);
+		assert.equal(child.stdout.isPaused(), true);
+		const next = JSON.parse(line) as {
+			params: { envelope: { timestamp: number; dataMessage: { timestamp: number } } };
+		};
+		next.params.envelope.timestamp += 1;
+		next.params.envelope.dataMessage.timestamp += 1;
+		child.stdout.write(`${JSON.stringify(next)}\n`);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(accepted, 1);
+		release();
+		await waitFor(() => accepted === 2);
+	} finally {
+		await stop();
+	}
+});
+
 test("Signal records a permanent invalid activation and processes the line behind it", async () => {
 	const children: FakeChild[] = [];
 	const spawn = (() => {

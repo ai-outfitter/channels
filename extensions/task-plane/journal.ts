@@ -1,5 +1,7 @@
-import { mkdir, open, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readdir, readFile, rename, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { TASK_RETENTION_MS } from "../a2a/store.ts";
 import { serialize, sha256Hex } from "./serialize.ts";
 import type { NativeActivation } from "./types.ts";
 
@@ -58,8 +60,7 @@ interface JournalLine {
 export class ActivationJournal {
 	readonly #path: string;
 	readonly #quarantinePath: string;
-	// The log is append-only and never compacted, so every lookup is served
-	// from an index built alongside it rather than by scanning the records.
+	// Lookups are served from indexes rebuilt after load and compaction.
 	#claims: ActivationClaim[] = [];
 	#claimsByProviderKey = new Map<string, ActivationClaim>();
 	#claimsByActivationId = new Map<string, ActivationClaim>();
@@ -151,6 +152,78 @@ export class ActivationJournal {
 		await operation;
 	}
 
+	/**
+	 * Rewrite the journal to the retention contract. Incomplete claims and all
+	 * records for retained Tasks survive regardless of age. Accepted claims never
+	 * outlive their Task; quarantine evidence expires after the retention window.
+	 */
+	async compact(now: number, retainedTaskIds: ReadonlySet<string>): Promise<void> {
+		await this.initialize();
+		const operation = serialize(this.#operations, async () => {
+			const cutoff = now - TASK_RETENTION_MS;
+			const retainedActivations = new Set(
+				this.#claims
+					.filter((claim) => {
+						const accepted = this.#accepted.has(claim.activationId);
+						const quarantined = this.#quarantined.has(claim.activationId);
+						if (!accepted && !quarantined) return true;
+						if (retainedTaskIds.has(claim.taskId)) return true;
+						// An accepted claim may never dedupe to a Task that no longer
+						// exists. Quarantine evidence remains auditable for the window.
+						return quarantined && Date.parse(claim.claimedAt) >= cutoff;
+					})
+					.map((claim) => claim.activationId),
+			);
+			const records = await this.#readRecords();
+			const kept = records.filter((record) => retainedActivations.has(record.activationId));
+			const temporary = `${this.#path}.${process.pid}.${randomUUID()}.compact.tmp`;
+			const file = await open(temporary, "wx", 0o600);
+			try {
+				await file.writeFile(
+					kept.map((record) => JSON.stringify({ record, checksum: checksum(record) })).join("\n") +
+						(kept.length > 0 ? "\n" : ""),
+				);
+				await file.sync();
+			} finally {
+				await file.close();
+			}
+			try {
+				await rename(temporary, this.#path);
+				const directory = await open(dirname(this.#path), "r");
+				try {
+					await directory.sync();
+				} finally {
+					await directory.close();
+				}
+			} catch (error) {
+				await unlink(temporary).catch(() => {});
+				throw error;
+			}
+			this.#resetIndexes();
+			for (const record of kept) this.#index(record);
+		});
+		this.#operations = operation;
+		await operation;
+	}
+
+	async #readRecords(): Promise<ActivationJournalRecord[]> {
+		const text = await readFile(this.#path, "utf8");
+		return text
+			.split("\n")
+			.filter(Boolean)
+			.map((raw) => (JSON.parse(raw) as JournalLine).record);
+	}
+
+	#resetIndexes(): void {
+		this.#claims = [];
+		this.#claimsByProviderKey.clear();
+		this.#claimsByActivationId.clear();
+		this.#accepted.clear();
+		this.#woken.clear();
+		this.#wakeFailed.clear();
+		this.#quarantined.clear();
+	}
+
 	#index(record: ActivationJournalRecord): void {
 		if (record.kind === "CLAIM") {
 			this.#claims.push(record);
@@ -170,6 +243,12 @@ export class ActivationJournal {
 	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: checksum validation distinguishes a recoverable torn tail from corrupt committed records
 	async #load(): Promise<void> {
 		await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
+		const compactPrefix = `${basename(this.#path)}.`;
+		for (const entry of await readdir(dirname(this.#path))) {
+			if (entry.startsWith(compactPrefix) && entry.endsWith(".compact.tmp")) {
+				await unlink(join(dirname(this.#path), entry)).catch(() => {});
+			}
+		}
 		let bytes: Buffer;
 		try {
 			bytes = await readFile(this.#path);

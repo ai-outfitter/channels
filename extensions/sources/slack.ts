@@ -13,6 +13,7 @@ import {
 	type ConversationsRepliesResponse,
 	WebClient,
 } from "@slack/web-api";
+import { derivedId } from "../task-plane/serialize.ts";
 import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
 import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import { compareSlackTimestamps, parseSlackChannelIds } from "./slack-config.ts";
@@ -169,30 +170,44 @@ export function createSlackActions(
 
 		async respond(locator, response): Promise<ChannelRespondResult> {
 			const decoded = decodeSlackLocator(locator);
+			if (!taskSink.taskForLocator || !taskSink.deliver) {
+				throw new Error("Slack task delivery is not configured");
+			}
+			const activeTaskId = await taskSink.taskForLocator("slack", locator);
+			const deliveryInput = {
+				taskId: activeTaskId,
+				source: "slack",
+				operationId: `reply:${locator}`,
+				payloadDigest: contentDigest(response),
+				recovery: "lookup" as const,
+			};
+			const deliveryId = derivedId(
+				"delivery",
+				`${deliveryInput.taskId}\0${deliveryInput.source}\0${deliveryInput.operationId}\0${deliveryInput.payloadDigest}`,
+			);
 			const post = async (): Promise<string> => {
 				const posted = await web.chat.postMessage({
 					channel: decoded.channelId,
 					thread_ts: decoded.threadTs ?? decoded.messageTs,
 					text: response,
+					metadata: {
+						event_type: "ai_outfitter_delivery",
+						event_payload: { delivery_id: deliveryId },
+					},
 				});
 				assertSlackOk(posted, "chat.postMessage");
 				if (!posted.ts) throw new Error("chat.postMessage returned no response timestamp");
 				return posted.ts;
 			};
-			if (!taskSink.taskForLocator || !taskSink.deliver) {
-				throw new Error("Slack task delivery is not configured");
-			}
-			const activeTaskId = await taskSink.taskForLocator("slack", locator);
-			const responseId = await taskSink.deliver(
-				{
-					taskId: activeTaskId,
-					source: "slack",
-					operationId: `reply:${locator}`,
-					payloadDigest: contentDigest(response),
-					recovery: "ambiguous",
-				},
-				post,
-			);
+			const reconcile = async (): Promise<string | undefined> =>
+				findSlackDelivery(
+					web,
+					decoded.channelId,
+					decoded.threadTs ?? decoded.messageTs,
+					deliveryId,
+					await getBotUserId(),
+				);
+			const responseId = await taskSink.deliver(deliveryInput, post, reconcile);
 			if (!responseId) throw new Error("chat.postMessage returned no response timestamp");
 			const replied = {
 				channel: "slack",
@@ -325,6 +340,42 @@ async function readThreadContext(
 	throw new Error("Slack did not return the located thread message");
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: paginated exact-match lookup keeps every provider boundary explicit
+async function findSlackDelivery(
+	web: WebClient,
+	channelId: string,
+	threadTs: string,
+	deliveryId: string,
+	botUserId: string,
+): Promise<string | undefined> {
+	let cursor: string | undefined;
+	for (let page = 0; page < MAX_THREAD_PAGES; page += 1) {
+		const response = await web.conversations.replies({
+			channel: channelId,
+			ts: threadTs,
+			limit: 100,
+			include_all_metadata: true,
+			...(cursor ? { cursor } : {}),
+		});
+		assertSlackOk(response, "conversations.replies");
+		for (const message of response.messages ?? []) {
+			const metadata = isRecord(message.metadata) ? message.metadata : undefined;
+			const payload =
+				metadata && isRecord(metadata.event_payload) ? metadata.event_payload : undefined;
+			if (
+				message.user === botUserId &&
+				metadata?.event_type === "ai_outfitter_delivery" &&
+				payload?.delivery_id === deliveryId
+			) {
+				return message.ts;
+			}
+		}
+		cursor = response.response_metadata?.next_cursor?.trim() || undefined;
+		if (!cursor) return undefined;
+	}
+	throw new Error(`Slack delivery lookup exceeded ${MAX_THREAD_PAGES} pages`);
+}
+
 function addMessages(
 	target: Map<string, SlackMessage>,
 	messages: SlackMessage[] | undefined,
@@ -454,11 +505,13 @@ async function handleSlackEnvelope(
 		}
 	};
 	if (envelope.type !== "events_api" || !isRecord(envelope.body)) {
+		await recordNonWorkSlackEnvelope(taskSink, raw, "unsupported-envelope");
 		await acknowledge();
 		return;
 	}
 	const event = mentionEvent(envelope.body.event, channelIds);
 	if (!event) {
+		await recordNonWorkSlackEnvelope(taskSink, envelope.body, "non-work-event");
 		await acknowledge();
 		return;
 	}
@@ -503,6 +556,41 @@ async function handleSlackEnvelope(
 		contentDigest: contentDigest({ workspace, channel, messageTs, threadTs, text }),
 	});
 	await acknowledge();
+}
+
+async function recordNonWorkSlackEnvelope(
+	taskSink: SourceTaskActivationSink,
+	body: unknown,
+	reason: string,
+): Promise<void> {
+	const scope = slackEvidenceScope(body);
+	await taskSink.recordEvidence?.({
+		evidenceId: sourceIdentifier(
+			"evidence",
+			`${scope.workspace ?? "unknown"}\0${scope.channel ?? "unknown"}\0${reason}`,
+		),
+		source: "slack",
+		kind: "permanent-non-work",
+		detail: {
+			reason,
+			...(scope.workspace ? { workspace: scope.workspace } : {}),
+			...(scope.channel ? { channel: scope.channel } : {}),
+		},
+		aggregation: "counter",
+	});
+}
+
+function slackEvidenceScope(body: unknown): { workspace?: string; channel?: string } {
+	if (!isRecord(body)) return {};
+	const event = isRecord(body.event) ? body.event : undefined;
+	return {
+		...(typeof body.team_id === "string"
+			? { workspace: body.team_id }
+			: typeof event?.team === "string"
+				? { workspace: event.team }
+				: {}),
+		...(typeof event?.channel === "string" ? { channel: event.channel } : {}),
+	};
 }
 
 async function recordMalformedSlackEnvelope(
