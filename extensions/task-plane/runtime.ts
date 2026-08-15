@@ -76,7 +76,9 @@ export async function startChannelsRuntime(
 		deliveries.initialize(),
 		journal.initialize(),
 	]);
-	const wakeQueue = new DurableWakeQueue(pi, tasks, journal, log);
+	const wakeQueue = new DurableWakeQueue(pi, tasks, journal, log, (claim, error) =>
+		evidence.appendUnhealthy(claim.activationId, claim.taskId, claim.input.source, error),
+	);
 	const taskPlane = createTaskPlane({
 		tasks,
 		origins,

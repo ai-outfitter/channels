@@ -141,14 +141,23 @@ agent, a tool set, or a workflow topology.
 - **Recovery uses durable state.** Streams are ephemeral; the durable Task —
   status, history, artifacts — is the record. A reconnecting client reads
   the Task, then opens a new subscription; nothing replays.
-- **Wake recovery follows terminal Task state.** `WOKEN` records that Pi began
-  a turn, not that the turn completed. On startup, every accepted activation
+- **Wake authority begins at delivery.** The queue grants authority, transitions
+  the Task to `WORKING`, and records `WOKEN` immediately before delivering the
+  body-free follow-up. Authority lasts through the end of the turn that consumes
+  that wake, whether or not Pi fires `before_agent_start` for the follow-up.
+  `agent_end` clears it before the queue offers another Task.
+- **Wake recovery follows terminal Task state.** `WOKEN` records that Pi was
+  offered a turn, not that the turn completed. On startup, every accepted activation
   whose Task is still non-terminal is offered once to the new runtime, including
   activations already marked `WOKEN`. Terminal claims are filtered before queue
   admission and do not count toward the bound. Replaying a historical wake does
   not replace an unanswered `INPUT_REQUIRED` or `AUTH_REQUIRED` status message
   with bare `WORKING`; a newly accepted continuation still starts normally. A
-  wake transport failure retries three times with timer backoff, then records
+  successful delivery is re-offered at most five consecutive times while its
+  Task remains unsettled. Reaching that durable cap records `WAKE_FAILED` and
+  unhealthy evidence; startup does not resurrect the activation. A new provider
+  event or explicit continuation creates a new activation and may enqueue it.
+  A wake transport failure retries three times with timer backoff, then records
   `WAKE_FAILED` evidence and stops. Transient store or journal failures during
   pumping schedule a macrotask retry with capped exponential backoff.
 - **Wake admission is bounded.** At most 128 wakes wait behind the offered or

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -53,9 +53,9 @@ async function fire(handlers: Map<string, Handler[]>, event: string): Promise<Er
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
+	for (let attempt = 0; attempt < 200; attempt += 1) {
 		if (predicate()) return;
-		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error("condition was not met");
 }
@@ -352,9 +352,7 @@ test("real wake-queue source wiring denies continuation for a native Task", asyn
 				parts: [{ text: "untrusted" }],
 				contentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			});
-			for (let attempt = 0; prompts.length === 0 && attempt < 100; attempt += 1) {
-				await new Promise((resolve) => setImmediate(resolve));
-			}
+			await waitFor(() => prompts.length === 1);
 			const before = handlers.get("before_agent_start")?.[0];
 			assert.ok(before && prompts[0]);
 			await (before as unknown as (event: { prompt: string }) => Promise<void>)({
@@ -409,11 +407,10 @@ test("native-only deployment registers task tools and settles a Task end to end"
 			});
 			assert.ok(accepted && runtime);
 			await waitFor(() => prompts.length === 1);
-			const before = handlers.get("before_agent_start")?.[0];
-			assert.ok(before);
-			await (before as unknown as (event: { prompt: string }) => Promise<void>)({
-				prompt: prompts[0] as string,
+			const read = await tools.get("a2a_read_task")?.execute("call", {
+				taskId: accepted.taskId,
 			});
+			assert.ok(read, "read succeeds without a before_agent_start callback");
 			await tools.get("a2a_complete_task")?.execute("call", {
 				taskId: accepted.taskId,
 				response: "done",
@@ -423,6 +420,8 @@ test("native-only deployment registers task tools and settles a Task end to end"
 				(await runtime.taskPlane.taskStore.lookup(accepted.taskId))?.task.status.state,
 				"TASK_STATE_COMPLETED",
 			);
+			const journal = await readFile(join(root, "activation-journal.v1.jsonl"), "utf8");
+			assert.equal(journal.match(/"kind":"WOKEN"/g)?.length, 1);
 			await fire(handlers, "session_shutdown");
 		},
 	);
