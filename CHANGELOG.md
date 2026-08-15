@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- A2A remains enabled by `A2A_SERVER` when native channels are disabled, and no
+  longer requires `A2A_STORE_PATH`. Legacy standalone A2A task files are not
+  merged automatically; complete or export active tasks and retain the old file
+  as an audit archive before upgrading.
+- Explicit `OUTFITTER_CHANNELS` selection now starts transactionally: any selected
+  source failure rolls back all selected sources and reports unhealthy. Automatic
+  detection keeps the 1.7 log-and-skip behavior.
+
 ## [1.7.0](https://github.com/ai-outfitter/channels/compare/v1.6.1...v1.7.0) (2026-08-13)
 
 

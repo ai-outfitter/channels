@@ -165,7 +165,8 @@ agent, a tool set, or a workflow topology.
 ## Resident-agent bridge
 
 `extensions/a2a-extension.ts` hosts the server inside a resident Pi profile.
-Inert unless `A2A_SERVER=1`; configuration is `A2A_STORE_PATH` (required),
+Inert unless `A2A_SERVER=1`; the composed runtime always injects its already-open
+shared store, so `A2A_STORE_PATH` is no longer required. Configuration is
 `A2A_CREDENTIALS_PATH` (required, `{"credentials": [{"token", "principal"}]}`),
 `A2A_HOST`/`A2A_PORT` (default loopback:8788), and `A2A_PUBLIC_URL` /
 `A2A_AGENT_NAME` / `A2A_AGENT_DESCRIPTION` / `A2A_AGENT_VERSION` for the Card.
@@ -182,9 +183,33 @@ the task with three tools:
   explicit `taskId` follow-up; the runtime commits add verified reply
   anchors, and make this tool fail for a Task whose source declares no
   continuation method in the conformance matrix — the executor completes or
-  rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
+rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
   a new wake for that Task. This tool is the protocol-native structured-question
-  surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+
+### Upgrade from the 1.7 standalone A2A store
+
+This release does not automatically merge the legacy `A2A_STORE_PATH` document
+into the shared task-plane store. Automatic merging could combine principal,
+message-dedupe, and task identities without enough provenance to resolve a
+collision safely. Before upgrading an A2A-only deployment, complete or export
+any active tasks in the legacy store and retain that file as the audit archive.
+New and continued work after the upgrade uses
+`${XDG_DATA_HOME:-$HOME/.local/share}/outfitter/channels/task-plane/tasks.json`
+unless `CHANNELS_TASK_STORE_PATH` selects another task-plane root.
+
+For a wake accepted through the durable task-plane queue, all three tools require
+the exact Task to be the active turn authority. A task ID from another queued or
+completed Task is rejected. Legacy A2A listener wakes do not pass through that
+queue and retain the resident-owner access convention. For a native Task whose
+source declares no continuation method, `a2a_require_input` fails and the
+executor must complete or reject the Task.
+
+The default `${XDG_DATA_HOME:-$HOME/.local/share}/outfitter/channels/task-plane`
+store has no cross-process journal lock.
+Only one Channels process may open a given store root at a time. Concurrent Pi
+sessions must set distinct `CHANNELS_TASK_STORE_PATH` roots. A cross-process
+lock is required before this single-process constraint can be removed.
 
 ## Verification gates
 

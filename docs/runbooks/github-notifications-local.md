@@ -116,15 +116,14 @@ export OUTFITTER_CHANNELS="github"
 longer gap than your floor. A short floor therefore shortens this test only if
 GitHub permits it. The source logs the interval each time it changes.
 
-Leave `GITHUB_NOTIFY_MARK_READ` unset. It defaults to off. It must stay off
-when the agent reads its own notifications. If the source marks a thread read
-in the poll that emits the wake, it removes the item that the woken agent then
-looks for.
+`GITHUB_NOTIFY_MARK_READ` is retired and ignored with one startup warning.
+Channels now accepts the exact notification revision before it marks the
+notification read. See the [GitHub acknowledgment migration note](../a2a-source-conformance.md#migration-note-github-acknowledgment).
 
 At start, the source logs its identity and its configuration:
 
 ```text
-[channels:github] watching notifications as <login>; filters=[…] interval=15000ms api=https://api.github.com markRead=false
+[channels:github] watching notifications as <login>; filters=[…] interval=15000ms api=https://api.github.com acknowledgment=after-acceptance
 ```
 
 Confirm that the login is the machine account, and not your own account.
@@ -153,21 +152,11 @@ The wake carries one word: the reason. For this test the reason is
 this source splits that one reason by subject type, so that every forge reports
 the same event by the same name.
 
-The wake carries nothing else. It does not carry the issue title, because a
-stranger wrote that text. It also carries no item locator. Therefore
-`channel_read` and `channel_respond` do not apply to this channel.
-
-An agent that this channel wakes must find its own work:
-
-```sh
-gh search issues --assignee @me --state open
-```
-
-Query your assignments. Do not rely on the notification list. An assignment is
-durable state. A notification is a transient hint: something may have marked it
-read already, and the poller reports only threads updated after the poller
-started. A restart therefore drops everything that was pending. Run this same
-query at session start to recover that work.
+The Task carries the exact repository, subject kind, number, notification ID,
+reason, and revision, but not the attacker-controlled title. Process only that
+subject. Do not query all assignments or scan the notification inbox during the
+turn. Startup reconciliation resumes from the durable poll window after a
+restart; see the [migration note](../a2a-source-conformance.md#migration-note-github-acknowledgment).
 
 Now test the negative case. Activity that matches no filter must produce no
 wake. Comment on an unrelated issue that the account does not subscribe to.
@@ -184,7 +173,7 @@ Wait one interval. Confirm that no new `waking agent` line appears.
 | `filter "…" is not a GitHub notification reason` | A filter name is misspelled | Compare it against the filter table in the README |
 | `filter "assign" never matches` | `assign` is split by subject type | Use `assigned_issue` or `assigned_pr` |
 | Starts cleanly, but never wakes | The filters exclude the reason | Add the reason to `GITHUB_NOTIFY_FILTERS` |
-| Wakes once, then never again | The agent marked threads read, or the poller restarted | Query assignments, not notifications |
+| A revision is not re-woken after restart | Checkpoint or reconciliation failure | Inspect the task-plane source checkpoint and the [migration note](../a2a-source-conformance.md#migration-note-github-acknowledgment) |
 
 No row in this table produces an error or a stack trace. If the channel is
 quiet, examine your configuration first. Examine GitHub second.
@@ -205,11 +194,10 @@ the tools that run `gh` and edit files.
 **Keep the tokens split.** Deliver both tokens described above as secrets,
 never in an image or a manifest.
 
-**Expect a restart to lose pending work.** The poller reports only threads
-updated after it started. A deployment restarts the pod, so anything assigned
-during the restart never produces a wake. Two consequences: do not deploy while
-an agent is mid-task, and instruct the agent to query its open assignments at
-session start, which recovers the work that the wake did not report.
+**Expect startup reconciliation.** The poller persists its poll window, `since`,
+`lastModified`, and seen state after acceptance. On restart it reconciles unread
+notifications from that window before advancing the checkpoint. See the
+[migration note](../a2a-source-conformance.md#migration-note-github-acknowledgment).
 
 **Keep the account assignable.** Wakes for `assigned_issue` and `assigned_pr`
 arrive only if the forge can assign an issue to this account. A GitHub App

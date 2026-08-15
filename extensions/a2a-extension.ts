@@ -3,18 +3,72 @@ import { Type } from "typebox";
 import {
 	type A2aExecutor,
 	type A2aServerConfig,
+	type A2aTaskController,
 	configFromEnv,
 	type RunningA2aServer,
 	startA2aServer,
 } from "./a2a/server.ts";
-import type { A2aMessage, A2aPart } from "./a2a/types.ts";
+import type { A2aMessage, A2aPart, A2aTask } from "./a2a/types.ts";
+import type { TaskPlane } from "./task-plane/plane.ts";
+import type { RuntimeListener } from "./task-plane/runtime.ts";
 import { taskWakePrompt } from "./task-plane/wake-queue.ts";
 
 export interface A2aExtensionDependencies {
 	readonly enabled?: () => boolean;
 	readonly loadConfig?: () => Promise<A2aServerConfig>;
-	readonly start?: (config: A2aServerConfig, executor: A2aExecutor) => Promise<RunningA2aServer>;
+	readonly start?: (
+		config: A2aServerConfig,
+		executor: A2aExecutor,
+		sharedStore?: TaskPlane["taskStore"],
+	) => Promise<RunningA2aServer>;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
+}
+
+export interface A2aToolAccess {
+	readTask(taskId: string): Promise<A2aTask | undefined>;
+	controllerForTask(taskId: string): Promise<A2aTaskController | undefined>;
+}
+
+/** Compose the optional HTTP listener above the already-open task plane. */
+export function createA2aRuntimeListener(
+	pi: ExtensionAPI,
+	dependencies: A2aExtensionDependencies = {},
+	onRunning: (server: RunningA2aServer | undefined) => void = () => {},
+): RuntimeListener | undefined {
+	const enabled = dependencies.enabled ?? enabledFromEnv;
+	if (!enabled()) return undefined;
+	const loadConfig = dependencies.loadConfig ?? configFromEnv;
+	const start = dependencies.start ?? startA2aServer;
+	const log = dependencies.log ?? ((record) => console.error(JSON.stringify(record)));
+	return {
+		async start(taskPlane) {
+			const executor: A2aExecutor = async (context) => {
+				const controller = await context.begin();
+				await controller.status("TASK_STATE_WORKING");
+				const delivery: unknown = pi.sendUserMessage(taskWakePrompt(controller.task.id), {
+					deliverAs: "followUp",
+				});
+				if (delivery && typeof (delivery as PromiseLike<unknown>).then === "function") {
+					void (delivery as Promise<unknown>).catch((error) =>
+						log({
+							event: "a2a_wake_failed",
+							taskId: controller.task.id,
+							error: (error as Error).message,
+						}),
+					);
+				}
+				return undefined;
+			};
+			const server = await start(await loadConfig(), executor, taskPlane.taskStore);
+			onRunning(server);
+			log({ event: "a2a_server_started", url: server.url });
+			return async () => {
+				onRunning(undefined);
+				await server.close();
+				log({ event: "a2a_server_stopped" });
+			};
+		},
+	};
 }
 
 function enabledFromEnv(): boolean {
@@ -22,89 +76,21 @@ function enabledFromEnv(): boolean {
 	return value === "1" || value === "true";
 }
 
-/**
- * Hosts the A2A task plane inside a resident Pi profile.
- *
- * Inert unless A2A_SERVER is explicitly enabled. An inbound A2A message
- * becomes a durable task plus a body-free wake — the sender's content never
- * enters the prompt; the agent reads it through a2a_read_task, which marks
- * it as untrusted data. The agent settles the task with a2a_complete_task or
- * pauses it on the caller with a2a_require_input (A2A's protocol-native
- * structured-question surface). Task creation grants no authority: the woken
- * agent acts under its own profile's loadout, nothing more.
- */
-export default function a2aServerExtension(
-	pi: ExtensionAPI,
-	dependencies: A2aExtensionDependencies = {},
-): void {
-	const enabled = dependencies.enabled ?? enabledFromEnv;
-	if (!enabled()) return;
-
-	const loadConfig = dependencies.loadConfig ?? configFromEnv;
-	const start = dependencies.start ?? startA2aServer;
-	const log = dependencies.log ?? ((record) => console.error(JSON.stringify(record)));
-	let running: RunningA2aServer | undefined;
-	let starting: Promise<void> | undefined;
-	let stopped = false;
-
-	const executor: A2aExecutor = async (context) => {
-		const controller = await context.begin();
-		await controller.status("TASK_STATE_WORKING");
-		const taskId = controller.task.id;
-		// Body-free wake, same rule as every channel source: an inbound A2A
-		// message is untrusted content and never rides the prompt.
-		const delivery: unknown = pi.sendUserMessage(taskWakePrompt(taskId), {
-			deliverAs: "followUp",
-		});
-		if (delivery && typeof (delivery as PromiseLike<unknown>).then === "function") {
-			void (delivery as Promise<unknown>).catch((error) => {
-				log({ event: "a2a_wake_failed", taskId, error: (error as Error).message });
-			});
-		}
-		return undefined;
-	};
-
-	registerA2aTools(pi, () => running);
-
-	pi.on("session_start", async () => {
-		if (running) return;
-		if (starting) return starting;
-		stopped = false;
-		starting = (async () => {
-			const server = await start(await loadConfig(), executor);
-			if (stopped) {
-				await server.close();
-				return;
-			}
-			running = server;
-			log({ event: "a2a_server_started", url: server.url });
-		})();
-		try {
-			await starting;
-		} finally {
-			starting = undefined;
-		}
-	});
-
-	pi.on("session_shutdown", async () => {
-		stopped = true;
-		await starting?.catch(() => {});
-		const server = running;
-		running = undefined;
-		if (!server) return;
-		await server.close();
-		log({ event: "a2a_server_stopped" });
-	});
-}
-
 export function registerA2aTools(
 	pi: ExtensionAPI,
-	server: () => RunningA2aServer | undefined,
+	server: () => A2aToolAccess | undefined,
+	hasAuthority: (taskId: string) => Promise<boolean>,
+	canContinue: (taskId: string) => boolean = () => true,
 ): void {
-	const requireServer = (): RunningA2aServer => {
+	const requireServer = (): A2aToolAccess => {
 		const current = server();
 		if (!current) throw new Error("the a2a server is not running");
 		return current;
+	};
+	const authorize = async (taskId: string): Promise<void> => {
+		if (!(await hasAuthority(taskId))) {
+			throw new Error(`a2a task "${taskId}" is not authorized for the active turn`);
+		}
 	};
 
 	pi.registerTool({
@@ -120,6 +106,7 @@ export function registerA2aTools(
 			taskId: Type.String({ minLength: 1, description: "Task id from the wake." }),
 		}),
 		async execute(_toolCallId, params) {
+			await authorize(params.taskId);
 			const task = await requireServer().readTask(params.taskId);
 			if (!task) throw new Error(`a2a task "${params.taskId}" was not found`);
 			return {
@@ -144,6 +131,7 @@ export function registerA2aTools(
 			}),
 		}),
 		async execute(_toolCallId, params) {
+			await authorize(params.taskId);
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
@@ -174,6 +162,12 @@ export function registerA2aTools(
 			question: Type.String({ minLength: 1, maxLength: 40_000 }),
 		}),
 		async execute(_toolCallId, params) {
+			await authorize(params.taskId);
+			if (!canContinue(params.taskId)) {
+				throw new Error(
+					"this Task's source has no continuation method; complete or reject it instead",
+				);
+			}
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			await controller.status("TASK_STATE_INPUT_REQUIRED", statusMessage(params.question));

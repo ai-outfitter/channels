@@ -13,6 +13,8 @@ import {
 	type ConversationsRepliesResponse,
 	WebClient,
 } from "@slack/web-api";
+import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import { compareSlackTimestamps, parseSlackChannelIds } from "./slack-config.ts";
 import type {
 	ChannelActions,
@@ -133,6 +135,7 @@ interface DecodedSlackLocator {
 export function createSlackActions(
 	cfg: SlackActionsConfig,
 	web: WebClient = new WebClient(cfg.botToken),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelActions {
 	let botUserId: Promise<string> | undefined;
 	const getBotUserId = (): Promise<string> => {
@@ -165,27 +168,66 @@ export function createSlackActions(
 
 		async respond(locator, response): Promise<ChannelRespondResult> {
 			const decoded = decodeSlackLocator(locator);
-			const posted = await web.chat.postMessage({
-				channel: decoded.channelId,
-				thread_ts: decoded.threadTs ?? decoded.messageTs,
-				text: response,
-			});
-			assertSlackOk(posted, "chat.postMessage");
-			if (!posted.ts) throw new Error("chat.postMessage returned no response timestamp");
+			const post = async (): Promise<string> => {
+				const posted = await web.chat.postMessage({
+					channel: decoded.channelId,
+					thread_ts: decoded.threadTs ?? decoded.messageTs,
+					text: response,
+				});
+				assertSlackOk(posted, "chat.postMessage");
+				if (!posted.ts) throw new Error("chat.postMessage returned no response timestamp");
+				return posted.ts;
+			};
+			const taskForLocator = taskSink?.taskForLocator?.bind(taskSink);
+			const deliver = taskSink?.deliver?.bind(taskSink);
+			let activeTaskId: string | undefined;
+			const responseId =
+				taskForLocator && deliver
+					? await (async () => {
+							const taskId = await taskForLocator("slack", locator);
+							activeTaskId = taskId;
+							return deliver(
+								{
+									taskId,
+									source: "slack",
+									operationId: `reply:${locator}`,
+									payloadDigest: contentDigest(response),
+									recovery: "ambiguous",
+								},
+								post,
+							);
+						})()
+					: await post();
+			if (!responseId) throw new Error("chat.postMessage returned no response timestamp");
 			const replied = {
 				channel: "slack",
 				locator,
 				replied: true,
-				responseId: posted.ts,
+				responseId,
 			} as const;
 
 			try {
-				const handled = await web.reactions.add({
-					channel: decoded.channelId,
-					timestamp: decoded.messageTs,
-					name: cfg.doneEmoji,
-				});
-				assertSlackOk(handled, "reactions.add");
+				const addReaction = async (): Promise<string> => {
+					const handled = await web.reactions.add({
+						channel: decoded.channelId,
+						timestamp: decoded.messageTs,
+						name: cfg.doneEmoji,
+					});
+					assertSlackOk(handled, "reactions.add");
+					return decoded.messageTs;
+				};
+				if (activeTaskId && deliver) {
+					await deliver(
+						{
+							taskId: activeTaskId,
+							source: "slack",
+							operationId: `handled:${locator}`,
+							payloadDigest: contentDigest({ emoji: cfg.doneEmoji }),
+							recovery: "idempotent",
+						},
+						addReaction,
+					);
+				} else await addReaction();
 				return { ...replied, handled: true };
 			} catch (error) {
 				if (slackErrorCode(error) === "already_reacted") {
@@ -353,10 +395,15 @@ export function createSlackSource(
 	cfg: SlackConfig,
 	clients: SlackClientFactories = defaultClients,
 	retryMs: number = RECONNECT_DELAY_MS,
+	taskSink?: SourceTaskActivationSink,
 ): ChannelSource {
 	return {
 		async start(onEvent) {
-			return supervise((signal) => runSlackAttempt(cfg, clients, signal, onEvent), log, retryMs);
+			return supervise(
+				(signal) => runSlackAttempt(cfg, clients, signal, onEvent, taskSink),
+				log,
+				retryMs,
+			);
 		},
 	};
 }
@@ -366,6 +413,7 @@ async function runSlackAttempt(
 	clients: SlackClientFactories,
 	signal: AbortSignal,
 	onEvent: (event: ChannelEvent) => void,
+	taskSink?: SourceTaskActivationSink,
 ): Promise<void> {
 	const botUserId = await authenticateBot(clients.web(cfg.botToken));
 
@@ -374,7 +422,9 @@ async function runSlackAttempt(
 		log(`socket mode error: ${errorMessage(error)}`);
 	});
 	socket.on("slack_event", (payload) => {
-		void handleSlackEnvelope(payload, cfg.channelIds, onEvent);
+		void handleSlackEnvelope(payload, cfg.channelIds, onEvent, taskSink).catch((error) => {
+			log(`Slack activation failed: ${errorMessage(error)}`);
+		});
 	});
 	try {
 		await socket.start();
@@ -399,6 +449,7 @@ async function handleSlackEnvelope(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
 	onEvent: (event: ChannelEvent) => void,
+	taskSink?: SourceTaskActivationSink,
 ): Promise<void> {
 	if (!isRecord(raw)) return;
 	const envelope = raw as SlackEnvelope;
@@ -406,15 +457,93 @@ async function handleSlackEnvelope(
 		log("Slack envelope did not provide an acknowledgement callback");
 		return;
 	}
-	try {
-		await envelope.ack();
-	} catch (error) {
-		log(`failed to acknowledge Slack envelope: ${errorMessage(error)}`);
+	const acknowledge = async (): Promise<void> => {
+		try {
+			await envelope.ack?.();
+		} catch (error) {
+			log(`failed to acknowledge Slack envelope: ${errorMessage(error)}`);
+		}
+	};
+	if (envelope.type !== "events_api" || !isRecord(envelope.body)) {
+		await acknowledge();
 		return;
 	}
-	if (envelope.type !== "events_api" || !isRecord(envelope.body)) return;
 	const event = mentionEvent(envelope.body.event, channelIds);
-	if (event) onEvent(event);
+	if (!event) {
+		await acknowledge();
+		return;
+	}
+	if (!taskSink) {
+		onEvent(event);
+		await acknowledge();
+		return;
+	}
+	const body = envelope.body as Record<string, unknown>;
+	const native = body.event as Record<string, unknown>;
+	const eventId = body.event_id;
+	const workspace = body.team_id ?? native.team;
+	if (typeof eventId !== "string" || typeof workspace !== "string") {
+		await recordMalformedSlackEnvelope(
+			taskSink,
+			body,
+			"Slack event is missing event_id or workspace identity",
+		);
+		await acknowledge();
+		return;
+	}
+	const channel = native.channel as string;
+	const messageTs = native.ts as string;
+	const threadTs = typeof native.thread_ts === "string" ? native.thread_ts : messageTs;
+	const text = typeof native.text === "string" ? native.text : "";
+	const locator = event.locator?.key;
+	if (!locator) {
+		await recordMalformedSlackEnvelope(taskSink, body, "Slack mention has no exact locator");
+		await acknowledge();
+		return;
+	}
+	await taskSink.accept({
+		principal: sourceIdentifier("slack", workspace),
+		source: "slack",
+		providerEventId: sourceIdentifier("event", eventId),
+		providerDedupeKey: sourceIdentifier("event", eventId),
+		nativeLocator: {
+			workspace,
+			channel,
+			messageTimestamp: messageTs,
+			threadTimestamp: threadTs,
+			channelLocator: locator,
+		},
+		receivedAt: new Date().toISOString(),
+		conversationKey: sourceIdentifier("conversation", `${workspace}\0${channel}\0${threadTs}`),
+		parts: [{ data: { channelLocator: locator } }, { text }],
+		contentDigest: contentDigest({ workspace, channel, messageTs, threadTs, text }),
+	});
+	await acknowledge();
+}
+
+async function recordMalformedSlackEnvelope(
+	taskSink: SourceTaskActivationSink,
+	body: Record<string, unknown>,
+	reason: string,
+): Promise<void> {
+	const eventId = typeof body.event_id === "string" ? body.event_id : undefined;
+	const workspace =
+		typeof body.team_id === "string"
+			? body.team_id
+			: isRecord(body.event) && typeof body.event.team === "string"
+				? body.event.team
+				: undefined;
+	await taskSink.recordEvidence?.({
+		evidenceId: sourceIdentifier("evidence", `${contentDigest(body)}\0${reason}`),
+		source: "slack",
+		kind: "malformed-envelope",
+		detail: {
+			reason,
+			...(eventId ? { eventId } : {}),
+			...(workspace ? { workspace } : {}),
+		},
+	});
+	log(`acknowledging malformed envelope: ${reason}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

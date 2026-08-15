@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { type A2aTaskStore, TASK_RETENTION_MS } from "../a2a/store.ts";
 import { validateIdentifier } from "../a2a/types.ts";
 import { serialize } from "./serialize.ts";
-import type { NativeActivation, OutboundDelivery } from "./types.ts";
+import type { NativeActivation, OutboundDelivery, SourceEvidenceInput } from "./types.ts";
 
 /** Contexts are retained for the same window as the Tasks that reference them. */
 const RETENTION_MS = TASK_RETENTION_MS;
@@ -288,6 +288,16 @@ export class OutboundDeliveryStore extends JsonStore<DeliveryData> {
 			await this.persist();
 		});
 	}
+
+	async get(deliveryId: string): Promise<OutboundDelivery | undefined> {
+		return this.run(async () => this.data.deliveries[deliveryId]);
+	}
+
+	async pending(): Promise<readonly OutboundDelivery[]> {
+		return this.run(async () =>
+			Object.values(this.data.deliveries).filter((delivery) => delivery.state === "sending"),
+		);
+	}
 }
 
 interface ActivationEvidenceRecord {
@@ -308,7 +318,12 @@ interface UnhealthyEvidenceRecord {
 	readonly recordedAt: string;
 }
 
-type EvidenceRecord = ActivationEvidenceRecord | UnhealthyEvidenceRecord;
+interface SourceEvidenceRecord extends SourceEvidenceInput {
+	readonly recordType: "source.evidence";
+	readonly recordedAt: string;
+}
+
+type EvidenceRecord = ActivationEvidenceRecord | UnhealthyEvidenceRecord | SourceEvidenceRecord;
 
 interface EvidenceData {
 	readonly version: 1;
@@ -327,7 +342,7 @@ export class ActivationEvidenceStore extends JsonStore<EvidenceData> {
 	async append(activationId: string, taskId: string, input: NativeActivation): Promise<void> {
 		return this.run(async () => {
 			const prior = this.data.records.find(
-				(entry) => entry.activationId === activationId && entry.recordType === "task.activation",
+				(entry) => entry.recordType === "task.activation" && entry.activationId === activationId,
 			) as ActivationEvidenceRecord | undefined;
 			if (prior) {
 				if (prior.taskId !== taskId || prior.contentDigest !== input.contentDigest) {
@@ -357,7 +372,7 @@ export class ActivationEvidenceStore extends JsonStore<EvidenceData> {
 		return this.run(async () => {
 			const prior = this.data.records.find(
 				(entry) =>
-					entry.activationId === activationId && entry.recordType === "activation.unhealthy",
+					entry.recordType === "activation.unhealthy" && entry.activationId === activationId,
 			) as UnhealthyEvidenceRecord | undefined;
 			if (prior) {
 				if (prior.taskId !== taskId || prior.source !== source) {
@@ -372,6 +387,30 @@ export class ActivationEvidenceStore extends JsonStore<EvidenceData> {
 				recordType: "activation.unhealthy",
 				source,
 				error,
+				recordedAt: new Date().toISOString(),
+			});
+			await this.persist();
+		});
+	}
+
+	async appendSource(input: SourceEvidenceInput): Promise<void> {
+		return this.run(async () => {
+			const prior = this.data.records.find(
+				(entry) => entry.recordType === "source.evidence" && entry.evidenceId === input.evidenceId,
+			) as SourceEvidenceRecord | undefined;
+			if (prior) {
+				if (
+					prior.source !== input.source ||
+					prior.kind !== input.kind ||
+					JSON.stringify(prior.detail) !== JSON.stringify(input.detail)
+				) {
+					throw new Error("source evidence conflicts with its durable record");
+				}
+				return;
+			}
+			this.data.records.push({
+				...input,
+				recordType: "source.evidence",
 				recordedAt: new Date().toISOString(),
 			});
 			await this.persist();

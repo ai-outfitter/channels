@@ -50,7 +50,10 @@ export interface SourceRegistration {
 		taskSink?: SourceTaskActivationSink,
 	): Promise<ChannelSource | undefined>;
 	/** Dynamically load the channel's agent-facing actions, when supported. */
-	loadActions?(journal?: AgentSessionJournal): Promise<ChannelActions | undefined>;
+	loadActions?(
+		journal?: AgentSessionJournal,
+		taskSink?: SourceTaskActivationSink,
+	): Promise<ChannelActions | undefined>;
 	/** Load the native agent channel's discovery/send actions, when supported. */
 	loadAgentActions?(journal?: AgentSessionJournal): Promise<AgentChannelActions | undefined>;
 	/** Load a forwarder that streams Pi assistant text events as previews. */
@@ -81,9 +84,10 @@ const SOURCES: Record<string, SourceRegistration> = {
 	jmap: {
 		configured: () =>
 			Boolean(process.env.XIN_BASE_URL || process.env.XIN_BASIC_USER || process.env.XIN_BASIC_PASS),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/jmap.ts");
-			return configure(m.jmapConfigFromEnv, m.createJmapSource);
+			const cfg = m.jmapConfigFromEnv();
+			return cfg ? m.createJmapSource(cfg, undefined, taskSink) : undefined;
 		},
 	},
 	signal: {
@@ -95,9 +99,10 @@ const SOURCES: Record<string, SourceRegistration> = {
 	},
 	github: {
 		configured: () => Boolean(process.env.GITHUB_NOTIFY_TOKEN || process.env.GITHUB_TOKEN),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/github.ts");
-			return configure(m.githubConfigFromEnv, m.createGithubSource);
+			const cfg = m.githubConfigFromEnv();
+			return cfg ? m.createGithubSource(cfg, taskSink) : undefined;
 		},
 	},
 	forgejo: {
@@ -109,13 +114,15 @@ const SOURCES: Record<string, SourceRegistration> = {
 	},
 	slack: {
 		configured: () => Boolean(process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/slack.ts");
-			return configure(m.slackConfigFromEnv, m.createSlackSource);
+			const cfg = m.slackConfigFromEnv();
+			return cfg ? m.createSlackSource(cfg, undefined, undefined, taskSink) : undefined;
 		},
-		async loadActions() {
+		async loadActions(_journal, taskSink) {
 			const m = await import("./sources/slack.ts");
-			return configure(m.slackActionsConfigFromEnv, m.createSlackActions);
+			const cfg = m.slackActionsConfigFromEnv();
+			return cfg ? m.createSlackActions(cfg, undefined, taskSink) : undefined;
 		},
 	},
 	agent: {
@@ -152,13 +159,15 @@ const SOURCES: Record<string, SourceRegistration> = {
 			Boolean(
 				process.env.CHATTO_BASE_URL || process.env.CHATTO_TOKEN || process.env.CHATTO_ROOM_IDS,
 			),
-		async load() {
+		async load(_journal, taskSink) {
 			const m = await import("./sources/chatto.ts");
-			return configure(m.chattoConfigFromEnv, m.createChattoSource);
+			const cfg = m.chattoConfigFromEnv();
+			return cfg ? m.createChattoSource(cfg, undefined, undefined, undefined, taskSink) : undefined;
 		},
-		async loadActions() {
+		async loadActions(_journal, taskSink) {
 			const m = await import("./sources/chatto.ts");
-			return configure(m.chattoConfigFromEnv, m.createChattoActions);
+			const cfg = m.chattoConfigFromEnv();
+			return cfg ? m.createChattoActions(cfg, undefined, taskSink) : undefined;
 		},
 	},
 	mattermost: {
@@ -200,6 +209,7 @@ export default function channelEventsExtension(
 	pi: ExtensionAPI,
 	sources: Readonly<Record<string, SourceRegistration>> = SOURCES,
 	taskSink: () => SourceTaskActivationSink | undefined = () => undefined,
+	onTransactionalFailure: () => void | Promise<void> = () => {},
 ): ChannelEventsLifecycle | undefined {
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
 	if (selection === "off" || selection === "none") return undefined;
@@ -232,7 +242,7 @@ export default function channelEventsExtension(
 		let actions = actionCache.get(channel);
 		if (!actions) {
 			actions = registration
-				.loadActions(channel === "agent" ? agentJournal : undefined)
+				.loadActions(channel === "agent" ? agentJournal : undefined, taskSink())
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" actions are not configured`);
 					return loaded;
@@ -421,6 +431,7 @@ export default function channelEventsExtension(
 			if (stops.length === 0) log("no channels started");
 		} catch (error) {
 			for (const { stop } of started.reverse()) await stop().catch(() => {});
+			await onTransactionalFailure();
 			log(`channels unhealthy: ${(error as Error).message}`);
 			throw error;
 		} finally {

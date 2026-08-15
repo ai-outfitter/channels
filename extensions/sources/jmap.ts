@@ -9,8 +9,11 @@
  *
  * Tested shape: Stalwart's JMAP EventSource (RFC 8620 §7.3).
  */
+
+import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import type { ChannelEvent, ChannelSource } from "./types.ts";
-import { RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
+import { errorMessage, RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
 
 const log = scopedLog("jmap");
 
@@ -18,6 +21,10 @@ const log = scopedLog("jmap");
 const IDLE_TIMEOUT_MS = 90_000;
 const MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
 const CALENDARS_CAPABILITY = "urn:ietf:params:jmap:calendars";
+const CORE_CAPABILITY = "urn:ietf:params:jmap:core";
+const RESYNC_QUERY_LIMIT = 100;
+const DEFAULT_MAX_OBJECTS_IN_GET = 256;
+const RECONCILE_ATTEMPTS = 3;
 /**
  * The uid is the only event-derived text surfaced in the trusted wake summary,
  * so it must match this conservative charset (which also bounds its length);
@@ -53,6 +60,7 @@ export function jmapConfigFromEnv(): JmapConfig | undefined {
 export function createJmapSource(
 	cfg: JmapConfig,
 	retryMs: number = RECONNECT_DELAY_MS,
+	taskSink?: SourceTaskActivationSink,
 ): ChannelSource {
 	const auth = `Basic ${Buffer.from(`${cfg.user}:${cfg.pass}`).toString("base64")}`;
 
@@ -62,9 +70,30 @@ export function createJmapSource(
 				async (signal) => {
 					const session = await fetchSession(cfg.baseUrl, auth, signal);
 					log(`watching Email state and calendar alerts for account ${session.accountId}`);
-					await streamStateChanges(session, auth, signal, (wake) => {
-						onEvent({ channel: "jmap", ...wake });
-					});
+					const principal = sourceIdentifier("jmap", `${cfg.baseUrl}\0${cfg.user}`);
+					let changes = Promise.resolve();
+					const reconcile = (): void => {
+						if (!taskSink) return;
+						changes = changes
+							.then(() =>
+								reconcileEmailsWithRetry(session, auth, principal, taskSink, signal, retryMs),
+							)
+							.catch((error) => log(`email reconcile failed: ${errorMessage(error)}`));
+					};
+					if (taskSink) reconcile();
+					await streamStateChanges(
+						session,
+						auth,
+						signal,
+						(wake) => {
+							onEvent({ channel: "jmap", ...wake });
+						},
+						() => {
+							if (taskSink) reconcile();
+							else onEvent({ channel: "jmap", summary: "new mail" });
+						},
+					);
+					await changes;
 				},
 				log,
 				retryMs,
@@ -91,7 +120,9 @@ interface JmapAccounts {
 
 interface JmapSession {
 	accountId: string;
+	apiUrl?: string;
 	alertAccountIds: ReadonlySet<string>;
+	maxObjectsInGet: number;
 	/** Absolute EventSource URL for the given push `{types}` list. */
 	eventSourceUrlFor: (types: string) => string;
 }
@@ -111,6 +142,8 @@ async function fetchSession(
 		eventSourceUrl?: string;
 		primaryAccounts?: Record<string, string>;
 		accounts?: Record<string, { accountCapabilities?: Record<string, unknown> }>;
+		capabilities?: Record<string, { maxObjectsInGet?: unknown }>;
+		apiUrl?: string;
 	};
 	if (!body.eventSourceUrl) throw new Error("session has no eventSourceUrl");
 
@@ -137,6 +170,11 @@ async function fetchSession(
 				(id) => body.accounts?.[id]?.accountCapabilities?.[CALENDARS_CAPABILITY] != null,
 			);
 	const alertAccountIds = new Set([accountId, ...calendarsAccountIds]);
+	const advertisedMax = body.capabilities?.[CORE_CAPABILITY]?.maxObjectsInGet;
+	const maxObjectsInGet =
+		typeof advertisedMax === "number" && Number.isSafeInteger(advertisedMax) && advertisedMax > 0
+			? advertisedMax
+			: DEFAULT_MAX_OBJECTS_IN_GET;
 
 	// Fill the RFC 8620 template and resolve against the (post-redirect) session
 	// URL, so a relative eventSourceUrl lands under the right path.
@@ -147,7 +185,50 @@ async function fetchSession(
 			template.replace("{types}", types).replace("{closeafter}", "no").replace("{ping}", "30"),
 			sessionUrl,
 		).toString();
-	return { accountId, alertAccountIds, eventSourceUrlFor };
+	return {
+		accountId,
+		...(body.apiUrl ? { apiUrl: new URL(body.apiUrl, sessionUrl).toString() } : {}),
+		alertAccountIds,
+		maxObjectsInGet,
+		eventSourceUrlFor,
+	};
+}
+
+async function reconcileEmailsWithRetry(
+	session: JmapSession,
+	auth: string,
+	principal: string,
+	taskSink: SourceTaskActivationSink,
+	signal: AbortSignal,
+	retryMs: number,
+): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= RECONCILE_ATTEMPTS; attempt += 1) {
+		try {
+			await reconcileEmails(session, auth, principal, taskSink, signal);
+			return;
+		} catch (error) {
+			if (signal.aborted) return;
+			lastError = error;
+			if (attempt === RECONCILE_ATTEMPTS) break;
+			log(`email reconcile attempt ${attempt} failed: ${errorMessage(error)}; retrying`);
+			await abortableDelay(retryMs * 2 ** (attempt - 1), signal);
+		}
+	}
+	throw lastError;
+}
+
+async function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
+	await new Promise<void>((resolve) => {
+		const timer = setTimeout(done, ms);
+		function done(): void {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", done);
+			resolve();
+		}
+		signal.addEventListener("abort", done, { once: true });
+	});
 }
 
 async function streamStateChanges(
@@ -155,6 +236,7 @@ async function streamStateChanges(
 	auth: string,
 	parentSignal: AbortSignal,
 	onWake: (wake: JmapWake) => void,
+	onMailChange: () => void,
 ): Promise<void> {
 	// A derived controller: aborts when the supervisor stops us OR when the
 	// stream goes idle past IDLE_TIMEOUT_MS (a half-open connection), which
@@ -230,11 +312,11 @@ async function streamStateChanges(
 				// Normalize CRLF on the whole buffer so a \r\n split across read
 				// boundaries can't hide an SSE frame separator.
 				buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
-				buffer = emitFrames(buffer, accounts, onWake);
+				buffer = emitFrames(buffer, accounts, onWake, onMailChange);
 			}
 			// Flush a trailing complete frame the server sent right before EOF.
 			buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
-			if (buffer.trim()) emitFrame(buffer, accounts, onWake);
+			if (buffer.trim()) emitFrame(buffer, accounts, onWake, onMailChange);
 		} finally {
 			await reader.cancel().catch(() => {});
 		}
@@ -249,18 +331,24 @@ function emitFrames(
 	buffer: string,
 	accounts: JmapAccounts,
 	onWake: (wake: JmapWake) => void,
+	onMailChange: () => void,
 ): string {
 	let rest = buffer;
 	let sep = rest.indexOf("\n\n");
 	while (sep !== -1) {
-		emitFrame(rest.slice(0, sep), accounts, onWake);
+		emitFrame(rest.slice(0, sep), accounts, onWake, onMailChange);
 		rest = rest.slice(sep + 2);
 		sep = rest.indexOf("\n\n");
 	}
 	return rest;
 }
 
-function emitFrame(frame: string, accounts: JmapAccounts, onWake: (wake: JmapWake) => void): void {
+function emitFrame(
+	frame: string,
+	accounts: JmapAccounts,
+	onWake: (wake: JmapWake) => void,
+	onMailChange: () => void,
+): void {
 	// Per SSE, the last `event:` line names the frame and `data:` lines rejoin
 	// with "\n".
 	let event: string | undefined;
@@ -287,7 +375,7 @@ function emitFrame(frame: string, accounts: JmapAccounts, onWake: (wake: JmapWak
 		if (wake) onWake(wake);
 		return;
 	}
-	if (isMailStateChange(payload, accounts.mailAccountId)) onWake({ summary: "new mail" });
+	if (isMailStateChange(payload, accounts.mailAccountId)) onMailChange();
 }
 
 /**
@@ -352,4 +440,215 @@ function isMailStateChange(payload: Record<string, unknown>, accountId: string):
 	if (payload["@type"] !== "StateChange") return false;
 	const changed = payload.changed as Record<string, Record<string, string>> | undefined;
 	return changed?.[accountId]?.Email != null;
+}
+
+interface JmapEmailCheckpoint {
+	readonly state: string;
+}
+
+interface ChangedEmail {
+	readonly id: string;
+	readonly threadId: string;
+	readonly mailboxIds?: Readonly<Record<string, boolean>>;
+}
+
+async function reconcileEmails(
+	session: JmapSession,
+	auth: string,
+	principal: string,
+	taskSink: SourceTaskActivationSink,
+	signal: AbortSignal,
+): Promise<void> {
+	if (!taskSink.checkpoint || !taskSink.advanceCheckpoint) {
+		throw new Error("JMAP task routing requires durable checkpoint services");
+	}
+	const checkpoint = await taskSink.checkpoint<JmapEmailCheckpoint>(principal, "jmap");
+	if (!checkpoint) {
+		const state = await currentEmailState(session, auth, signal);
+		await taskSink.advanceCheckpoint(principal, "jmap", { state });
+		return;
+	}
+	let sinceState = checkpoint.state;
+	const inboxId = await inboxMailboxId(session, auth, signal);
+	for (;;) {
+		let changes: {
+			oldState: string;
+			newState: string;
+			hasMoreChanges?: boolean;
+			created?: string[];
+			updated?: string[];
+		};
+		try {
+			changes = await jmapCall(session, auth, signal, "Email/changes", {
+				accountId: session.accountId,
+				sinceState,
+			});
+		} catch (error) {
+			if (!(error instanceof JmapMethodError) || error.type !== "cannotCalculateChanges")
+				throw error;
+			await resynchronizeInbox(session, auth, principal, taskSink, signal, inboxId, sinceState);
+			return;
+		}
+		const ids = [...new Set([...(changes.created ?? []), ...(changes.updated ?? [])])];
+		await acceptInboxEmails(session, auth, principal, taskSink, signal, inboxId, ids);
+		await taskSink.advanceCheckpoint(principal, "jmap", { state: changes.newState });
+		sinceState = changes.newState;
+		if (!changes.hasMoreChanges) return;
+	}
+}
+
+async function resynchronizeInbox(
+	session: JmapSession,
+	auth: string,
+	principal: string,
+	taskSink: SourceTaskActivationSink,
+	signal: AbortSignal,
+	inboxId: string,
+	staleState: string,
+): Promise<void> {
+	const state = await currentEmailState(session, auth, signal);
+	const query = await jmapCall<{ ids?: string[] }>(session, auth, signal, "Email/query", {
+		accountId: session.accountId,
+		filter: { inMailbox: inboxId },
+		limit: RESYNC_QUERY_LIMIT,
+	});
+	const ids = [...new Set(query.ids ?? [])];
+	const accepted = await acceptInboxEmails(
+		session,
+		auth,
+		principal,
+		taskSink,
+		signal,
+		inboxId,
+		ids,
+	);
+	await taskSink.recordEvidence?.({
+		evidenceId: sourceIdentifier("evidence", `${principal}\0${staleState}\0${state}`),
+		source: "jmap",
+		kind: "checkpoint-resync",
+		detail: {
+			accountId: session.accountId,
+			staleState,
+			currentState: state,
+			queried: String(ids.length),
+			accepted: String(accepted),
+		},
+	});
+	await taskSink.advanceCheckpoint?.(principal, "jmap", { state });
+	log(`resynchronized Email checkpoint and reconciled ${ids.length} bounded INBOX item(s)`);
+}
+
+async function acceptInboxEmails(
+	session: JmapSession,
+	auth: string,
+	principal: string,
+	taskSink: SourceTaskActivationSink,
+	signal: AbortSignal,
+	inboxId: string,
+	ids: readonly string[],
+): Promise<number> {
+	if (ids.length === 0) return 0;
+	let accepted = 0;
+	for (let offset = 0; offset < ids.length; offset += session.maxObjectsInGet) {
+		const chunk = ids.slice(offset, offset + session.maxObjectsInGet);
+		const result = await jmapCall<{ list?: ChangedEmail[] }>(session, auth, signal, "Email/get", {
+			accountId: session.accountId,
+			ids: chunk,
+			properties: ["id", "threadId", "mailboxIds"],
+		});
+		for (const email of result.list ?? []) {
+			if (!email.mailboxIds?.[inboxId]) continue;
+			const eventKey = `${session.accountId}\0${email.id}`;
+			await taskSink.accept({
+				principal,
+				source: "jmap",
+				providerEventId: sourceIdentifier("event", eventKey),
+				providerDedupeKey: sourceIdentifier("event", eventKey),
+				nativeLocator: {
+					accountId: session.accountId,
+					emailId: email.id,
+					threadId: email.threadId,
+				},
+				receivedAt: new Date().toISOString(),
+				conversationKey: sourceIdentifier("conversation", email.threadId),
+				parts: [{ data: { accountId: session.accountId, emailId: email.id } }],
+				contentDigest: contentDigest({
+					accountId: session.accountId,
+					emailId: email.id,
+					threadId: email.threadId,
+				}),
+			});
+			accepted += 1;
+		}
+	}
+	return accepted;
+}
+
+async function inboxMailboxId(
+	session: JmapSession,
+	auth: string,
+	signal: AbortSignal,
+): Promise<string> {
+	const result = await jmapCall<{ list?: Array<{ id: string; role?: string }> }>(
+		session,
+		auth,
+		signal,
+		"Mailbox/get",
+		{ accountId: session.accountId, properties: ["id", "role"] },
+	);
+	const inbox = result.list?.find((mailbox) => mailbox.role === "inbox")?.id;
+	if (!inbox) throw new Error("Mailbox/get returned no inbox mailbox");
+	return inbox;
+}
+
+async function currentEmailState(
+	session: JmapSession,
+	auth: string,
+	signal: AbortSignal,
+): Promise<string> {
+	const result = await jmapCall<{ state?: string }>(session, auth, signal, "Email/get", {
+		accountId: session.accountId,
+		ids: [],
+		properties: ["id"],
+	});
+	if (!result.state) throw new Error("Email/get returned no state");
+	return result.state;
+}
+
+async function jmapCall<T>(
+	session: JmapSession,
+	auth: string,
+	signal: AbortSignal,
+	method: string,
+	arguments_: Record<string, unknown>,
+): Promise<T> {
+	if (!session.apiUrl) throw new Error("session has no apiUrl for durable Email/changes intake");
+	const apiUrl = session.apiUrl.replace("{accountId}", encodeURIComponent(session.accountId));
+	const response = await fetch(apiUrl, {
+		method: "POST",
+		headers: {
+			Authorization: auth,
+			"Content-Type": "application/json",
+			Accept: "application/json",
+		},
+		body: JSON.stringify({ using: [MAIL_CAPABILITY], methodCalls: [[method, arguments_, "c1"]] }),
+		signal,
+	});
+	if (!response.ok) throw new Error(`${method} request failed ${response.status}`);
+	const body = (await response.json()) as { methodResponses?: [string, unknown, string][] };
+	const tuple = body.methodResponses?.[0];
+	if (!tuple || tuple[0] !== method) {
+		const detail = tuple?.[1] as { type?: string; description?: string } | undefined;
+		throw new JmapMethodError(method, detail?.type ?? "invalidResponse", detail?.description);
+	}
+	return tuple[1] as T;
+}
+
+class JmapMethodError extends Error {
+	readonly type: string;
+
+	constructor(method: string, type: string, description?: string) {
+		super(`${method} failed: ${description ?? type}`);
+		this.type = type;
+	}
 }

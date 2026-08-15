@@ -88,8 +88,9 @@ type Subscriber = (event: A2aStreamResponse) => void;
 export async function startA2aServer(
 	config: A2aServerConfig,
 	executor: A2aExecutor,
+	sharedStore?: A2aTaskStore,
 ): Promise<RunningA2aServer> {
-	const store = new A2aTaskStore(config.storePath);
+	const store = sharedStore ?? new A2aTaskStore(config.storePath);
 	await store.initialize();
 	const subscribers = new Map<string, Set<Subscriber>>();
 
@@ -518,11 +519,9 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
 
 export async function configFromEnv(): Promise<A2aServerConfig> {
 	// The task plane's whole config surface is A2A_*; absent configuration
-	// means the extension stays inert. The store path is required so a
-	// misconfigured server refuses to start instead of opening an empty
-	// store somewhere else — the relay outage taught that lesson.
-	const storePath = process.env.A2A_STORE_PATH?.trim();
-	if (!storePath) throw new Error("A2A_STORE_PATH is required");
+	// means the extension stays inert. The composed runtime injects its shared
+	// Task store, so the legacy path is retained only as compatibility metadata.
+	const storePath = process.env.A2A_STORE_PATH?.trim() ?? "";
 	const credentialsPath = process.env.A2A_CREDENTIALS_PATH?.trim();
 	if (!credentialsPath) throw new Error("A2A_CREDENTIALS_PATH is required");
 	const credentialsDocument = JSON.parse(await readFile(credentialsPath, "utf8")) as {
