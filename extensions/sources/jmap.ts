@@ -3,16 +3,23 @@
  *
  * Consumes JMAP `StateChange` **pings** for the account's `Email` type and
  * `CalendarAlert` pushes when calendar alarms fire. It never reads message or
- * event bodies. The `mail` skill (via the `xin` CLI) does the actual mail work,
- * so this stays a push *signal* listener, not a mail or calendar client. Reuses
- * the mail skill's existing `XIN_*` credentials.
+ * event bodies during intake. Exact-item channel actions fetch only the located
+ * email and can reply through JMAP. Reuses the mail skill's existing `XIN_*`
+ * credentials.
  *
  * Tested shape: Stalwart's JMAP EventSource (RFC 8620 §7.3).
  */
 
+import { derivedId } from "../task-plane/serialize.ts";
 import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
 import type { SourceTaskActivationSink } from "../task-plane/types.ts";
-import type { ChannelEvent, ChannelSource } from "./types.ts";
+import type {
+	ChannelActions,
+	ChannelEvent,
+	ChannelReadResult,
+	ChannelRespondResult,
+	ChannelSource,
+} from "./types.ts";
 import { errorMessage, RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
 
 const log = scopedLog("jmap");
@@ -20,11 +27,15 @@ const log = scopedLog("jmap");
 /** The account has ~30s ping; treat a stream silent for this long as dead. */
 const IDLE_TIMEOUT_MS = 90_000;
 const MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
+const SUBMISSION_CAPABILITY = "urn:ietf:params:jmap:submission";
 const CALENDARS_CAPABILITY = "urn:ietf:params:jmap:calendars";
 const CORE_CAPABILITY = "urn:ietf:params:jmap:core";
 const RESYNC_QUERY_LIMIT = 100;
 const DEFAULT_MAX_OBJECTS_IN_GET = 256;
 const RECONCILE_ATTEMPTS = 3;
+const MAX_LOCATOR_BYTES = 1024;
+const MAX_EMAIL_BODY_BYTES = 64_000;
+const MAX_EMAIL_BODY_CHARS = 40_000;
 /**
  * The uid is the only event-derived text surfaced in the trusted wake summary,
  * so it must match this conservative charset (which also bounds its length);
@@ -48,6 +59,43 @@ export interface JmapConfig {
 	pass: string;
 }
 
+export interface JmapLocator {
+	accountId: string;
+	emailId: string;
+	threadId?: string;
+}
+
+interface JmapAddress {
+	email: string;
+	name?: string;
+}
+
+export interface JmapEmail {
+	id: string;
+	threadId?: string;
+	subject?: string;
+	from?: JmapAddress[];
+	replyTo?: JmapAddress[];
+	to?: JmapAddress[];
+	receivedAt?: string;
+	sentAt?: string;
+	messageId?: string[];
+	references?: string[];
+	textBody?: Array<{ partId?: string }>;
+	bodyValues?: Record<string, { value?: string }>;
+}
+
+export interface JmapApi {
+	getEmail(locator: JmapLocator): Promise<JmapEmail | undefined>;
+	sendReply(
+		locator: JmapLocator,
+		original: JmapEmail,
+		text: string,
+		deliveryId: string,
+	): Promise<string>;
+	findReply(locator: JmapLocator, deliveryId: string): Promise<string | undefined>;
+}
+
 /** Build config from the mail skill's XIN_* env, or undefined if unset. */
 export function jmapConfigFromEnv(): JmapConfig | undefined {
 	const baseUrl = process.env.XIN_BASE_URL;
@@ -55,6 +103,385 @@ export function jmapConfigFromEnv(): JmapConfig | undefined {
 	const pass = process.env.XIN_BASIC_PASS;
 	if (!baseUrl || !user || !pass) return undefined;
 	return { baseUrl: baseUrl.replace(/\/+$/, ""), user, pass };
+}
+
+/** Exact-item mail actions. No operation in this adapter queries the inbox. */
+export function createJmapActions(
+	cfg: JmapConfig,
+	api: JmapApi | undefined,
+	taskSink: SourceTaskActivationSink,
+): ChannelActions {
+	api ??= createHttpJmapApi(cfg);
+	return {
+		async read(locator): Promise<ChannelReadResult> {
+			const decoded = decodeJmapLocator(locator);
+			const email = await api.getEmail(decoded);
+			if (!email || email.id !== decoded.emailId) {
+				throw new Error("JMAP did not return the located email");
+			}
+			const taskId = taskSink.taskForLocator
+				? await taskSink.taskForLocator("jmap", locator)
+				: undefined;
+			const handled =
+				taskId && taskSink.taskIsTerminal ? await taskSink.taskIsTerminal(taskId) : false;
+			return {
+				channel: "jmap",
+				locator,
+				handled,
+				messages: [
+					{
+						id: email.id,
+						author: formatAddresses(email.from),
+						text: formatEmail(email),
+						target: true,
+					},
+				],
+			};
+		},
+
+		async respond(locator, response): Promise<ChannelRespondResult> {
+			const decoded = decodeJmapLocator(locator);
+			if (!taskSink.taskForLocator || !taskSink.deliver) {
+				throw new Error("JMAP task delivery is not configured");
+			}
+			const activeTaskId = await taskSink.taskForLocator("jmap", locator);
+			const deliveryInput = {
+				taskId: activeTaskId,
+				source: "jmap",
+				operationId: `reply:${locator}`,
+				payloadDigest: contentDigest(response),
+				recovery: "lookup" as const,
+			};
+			const deliveryId = derivedId(
+				"delivery",
+				`${deliveryInput.taskId}\0${deliveryInput.source}\0${deliveryInput.operationId}\0${deliveryInput.payloadDigest}`,
+			);
+			const responseId = await taskSink.deliver(
+				deliveryInput,
+				async () => {
+					const original = await api.getEmail(decoded);
+					if (!original || original.id !== decoded.emailId) {
+						throw new Error("JMAP did not return the located email");
+					}
+					return api.sendReply(decoded, original, response, deliveryId);
+				},
+				() => api.findReply(decoded, deliveryId),
+			);
+			if (!responseId) throw new Error("JMAP reply delivery returned no response id");
+			return {
+				channel: "jmap",
+				locator,
+				replied: true,
+				handled: true,
+				responseId,
+			};
+		},
+	};
+}
+
+export function encodeJmapLocator(locator: JmapLocator): string {
+	assertLocatorField(locator.accountId);
+	assertLocatorField(locator.emailId);
+	if (locator.threadId !== undefined) assertLocatorField(locator.threadId);
+	const payload = {
+		a: locator.accountId,
+		e: locator.emailId,
+		...(locator.threadId ? { t: locator.threadId } : {}),
+	};
+	return `jmap:v1:${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
+}
+
+export function decodeJmapLocator(locator: string): JmapLocator {
+	const [channel, version, encoded, extra] = locator.split(":");
+	if (
+		channel !== "jmap" ||
+		version !== "v1" ||
+		extra !== undefined ||
+		!encoded ||
+		encoded.length > MAX_LOCATOR_BYTES ||
+		!/^[A-Za-z0-9_-]+$/.test(encoded)
+	) {
+		throw new Error("invalid JMAP channel locator");
+	}
+	let payload: unknown;
+	try {
+		const bytes = Buffer.from(encoded, "base64url");
+		if (bytes.toString("base64url") !== encoded) throw new Error("non-canonical locator");
+		payload = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		throw new Error("invalid JMAP channel locator");
+	}
+	if (!isRecord(payload)) throw new Error("invalid JMAP channel locator");
+	const accountId = payload.a;
+	const emailId = payload.e;
+	const threadId = payload.t;
+	try {
+		assertLocatorField(accountId);
+		assertLocatorField(emailId);
+		if (threadId !== undefined) assertLocatorField(threadId);
+	} catch {
+		throw new Error("invalid JMAP channel locator");
+	}
+	return {
+		accountId,
+		emailId,
+		...(threadId ? { threadId } : {}),
+	};
+}
+
+function assertLocatorField(value: unknown): asserts value is string {
+	if (typeof value !== "string" || value.length === 0 || value.length > 512) {
+		throw new Error("invalid JMAP channel locator");
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatAddresses(addresses: readonly JmapAddress[] | undefined): string {
+	if (!addresses?.length) return "unknown sender";
+	return addresses.map(({ name, email }) => (name ? `${name} <${email}>` : email)).join(", ");
+}
+
+function formatEmail(email: JmapEmail): string {
+	const body = (email.textBody ?? [])
+		.map((part) => (part.partId ? email.bodyValues?.[part.partId]?.value : undefined))
+		.filter((value): value is string => typeof value === "string")
+		.join("\n")
+		.slice(0, MAX_EMAIL_BODY_CHARS);
+	return [
+		`Subject: ${email.subject ?? ""}`,
+		`From: ${formatAddresses(email.from)}`,
+		`To: ${formatAddresses(email.to)}`,
+		`Date: ${email.receivedAt ?? email.sentAt ?? ""}`,
+		"",
+		body,
+	].join("\n");
+}
+
+function createHttpJmapApi(cfg: JmapConfig): JmapApi {
+	const auth = `Basic ${Buffer.from(`${cfg.user}:${cfg.pass}`).toString("base64")}`;
+	let sessionPromise: Promise<JmapSession> | undefined;
+	const session = (): Promise<JmapSession> => {
+		sessionPromise ??= fetchSession(cfg.baseUrl, auth, new AbortController().signal).catch(
+			(error) => {
+				sessionPromise = undefined;
+				throw error;
+			},
+		);
+		return sessionPromise;
+	};
+	const locatedSession = async (locator: JmapLocator): Promise<JmapSession> => {
+		const current = await session();
+		if (current.accountId !== locator.accountId) {
+			throw new Error("JMAP channel locator is outside the configured mail account");
+		}
+		return current;
+	};
+
+	return {
+		async getEmail(locator) {
+			const current = await locatedSession(locator);
+			const result = await jmapCall<{ list?: JmapEmail[] }>(
+				current,
+				auth,
+				new AbortController().signal,
+				"Email/get",
+				{
+					accountId: locator.accountId,
+					ids: [locator.emailId],
+					properties: [
+						"id",
+						"threadId",
+						"subject",
+						"from",
+						"replyTo",
+						"to",
+						"receivedAt",
+						"sentAt",
+						"messageId",
+						"references",
+						"textBody",
+						"bodyValues",
+					],
+					fetchTextBodyValues: true,
+					maxBodyValueBytes: MAX_EMAIL_BODY_BYTES,
+				},
+			);
+			return result.list?.find((email) => email.id === locator.emailId);
+		},
+
+		async sendReply(locator, original, text, deliveryId) {
+			const current = await locatedSession(locator);
+			const emailCreationId = derivedId("email", deliveryId);
+			const submissionCreationId = derivedId("submission", deliveryId);
+			const [identity, mailboxes, matchingDrafts] = await Promise.all([
+				jmapCall<{ list?: Array<{ id: string; email: string; name?: string }> }>(
+					current,
+					auth,
+					new AbortController().signal,
+					"Identity/get",
+					{ accountId: locator.accountId, properties: ["id", "email", "name"] },
+				),
+				jmapCall<{ list?: Array<{ id: string; role?: string }> }>(
+					current,
+					auth,
+					new AbortController().signal,
+					"Mailbox/get",
+					{ accountId: locator.accountId, properties: ["id", "role"] },
+				),
+				jmapCall<{ ids?: string[] }>(current, auth, new AbortController().signal, "Email/query", {
+					accountId: locator.accountId,
+					filter: {
+						header: ["X-AI-Outfitter-Delivery-ID", deliveryId],
+						hasKeyword: "$draft",
+					},
+					limit: 2,
+				}),
+			]);
+			if ((matchingDrafts.ids?.length ?? 0) > 1) {
+				throw new Error("JMAP delivery lookup returned multiple drafts");
+			}
+			const existingDraftId = matchingDrafts.ids?.[0];
+			const { reply, submission, update } = prepareReply(
+				identity.list,
+				mailboxes.list,
+				original,
+				text,
+				deliveryId,
+				emailCreationId,
+			);
+			if (existingDraftId) submission.emailId = existingDraftId;
+			const responses = await jmapCalls(current, auth, [
+				...(existingDraftId
+					? []
+					: ([
+							[
+								"Email/set",
+								{ accountId: locator.accountId, create: { [emailCreationId]: reply } },
+								"email",
+							],
+						] as JmapMethodCall[])),
+				[
+					"EmailSubmission/set",
+					{
+						accountId: locator.accountId,
+						create: { [submissionCreationId]: submission },
+						onSuccessUpdateEmail: { [`#${submissionCreationId}`]: update },
+					},
+					"submission",
+				],
+			]);
+			const submissionResult = methodResult<{ created?: Record<string, { id?: string }> }>(
+				responses,
+				"EmailSubmission/set",
+				"submission",
+			);
+			const submissionId = submissionResult.created?.[submissionCreationId]?.id;
+			if (!submissionId) throw new Error("EmailSubmission/set returned no submission id");
+			if (existingDraftId) return existingDraftId;
+			const emailResult = methodResult<{ created?: Record<string, { id?: string }> }>(
+				responses,
+				"Email/set",
+				"email",
+			);
+			const emailId = emailResult.created?.[emailCreationId]?.id;
+			if (!emailId) throw new Error("Email/set returned no email id");
+			return emailId;
+		},
+
+		async findReply(locator, deliveryId) {
+			const current = await locatedSession(locator);
+			const result = await jmapCall<{ ids?: string[] }>(
+				current,
+				auth,
+				new AbortController().signal,
+				"Email/query",
+				{
+					accountId: locator.accountId,
+					filter: {
+						header: ["X-AI-Outfitter-Delivery-ID", deliveryId],
+						notKeyword: "$draft",
+					},
+					limit: 2,
+				},
+			);
+			if ((result.ids?.length ?? 0) > 1) {
+				throw new Error("JMAP delivery lookup returned multiple emails");
+			}
+			return result.ids?.[0];
+		},
+	};
+}
+
+function selectReplyIdentity(
+	identities: Array<{ id: string; email: string; name?: string }> | undefined,
+	recipients: readonly JmapAddress[] | undefined,
+): { id: string; email: string; name?: string } | undefined {
+	return (
+		identities?.find((identity) =>
+			recipients?.some(
+				(recipient) => recipient.email.toLowerCase() === identity.email.toLowerCase(),
+			),
+		) ?? identities?.[0]
+	);
+}
+
+function prepareReply(
+	identities: Array<{ id: string; email: string; name?: string }> | undefined,
+	mailboxes: Array<{ id: string; role?: string }> | undefined,
+	original: JmapEmail,
+	text: string,
+	deliveryId: string,
+	emailCreationId: string,
+): {
+	reply: Record<string, unknown>;
+	submission: Record<string, unknown>;
+	update: Record<string, unknown>;
+} {
+	const replyIdentity = selectReplyIdentity(identities, original.to);
+	const recipient = original.replyTo?.[0] ?? original.from?.[0];
+	if (!replyIdentity) throw new Error("Identity/get returned no sending identity");
+	if (!recipient?.email) throw new Error("located email has no sender to reply to");
+	const draftsId = mailboxes?.find((mailbox) => mailbox.role === "drafts")?.id;
+	if (!draftsId) throw new Error("Mailbox/get returned no drafts mailbox");
+	const sentId = mailboxes?.find((mailbox) => mailbox.role === "sent")?.id;
+	const messageIds = original.messageId ?? [];
+	const references = [...new Set([...(original.references ?? []), ...messageIds])];
+	return {
+		reply: {
+			mailboxIds: { [draftsId]: true },
+			keywords: { $draft: true },
+			from: [
+				{
+					email: replyIdentity.email,
+					...(replyIdentity.name ? { name: replyIdentity.name } : {}),
+				},
+			],
+			to: [recipient],
+			subject: replySubject(original.subject),
+			...(messageIds.length ? { "header:In-Reply-To:asMessageIds": messageIds } : {}),
+			...(references.length ? { "header:References:asMessageIds": references } : {}),
+			"header:X-AI-Outfitter-Delivery-ID:asText": deliveryId,
+			bodyStructure: { type: "text/plain", partId: "body" },
+			bodyValues: { body: { value: text } },
+		},
+		submission: {
+			identityId: replyIdentity.id,
+			emailId: `#${emailCreationId}`,
+		},
+		update: {
+			"keywords/$draft": null,
+			[`mailboxIds/${draftsId}`]: null,
+			...(sentId ? { [`mailboxIds/${sentId}`]: true } : {}),
+		},
+	};
+}
+
+function replySubject(subject: string | undefined): string {
+	const value = subject ?? "";
+	return /^re\s*:/i.test(value) ? value : `Re: ${value}`;
 }
 
 export function createJmapSource(
@@ -578,6 +1005,11 @@ async function acceptInboxEmails(
 		for (const email of result.list ?? []) {
 			if (!email.mailboxIds?.[inboxId]) continue;
 			const eventKey = `${session.accountId}\0${email.id}`;
+			const channelLocator = encodeJmapLocator({
+				accountId: session.accountId,
+				emailId: email.id,
+				threadId: email.threadId,
+			});
 			await taskSink.accept({
 				principal,
 				source: "jmap",
@@ -587,10 +1019,11 @@ async function acceptInboxEmails(
 					accountId: session.accountId,
 					emailId: email.id,
 					threadId: email.threadId,
+					channelLocator,
 				},
 				receivedAt: new Date().toISOString(),
 				conversationKey: sourceIdentifier("conversation", email.threadId),
-				parts: [{ data: { accountId: session.accountId, emailId: email.id } }],
+				parts: [{ data: { channelLocator } }],
 				contentDigest: contentDigest({
 					accountId: session.accountId,
 					emailId: email.id,
@@ -641,8 +1074,29 @@ async function jmapCall<T>(
 	method: string,
 	arguments_: Record<string, unknown>,
 ): Promise<T> {
-	if (!session.apiUrl) throw new Error("session has no apiUrl for durable Email/changes intake");
+	const responses = await jmapCalls(session, auth, [[method, arguments_, "c1"]], signal);
+	return methodResult<T>(responses, method, "c1");
+}
+
+type JmapMethodCall = [string, Record<string, unknown>, string];
+type JmapMethodResponse = [string, unknown, string];
+
+async function jmapCalls(
+	session: JmapSession,
+	auth: string,
+	methodCalls: JmapMethodCall[],
+	signal: AbortSignal = new AbortController().signal,
+): Promise<JmapMethodResponse[]> {
+	if (!session.apiUrl) throw new Error("session has no apiUrl for JMAP methods");
 	const apiUrl = session.apiUrl.replace("{accountId}", encodeURIComponent(session.accountId));
+	const using = [CORE_CAPABILITY, MAIL_CAPABILITY];
+	if (
+		methodCalls.some(
+			([method]) => method.startsWith("Identity/") || method.startsWith("EmailSubmission/"),
+		)
+	) {
+		using.push(SUBMISSION_CAPABILITY);
+	}
 	const response = await fetch(apiUrl, {
 		method: "POST",
 		headers: {
@@ -650,12 +1104,21 @@ async function jmapCall<T>(
 			"Content-Type": "application/json",
 			Accept: "application/json",
 		},
-		body: JSON.stringify({ using: [MAIL_CAPABILITY], methodCalls: [[method, arguments_, "c1"]] }),
+		body: JSON.stringify({ using, methodCalls }),
 		signal,
 	});
-	if (!response.ok) throw new Error(`${method} request failed ${response.status}`);
-	const body = (await response.json()) as { methodResponses?: [string, unknown, string][] };
-	const tuple = body.methodResponses?.[0];
+	if (!response.ok) throw new Error(`JMAP request failed ${response.status}`);
+	const body = (await response.json()) as { methodResponses?: JmapMethodResponse[] };
+	if (!body.methodResponses) throw new Error("JMAP response has no methodResponses");
+	return body.methodResponses;
+}
+
+function methodResult<T>(
+	responses: readonly JmapMethodResponse[],
+	method: string,
+	callId: string,
+): T {
+	const tuple = responses.find((response) => response[2] === callId);
 	if (!tuple || tuple[0] !== method) {
 		const detail = tuple?.[1] as { type?: string; description?: string } | undefined;
 		throw new JmapMethodError(method, detail?.type ?? "invalidResponse", detail?.description);

@@ -181,8 +181,13 @@ belong to the extension adapter; existing non-tool skills may reuse them.
 ### Email — `jmap`
 
 Watches a JMAP mailbox's `Email` state over an EventSource (SSE) and wakes
-whenever that state changes. It reads no message bodies; the `mail` skill (via
-`xin`) determines whether actionable new mail exists.
+for each exact message newly present in INBOX. The wake carries an opaque
+task-bound locator. `channel_read` fetches only that email's subject, addresses,
+date, and bounded text body, and `channel_respond` replies to its sender through
+`EmailSubmission/set`; neither operation scans the inbox. Each reply carries a
+deterministic delivery header. After a crash, an exact header lookup reconciles
+only a non-draft email before any retry. If draft creation succeeded but
+submission failed, the retry submits that same draft instead of duplicating it.
 
 It also wakes on JMAP `CalendarAlert` pushes. When a calendar event's alarm
 fires, the server pushes an alert and the source wakes the agent. Push delivery
@@ -192,7 +197,7 @@ mail-only wakes — see
 [docs/channel-events.md](docs/channel-events.md) for the full caveats.
 
 - **Prerequisites:** a JMAP mailbox (e.g. [Stalwart](https://stalw.art/),
-  Fastmail) and the `mail` skill enabled. *(JMAP servers only — Gmail is not JMAP;
+  Fastmail). *(JMAP servers only — Gmail is not JMAP;
   use the `gmail` skill/`gam` for Google Workspace.)* Calendar wakes additionally
   need a server that speaks JMAP for Calendars. The `CalendarAlert` frame name
   and its field casing follow Stalwart's implementation and are not part of

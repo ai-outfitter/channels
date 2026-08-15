@@ -211,6 +211,11 @@ test("JMAP restart resumes Email/changes and accepts each exact email before che
 			[ACCOUNT_ID, "email-2"],
 		],
 	);
+	for (const activation of accepted) {
+		const channelLocator = activation.nativeLocator.channelLocator;
+		assert.ok(channelLocator?.startsWith("jmap:v1:"));
+		assert.deepEqual(activation.parts, [{ data: { channelLocator } }]);
+	}
 });
 
 test("JMAP updated mail creates one Task only when it newly enters INBOX", async () => {

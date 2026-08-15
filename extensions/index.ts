@@ -93,6 +93,11 @@ export function createSourceRegistry(
 				const cfg = m.jmapConfigFromEnv();
 				return cfg ? m.createJmapSource(cfg, undefined, taskSink) : undefined;
 			},
+			async loadActions(_journal, taskSink) {
+				const m = await importOnce("./sources/jmap.ts", () => import("./sources/jmap.ts"));
+				const cfg = m.jmapConfigFromEnv();
+				return cfg ? m.createJmapActions(cfg, undefined, taskSink) : undefined;
+			},
 		},
 		signal: {
 			configured: () => Boolean(process.env.SIGNAL_NUMBER || process.env.SIGNAL_CLI_CONFIG),
