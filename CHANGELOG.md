@@ -13,6 +13,20 @@
 - **Source authors (breaking):** Task-producing source loaders and migrated
   source constructors require a task sink. Emitting through the old
   `ChannelEvent` wake callback is rejected instead of waking Pi.
+- **Agent, Signal, Forgejo, Mattermost, and Zulip profile authors (breaking):**
+  These remaining work sources now require the task-plane sink and emit only
+  Task-scoped wakes. Agent transport subscription callbacks are asynchronous;
+  spool unlink and relay acknowledgment now wait for durable acceptance.
+- **Mattermost and Zulip action integrators (breaking):** Reply and handled
+  mutations now require task-bound delivery services. Indeterminate reply
+  failures are recorded as ambiguous instead of being blindly repeated.
+- **Signal operators:** Each receive envelope is now stored as the Task's
+  durable exact-item payload before `signal-cli` intake advances; response
+  workflows must quote the recorded sender and timestamp.
+- **Forgejo operators:** Poll cursors and accepted revisions are durable, and
+  configured mark-read acknowledgment occurs only after Task acceptance.
+- **Task-plane operators:** The resident wake queue admits at most 128 pending
+  wakes. Overflow is logged and recorded as durable failed-wake evidence.
 - **All channel profiles and skills:** Every channel source now sends a
   Task-scoped wake prompt instead of the 1.7 channel-and-locator wake. Update any
   profile or skill that matches or parses the old wake text.

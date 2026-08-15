@@ -430,7 +430,11 @@ function calendarAlertWake(
 	// must not reach the trusted wake summary — only the conservative charset
 	// passes; everything else gets the generic form.
 	if (typeof uid !== "string" || !CALENDAR_ALERT_UID_PATTERN.test(uid)) {
-		return { summary: "calendar alert", dedupeKey: "calendar-alert" };
+		const occurrence = `${String(uid)}\0${String(recurrenceId)}`;
+		return {
+			summary: "calendar alert",
+			dedupeKey: sourceIdentifier("calendar-alert", occurrence),
+		};
 	}
 	// A recurring event can have two occurrences pending in one wake window;
 	// keying on the occurrence keeps them distinct. recurrenceId is

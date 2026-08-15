@@ -4,6 +4,7 @@ import { AgentSessionJournal } from "../agent/journal.ts";
 import { RelayAgentTransport } from "../agent/relay.ts";
 import {
 	type AgentEndpoint,
+	type AgentMessageV1,
 	type AgentSendInput,
 	type AgentSendResult,
 	type AgentTransport,
@@ -16,6 +17,8 @@ import type {
 	RelayStatusTurnPhase,
 	RelayStreamEvent,
 } from "../relay/protocol.ts";
+import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import type {
 	ChannelActions,
 	ChannelReadResult,
@@ -128,16 +131,31 @@ export function createAgentSource(
 	) => AgentTransport = sharedAgentTransport,
 	journal = new AgentSessionJournal(),
 	retryInitialMs = SUBSCRIBE_RETRY_INITIAL_MS,
+	taskSink?: SourceTaskActivationSink,
 ): ChannelSource {
+	if (!taskSink) throw new Error("agent task sink is required");
 	const log = scopedLog("agent");
 	return {
-		async start(onEvent) {
+		async start() {
 			const transport = createTransport(config, journal);
-			const deliver = (messageId: string) => {
-				onEvent({
-					channel: "agent",
-					summary: "new agent message",
-					locator: { key: agentLocator(messageId) },
+			const deliver = async (message: AgentMessageV1): Promise<void> => {
+				const locator = agentLocator(message.id);
+				await taskSink.accept({
+					principal: sourceIdentifier("agent", config.principalId),
+					source: "agent",
+					providerEventId: sourceIdentifier("event", message.id),
+					providerDedupeKey: sourceIdentifier("event", message.id),
+					nativeLocator: {
+						channelLocator: locator,
+						messageId: message.id,
+						sender: message.sender,
+						recipient: message.recipient,
+						conversationId: message.conversationId,
+					},
+					receivedAt: message.createdAt,
+					conversationKey: sourceIdentifier("conversation", message.conversationId),
+					parts: [{ data: { channelLocator: locator } }],
+					contentDigest: contentDigest(message),
 				});
 			};
 			// The initial subscribe races the relay's own startup when the relay
@@ -495,6 +513,7 @@ export function createAgentActions(
 		journal?: AgentSessionJournal,
 	) => AgentTransport = sharedAgentTransport,
 	journal = new AgentSessionJournal(),
+	taskSink?: SourceTaskActivationSink,
 ): AgentChannelActions {
 	let injectedTransport: AgentTransport | undefined;
 	const getTransport = (): AgentTransport => {
@@ -521,13 +540,31 @@ export function createAgentActions(
 			};
 		},
 		async respond(locator, response): Promise<ChannelRespondResult> {
-			const result = await getTransport().respond(decodeAgentLocator(locator), response);
+			if (!taskSink?.taskForLocator || !taskSink.deliver) {
+				throw new Error("agent task delivery is not configured");
+			}
+			const taskId = await taskSink.taskForLocator("agent", locator);
+			let result: Awaited<ReturnType<AgentTransport["respond"]>> | undefined;
+			const responseId = await taskSink.deliver(
+				{
+					taskId,
+					source: "agent",
+					operationId: `reply:${locator}`,
+					payloadDigest: contentDigest(response),
+					recovery: "idempotent",
+				},
+				async () => {
+					result = await getTransport().respond(decodeAgentLocator(locator), response);
+					return result.response.message.id;
+				},
+			);
+			if (!responseId) throw new Error("agent response returned no message id");
 			return {
 				channel: "agent",
 				locator,
 				replied: true,
-				handled: result.target.state === "replied",
-				responseId: result.response.message.id,
+				handled: true,
+				responseId,
 			};
 		},
 	};

@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { A2aError } from "../extensions/a2a/types.ts";
 import {
-	createZulipActions,
-	createZulipSource,
+	createZulipActions as createZulipActionsImpl,
+	createZulipSource as createZulipSourceImpl,
 	type ZulipApi,
 	type ZulipConfig,
 	type ZulipMessage,
 	zulipConfigFromEnv,
 	zulipMentionEvent,
 } from "../extensions/sources/zulip.ts";
+import type {
+	NativeActivation,
+	SourceEvidenceInput,
+	SourceTaskActivationSink,
+} from "../extensions/task-plane/types.ts";
 
 const config: ZulipConfig = {
 	baseUrl: "https://zulip.example.com",
@@ -16,6 +22,51 @@ const config: ZulipConfig = {
 	apiKey: "secret",
 	channelIds: new Set(),
 };
+
+const actionSink: SourceTaskActivationSink = {
+	async accept() {
+		throw new Error("unused");
+	},
+	async continue() {
+		throw new Error("unused");
+	},
+	async taskForLocator() {
+		return "task-1";
+	},
+	async deliver(_input, send) {
+		return send();
+	},
+};
+
+function createZulipActions(cfg: ZulipConfig, api?: ZulipApi) {
+	return createZulipActionsImpl(cfg, api, actionSink);
+}
+
+function createZulipSource(cfg: ZulipConfig, retryMs?: number, api?: ZulipApi) {
+	return {
+		async start(onEvent: (event: { locator?: { key: string } }) => unknown) {
+			const sink: SourceTaskActivationSink = {
+				async accept(input: NativeActivation) {
+					onEvent({ locator: { key: input.nativeLocator.channelLocator as string } });
+					return {
+						activationId: input.providerEventId,
+						taskId: "task-1",
+						contextId: input.conversationKey ?? "context",
+						disposition: "created",
+					};
+				},
+				async continue() {
+					throw new Error("unused");
+				},
+				async advanceCheckpoint() {},
+				async recordEvidence() {},
+			};
+			return createZulipSourceImpl(cfg, retryMs, api, sink).start(() => {
+				throw new Error("legacy onEvent must not be used");
+			});
+		},
+	};
+}
 
 test("Zulip configuration validates the organization and channel boundary", () => {
 	const prior = snapshot(
@@ -186,6 +237,129 @@ test("Zulip source retries, recreates expired queues, emits mentions, and shuts 
 	await stop();
 	assert.deepEqual(deleted, ["queue-2", "queue-3"]);
 	console.error = originalError;
+});
+
+test("Zulip advances its queue cursor only after Task acceptance", async () => {
+	const cursors: number[] = [];
+	let attempts = 0;
+	const controller = new AbortController();
+	const api = fakeApi({
+		async getEvents(_queueId, lastEventId, signal) {
+			cursors.push(lastEventId);
+			if (attempts < 2) return [messageEvent(streamMessage(77, 7), 1)];
+			return await waitForAbort(signal);
+		},
+	});
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			attempts += 1;
+			if (attempts === 1) throw new Error("task store unavailable");
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-1",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async advanceCheckpoint() {},
+	};
+	const stop = await createZulipSourceImpl(config, 0, api, sink).start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		await waitFor(() => attempts === 2);
+		assert.deepEqual(cursors.slice(0, 2), [0, 0]);
+	} finally {
+		controller.abort();
+		await stop();
+	}
+});
+
+test("Zulip steps over a permanent conflict once and accepts the event behind it", async () => {
+	const accepted: string[] = [];
+	const evidence: SourceEvidenceInput[] = [];
+	const checkpoints: number[] = [];
+	const api = fakeApi({
+		async getEvents(_queueId, lastEventId, signal) {
+			if (lastEventId === 0) {
+				return [messageEvent(streamMessage(81, 7), 1), messageEvent(streamMessage(82, 7), 2)];
+			}
+			return await waitForAbort(signal);
+		},
+	});
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			const messageId = input.nativeLocator.messageId as string;
+			if (messageId === "81") {
+				throw new A2aError(409, "DUPLICATE_MESSAGE_ID", "changed provider payload");
+			}
+			accepted.push(messageId);
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-1",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async advanceCheckpoint(_principal, _source, checkpoint) {
+			checkpoints.push((checkpoint as { eventId: number }).eventId);
+		},
+		async recordEvidence(input) {
+			evidence.push(input);
+		},
+	};
+	const stop = await createZulipSourceImpl(config, 0, api, sink).start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		await waitFor(() => accepted.length === 1);
+		assert.deepEqual(accepted, ["82"]);
+		assert.deepEqual(checkpoints, [1, 2]);
+		assert.equal(evidence.length, 1);
+		assert.equal(evidence[0]?.kind, "permanent-duplicate-conflict");
+		assert.deepEqual(evidence[0]?.detail, { eventId: "1" });
+	} finally {
+		await stop();
+	}
+});
+
+test("Zulip backs off before polling a retained transient event again", async () => {
+	const polls: number[] = [];
+	let attempts = 0;
+	const api = fakeApi({
+		async getEvents(_queueId, lastEventId, signal) {
+			polls.push(Date.now());
+			if (polls.length <= 2) return [messageEvent(streamMessage(91, 7), lastEventId + 1)];
+			return await waitForAbort(signal);
+		},
+	});
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			attempts += 1;
+			throw new Error("task store unavailable");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+	const originalError = console.error;
+	console.error = () => {};
+	const stop = await createZulipSourceImpl(config, 30, api, sink).start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		await waitFor(() => attempts >= 2);
+		assert.ok((polls[1] ?? 0) - (polls[0] ?? 0) >= 25, `polls were ${polls.join(", ")}`);
+	} finally {
+		console.error = originalError;
+		await stop();
+	}
 });
 
 function messageEvent(

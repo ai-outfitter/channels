@@ -1,4 +1,40 @@
 import { createHash } from "node:crypto";
+import { A2aError } from "../a2a/types.ts";
+
+export type PermanentIntakeFailure =
+	| { readonly kind: "permanent-duplicate-conflict" }
+	| { readonly kind: "permanent-invalid-activation" };
+
+/**
+ * Classify failures at the provider-to-Task intake boundary. Invalid source
+ * activations and provider-key payload conflicts cannot improve on retry;
+ * network failures, server failures, and unknown errors must retain the item.
+ */
+export function permanentIntakeFailure(error: unknown): PermanentIntakeFailure | undefined {
+	if (error instanceof A2aError) {
+		if (error.reason === "DUPLICATE_MESSAGE_ID") {
+			return { kind: "permanent-duplicate-conflict" };
+		}
+		if (error.httpStatus >= 400 && error.httpStatus < 500) {
+			return { kind: "permanent-invalid-activation" };
+		}
+		return undefined;
+	}
+	if (error instanceof Error && isPlainActivationValidationError(error.message)) {
+		return { kind: "permanent-invalid-activation" };
+	}
+	return undefined;
+}
+
+function isPlainActivationValidationError(message: string): boolean {
+	return (
+		message === "receivedAt is invalid" ||
+		message === "contentDigest must be a SHA-256 digest" ||
+		message === "nativeLocator is required" ||
+		message === "activation parts are required" ||
+		/^nativeLocator\.[^ ]+ must be a non-empty string of at most 4096 characters$/.test(message)
+	);
+}
 
 /** Stable identifier-safe representation for provider values that can contain URLs, @, or /. */
 export function sourceIdentifier(prefix: string, raw: string): string {

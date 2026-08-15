@@ -6,6 +6,12 @@
  * messages stay eligible. Locators contain numeric IDs, never content, topics,
  * channel names, sender names, or recipient addresses.
  */
+import {
+	contentDigest,
+	permanentIntakeFailure,
+	sourceIdentifier,
+} from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import type {
 	ChannelActions,
 	ChannelContextMessage,
@@ -14,7 +20,7 @@ import type {
 	ChannelRespondResult,
 	ChannelSource,
 } from "./types.ts";
-import { parseList, RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
+import { parseList, RECONNECT_DELAY_MS, retryDelay, scopedLog, supervise } from "./util.ts";
 
 const log = scopedLog("zulip");
 const MAX_CONTEXT = 10;
@@ -101,6 +107,7 @@ export function zulipConfigFromEnv(): ZulipConfig | undefined {
 export function createZulipActions(
 	cfg: ZulipConfig,
 	api: ZulipApi = createZulipApi(cfg),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelActions {
 	let botId: Promise<number> | undefined;
 	const getBotId = (): Promise<number> => {
@@ -141,7 +148,21 @@ export function createZulipActions(
 			assertAllowedChannel(decoded, cfg.channelIds);
 			const [message, ownId] = await Promise.all([api.getMessage(decoded.messageId), getBotId()]);
 			assertMatchingMessage(message, decoded);
-			const responseId = await api.sendReply(message, ownId, response);
+			if (!taskSink?.taskForLocator || !taskSink.deliver) {
+				throw new Error("Zulip task delivery is not configured");
+			}
+			const taskId = await taskSink.taskForLocator("zulip", locator);
+			const delivered = await taskSink.deliver(
+				{
+					taskId,
+					source: "zulip",
+					operationId: `reply:${locator}`,
+					payloadDigest: contentDigest(response),
+					recovery: "ambiguous",
+				},
+				async () => String(await api.sendReply(message, ownId, response)),
+			);
+			const responseId = Number(delivered);
 			if (!isPositiveInteger(responseId)) throw new Error("Zulip returned no response message id");
 			const replied = {
 				channel: "zulip",
@@ -150,7 +171,19 @@ export function createZulipActions(
 				responseId: String(responseId),
 			} as const;
 			try {
-				await api.addReaction(decoded.messageId);
+				await taskSink.deliver(
+					{
+						taskId,
+						source: "zulip",
+						operationId: `handled:${locator}`,
+						payloadDigest: contentDigest(DONE_EMOJI),
+						recovery: "idempotent",
+					},
+					async () => {
+						await api.addReaction(decoded.messageId);
+						return String(decoded.messageId);
+					},
+				);
 				return { ...replied, handled: true };
 			} catch (error) {
 				if (zulipErrorCode(error) === "REACTION_ALREADY_EXISTS") {
@@ -170,14 +203,16 @@ export function createZulipSource(
 	cfg: ZulipConfig,
 	retryMs: number = RECONNECT_DELAY_MS,
 	api: ZulipApi = createZulipApi(cfg),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelSource {
+	if (!taskSink) throw new Error("Zulip task sink is required");
 	return {
-		async start(onEvent) {
+		async start() {
 			return supervise(
 				async (signal) => {
 					const user = await api.me();
 					if (!isPositiveInteger(user.user_id)) throw new Error("Zulip returned an invalid bot id");
-					await runZulipQueue(cfg, api, signal, user.user_id, onEvent);
+					await runZulipQueue(cfg, api, signal, user.user_id, taskSink, retryMs);
 				},
 				log,
 				retryMs,
@@ -229,7 +264,8 @@ async function runZulipQueue(
 	api: ZulipApi,
 	signal: AbortSignal,
 	botId: number,
-	onEvent: (event: ChannelEvent) => void,
+	taskSink: SourceTaskActivationSink,
+	retryMs: number,
 ): Promise<void> {
 	let queue: ZulipQueue | undefined;
 	try {
@@ -244,27 +280,77 @@ async function runZulipQueue(
 		) {
 			throw new Error("Zulip returned invalid event queue metadata");
 		}
-		await consumeZulipEvents(cfg, api, queue, signal, botId, onEvent);
+		await consumeZulipEvents(cfg, api, queue, signal, botId, taskSink, retryMs);
 	} finally {
 		if (queue) await deleteZulipQueue(api, queue.queue_id);
 	}
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: the queue cursor advances only through explicit per-item outcome branches
 async function consumeZulipEvents(
 	cfg: ZulipConfig,
 	api: ZulipApi,
 	queue: ZulipQueue,
 	signal: AbortSignal,
 	botId: number,
-	onEvent: (event: ChannelEvent) => void,
+	taskSink: SourceTaskActivationSink,
+	retryMs: number,
 ): Promise<void> {
 	let lastEventId = queue.last_event_id;
+	const principal = sourceIdentifier("zulip", `${cfg.baseUrl}\0${botId}`);
 	while (!signal.aborted) {
 		const events = await pollZulipEvents(api, queue, lastEventId, signal);
 		if (!events) return;
 		for (const event of events) {
-			if (Number.isSafeInteger(event.id) && event.id > lastEventId) lastEventId = event.id;
-			emitZulipMention(event, botId, cfg.channelIds, onEvent);
+			if (!Number.isSafeInteger(event.id) || event.id <= lastEventId) continue;
+			try {
+				const mention = zulipMentionEvent(event, botId, cfg.channelIds);
+				if (mention?.locator && event.message) {
+					const message = event.message;
+					await taskSink.accept({
+						principal,
+						source: "zulip",
+						providerEventId: sourceIdentifier("event", String(message.id)),
+						providerDedupeKey: sourceIdentifier("event", String(message.id)),
+						nativeLocator: {
+							channelLocator: mention.locator.key,
+							messageId: String(message.id),
+							...(message.stream_id ? { channelId: String(message.stream_id) } : {}),
+						},
+						receivedAt: new Date().toISOString(),
+						conversationKey: zulipConversationKey(message),
+						parts: [{ data: { channelLocator: mention.locator.key } }],
+						contentDigest: contentDigest(event),
+					});
+				} else if (event.type === "message") {
+					await taskSink.recordEvidence?.({
+						evidenceId: sourceIdentifier("evidence", `${principal}\0${event.id}`),
+						source: "zulip",
+						kind: "permanent-non-work",
+						detail: { eventId: String(event.id) },
+					});
+				}
+				await taskSink.advanceCheckpoint?.(principal, "zulip", { eventId: event.id });
+				lastEventId = event.id;
+			} catch (error) {
+				const permanent = permanentIntakeFailure(error);
+				if (permanent) {
+					await taskSink.recordEvidence?.({
+						evidenceId: sourceIdentifier("evidence", `${principal}\0${event.id}`),
+						source: "zulip",
+						kind: permanent.kind,
+						detail: { eventId: String(event.id) },
+					});
+					await taskSink.advanceCheckpoint?.(principal, "zulip", { eventId: event.id });
+					lastEventId = event.id;
+					continue;
+				}
+				// Do not acknowledge this queue event by advancing last_event_id.
+				// The next long poll replays it ahead of all later events.
+				log(`event ${event.id} acceptance failed: ${errorMessage(error)}`);
+				await retryDelay(retryMs, signal);
+				break;
+			}
 		}
 	}
 }
@@ -330,14 +416,14 @@ function zulipLongPoll(signal: AbortSignal, queue: ZulipQueue): ZulipLongPoll {
 	};
 }
 
-function emitZulipMention(
-	event: ZulipEvent,
-	botId: number,
-	channelIds: ReadonlySet<number>,
-	onEvent: (event: ChannelEvent) => void,
-): void {
-	const mention = zulipMentionEvent(event, botId, channelIds);
-	if (mention) onEvent(mention);
+function zulipConversationKey(message: ZulipMessage): string {
+	if (isChannelMessage(message)) {
+		return sourceIdentifier("conversation", `${message.stream_id}\0${message.subject ?? ""}`);
+	}
+	const recipients = Array.isArray(message.display_recipient)
+		? message.display_recipient.map((recipient) => recipient.id).sort((a, b) => a - b)
+		: [message.sender_id];
+	return sourceIdentifier("conversation", recipients.join("\0"));
 }
 
 async function deleteZulipQueue(api: ZulipApi, queueId: string): Promise<void> {

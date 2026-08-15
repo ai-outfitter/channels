@@ -566,24 +566,18 @@ test("a uid outside the conservative charset falls back to the generic summary",
 		"calendar alert",
 	]);
 	assert.deepEqual(await summariesOf([calendarAlert(ACCOUNT_ID, 42)]), ["calendar alert"]);
-	// Every rejected uid gets the same constant key, deliberately: with no uid the
-	// source cannot tell two alerts apart, and one honest "a calendar alert fired"
-	// entry beats minting keys that claim a distinction it cannot make.
-	assert.deepEqual(
-		(await streamEvents([calendarAlert(ACCOUNT_ID, "task\n123")])).map((event) => event.dedupeKey),
-		["calendar-alert"],
-	);
-	// So two *distinct* rejected alerts coalesce onto that one queue entry. Pinned
-	// rather than incidental: this is the accepted cost of not trusting the uid.
+	// Rejected values stay out of trusted summaries but retain distinct hashed
+	// identities, so one malformed alert cannot suppress every later occurrence.
+	const malformedKey = (await streamEvents([calendarAlert(ACCOUNT_ID, "task\n123")]))[0]?.dedupeKey;
+	assert.match(malformedKey ?? "", /^calendar-alert:[a-f0-9]{40}$/);
 	const events = await streamEvents([
 		calendarAlert(ACCOUNT_ID, "task\n123"),
 		calendarAlert(ACCOUNT_ID, "x".repeat(500)),
 	]);
-	assert.deepEqual(events, [
-		{ channel: "jmap", summary: "calendar alert", dedupeKey: "calendar-alert" },
-		{ channel: "jmap", summary: "calendar alert", dedupeKey: "calendar-alert" },
-	]);
-	assert.equal(new Set(events.map((event) => event.dedupeKey)).size, 1, "one queue entry");
+	assert.equal(events.length, 2);
+	assert.notEqual(events[0]?.dedupeKey, events[1]?.dedupeKey);
+	assert.ok(events.every((event) => event.summary === "calendar alert"));
+	assert.equal(new Set(events.map((event) => event.dedupeKey)).size, 2, "distinct queue entries");
 });
 
 test("an Email StateChange never uses the removed generic wake", async () => {

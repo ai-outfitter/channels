@@ -7,6 +7,12 @@
  * the session later through channel_read.
  */
 import { WebSocket } from "undici";
+import {
+	contentDigest,
+	permanentIntakeFailure,
+	sourceIdentifier,
+} from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import type {
 	ChannelActions,
 	ChannelContextMessage,
@@ -15,7 +21,7 @@ import type {
 	ChannelRespondResult,
 	ChannelSource,
 } from "./types.ts";
-import { parseList, RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
+import { parseList, RECONNECT_DELAY_MS, retryDelay, scopedLog, supervise } from "./util.ts";
 
 const log = scopedLog("mattermost");
 const STRUCTURAL_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -101,6 +107,7 @@ export function mattermostConfigFromEnv(): MattermostConfig | undefined {
 export function createMattermostActions(
 	cfg: MattermostConfig,
 	api: MattermostApi = createMattermostApi(cfg),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelActions {
 	let botId: Promise<string> | undefined;
 	const getBotId = (): Promise<string> => {
@@ -149,25 +156,55 @@ export function createMattermostActions(
 			assertAllowedChannel(decoded, cfg.channelIds);
 			const [ownId, target] = await Promise.all([getBotId(), api.getPost(decoded.postId)]);
 			assertMatchingPost(target, decoded);
-			const posted = await api.createPost({
-				channel_id: decoded.channelId,
-				message: response,
-				root_id: decoded.rootId ?? decoded.postId,
-			});
-			if (!STRUCTURAL_ID.test(posted.id))
-				throw new Error("Mattermost returned no response post id");
+			if (!taskSink?.taskForLocator || !taskSink.deliver) {
+				throw new Error("Mattermost task delivery is not configured");
+			}
+			const taskId = await taskSink.taskForLocator("mattermost", locator);
+			const responseId = await taskSink.deliver(
+				{
+					taskId,
+					source: "mattermost",
+					operationId: `reply:${locator}`,
+					payloadDigest: contentDigest(response),
+					recovery: "ambiguous",
+				},
+				async () => {
+					const posted = await api.createPost({
+						channel_id: decoded.channelId,
+						message: response,
+						root_id: decoded.rootId ?? decoded.postId,
+					});
+					if (!STRUCTURAL_ID.test(posted.id)) {
+						throw new Error("Mattermost returned no response post id");
+					}
+					return posted.id;
+				},
+			);
+			if (!responseId) throw new Error("Mattermost returned no response post id");
 			const replied = {
 				channel: "mattermost",
 				locator,
 				replied: true,
-				responseId: posted.id,
+				responseId,
 			} as const;
 			try {
-				await api.addReaction({
-					user_id: ownId,
-					post_id: decoded.postId,
-					emoji_name: DONE_EMOJI,
-				});
+				await taskSink.deliver(
+					{
+						taskId,
+						source: "mattermost",
+						operationId: `handled:${locator}`,
+						payloadDigest: contentDigest(DONE_EMOJI),
+						recovery: "idempotent",
+					},
+					async () => {
+						await api.addReaction({
+							user_id: ownId,
+							post_id: decoded.postId,
+							emoji_name: DONE_EMOJI,
+						});
+						return decoded.postId;
+					},
+				);
 				return { ...replied, handled: true };
 			} catch (error) {
 				if (isAlreadyReacted(error)) return { ...replied, handled: true };
@@ -186,16 +223,18 @@ export function createMattermostSource(
 	socketFactory: MattermostSocketFactory = defaultSocketFactory,
 	retryMs: number = RECONNECT_DELAY_MS,
 	api: MattermostApi = createMattermostApi(cfg),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelSource {
+	if (!taskSink) throw new Error("Mattermost task sink is required");
 	return {
-		async start(onEvent) {
+		async start() {
 			return supervise(
 				async (signal) => {
 					const user = await api.me();
 					if (!STRUCTURAL_ID.test(user.id)) {
 						throw new Error("Mattermost returned an invalid bot id");
 					}
-					await runMattermostAttempt(cfg, socketFactory, signal, user.id, onEvent);
+					await runMattermostAttempt(cfg, socketFactory, signal, user.id, taskSink, retryMs);
 				},
 				log,
 				retryMs,
@@ -255,12 +294,14 @@ async function runMattermostAttempt(
 	socketFactory: MattermostSocketFactory,
 	signal: AbortSignal,
 	botId: string,
-	onEvent: (event: ChannelEvent) => void,
+	taskSink: SourceTaskActivationSink,
+	retryMs: number,
 ): Promise<void> {
 	const socket = socketFactory(websocketUrl(cfg.baseUrl));
 	await new Promise<void>((resolve, reject) => {
 		let settled = false;
 		let authenticated = false;
+		let intake = Promise.resolve();
 		const finish = (error?: Error): void => {
 			if (settled) return;
 			settled = true;
@@ -286,15 +327,64 @@ async function runMattermostAttempt(
 			);
 		};
 		const message = (event: SocketEvent): void => {
-			void socketText(event.data)
+			intake = intake
+				.then(() => socketText(event.data))
 				.then((text) => JSON.parse(text) as unknown)
-				.then((frame) => {
+				// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep authentication, exact intake, and checkpoint ordering on the serialized frame path
+				.then(async (frame) => {
 					if (!authenticated) {
 						authenticated = assertMattermostAuthentication(frame);
 						return;
 					}
 					const mention = mattermostMentionEvent(frame, botId, cfg.channelIds);
-					if (mention) onEvent(mention);
+					if (mention?.locator) {
+						const decoded = decodeMattermostLocator(mention.locator.key);
+						const principal = sourceIdentifier("mattermost", `${cfg.baseUrl}\0${botId}`);
+						const input = {
+							principal,
+							source: "mattermost",
+							providerEventId: sourceIdentifier("event", decoded.postId),
+							providerDedupeKey: sourceIdentifier("event", decoded.postId),
+							nativeLocator: {
+								channelLocator: mention.locator.key,
+								channelId: decoded.channelId,
+								postId: decoded.postId,
+								...(decoded.rootId ? { rootId: decoded.rootId } : {}),
+							},
+							receivedAt: new Date().toISOString(),
+							conversationKey: sourceIdentifier(
+								"conversation",
+								`${decoded.channelId}\0${decoded.rootId ?? decoded.postId}`,
+							),
+							parts: [{ data: { channelLocator: mention.locator.key } }],
+							contentDigest: contentDigest(frame),
+						};
+						while (!signal.aborted) {
+							try {
+								await taskSink.accept(input);
+								await taskSink.advanceCheckpoint?.(principal, "mattermost", {
+									postId: decoded.postId,
+								});
+								break;
+							} catch (error) {
+								const permanent = permanentIntakeFailure(error);
+								if (permanent) {
+									await taskSink.recordEvidence?.({
+										evidenceId: sourceIdentifier("evidence", `${principal}\0${decoded.postId}`),
+										source: "mattermost",
+										kind: permanent.kind,
+										detail: { postId: decoded.postId },
+									});
+									await taskSink.advanceCheckpoint?.(principal, "mattermost", {
+										postId: decoded.postId,
+									});
+									break;
+								}
+								log(`post ${decoded.postId} acceptance failed: ${errorMessage(error)}`);
+								await retryDelay(retryMs, signal);
+							}
+						}
+					}
 				})
 				.catch((error) => {
 					socket.close(4002, "invalid frame");
