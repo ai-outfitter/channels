@@ -30,6 +30,13 @@ export interface ActivationWoken {
 	readonly wokenAt: string;
 }
 
+export interface ActivationWakeDelivered {
+	readonly kind: "WAKE_DELIVERED";
+	readonly activationId: string;
+	readonly delivery: number;
+	readonly deliveredAt: string;
+}
+
 export interface ActivationWakeFailed {
 	readonly kind: "WAKE_FAILED";
 	readonly activationId: string;
@@ -49,6 +56,7 @@ export type ActivationJournalRecord =
 	| ActivationClaim
 	| ActivationAccepted
 	| ActivationWoken
+	| ActivationWakeDelivered
 	| ActivationWakeFailed
 	| ActivationQuarantined;
 
@@ -66,6 +74,7 @@ export class ActivationJournal {
 	#claimsByActivationId = new Map<string, ActivationClaim>();
 	#accepted = new Set<string>();
 	#woken = new Set<string>();
+	#wakeDeliveries = new Map<string, number>();
 	#wakeFailed = new Set<string>();
 	#quarantined = new Set<string>();
 	#initialized: Promise<void> | undefined;
@@ -99,6 +108,10 @@ export class ActivationJournal {
 
 	isWoken(activationId: string): boolean {
 		return this.#woken.has(activationId);
+	}
+
+	wakeDeliveries(activationId: string): number {
+		return this.#wakeDeliveries.get(activationId) ?? 0;
 	}
 
 	isWakeFailed(activationId: string): boolean {
@@ -220,6 +233,7 @@ export class ActivationJournal {
 		this.#claimsByActivationId.clear();
 		this.#accepted.clear();
 		this.#woken.clear();
+		this.#wakeDeliveries.clear();
 		this.#wakeFailed.clear();
 		this.#quarantined.clear();
 	}
@@ -233,6 +247,11 @@ export class ActivationJournal {
 			this.#accepted.add(record.activationId);
 		} else if (record.kind === "WOKEN") {
 			this.#woken.add(record.activationId);
+		} else if (record.kind === "WAKE_DELIVERED") {
+			this.#wakeDeliveries.set(
+				record.activationId,
+				Math.max(record.delivery, this.#wakeDeliveries.get(record.activationId) ?? 0),
+			);
 		} else if (record.kind === "WAKE_FAILED") {
 			this.#wakeFailed.add(record.activationId);
 		} else {

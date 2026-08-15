@@ -23,6 +23,7 @@ import type { NativeActivation, SourceTaskActivationSink } from "../extensions/t
 import {
 	DurableWakeQueue,
 	MAX_PENDING_WAKES,
+	MAX_WAKE_DELIVERIES,
 	taskWakePrompt,
 } from "../extensions/task-plane/wake-queue.ts";
 
@@ -42,6 +43,14 @@ function activation(key: string, overrides: Partial<NativeActivation> = {}): Nat
 		contentDigest: digest(`payload ${key}`),
 		...overrides,
 	};
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt += 1) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error("condition was not met");
 }
 
 async function fixture(
@@ -783,10 +792,11 @@ it("offers FIFO wakes only after ACCEPTED is durable and skips canceled queued w
 	const claims = journal.claims();
 	queue.enqueue(claims[0] as (typeof claims)[number]);
 	queue.enqueue(claims[1] as (typeof claims)[number]);
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => prompts.length === 1);
 	assert.equal(prompts.length, 1);
 	await queue.beforeAgentStart(prompts[0] as string);
 	assert.equal(await queue.hasAuthority(one.taskId), true);
+	await tasks.updateStatus("source:user", one.taskId, { state: "TASK_STATE_COMPLETED" });
 	await tasks.updateStatus("source:user", two.taskId, { state: "TASK_STATE_CANCELED" });
 	queue.agentEnd();
 	for (
@@ -812,25 +822,27 @@ it("re-offers an unclaimed wake after an unrelated agent turn ends", async () =>
 		journal,
 	);
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => prompts.length === 1);
 	await queue.beforeAgentStart("an unrelated prompt");
 	queue.agentEnd();
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => prompts.length === 2);
 	assert.equal(prompts.length, 2);
 	assert.equal(prompts[0], prompts[1]);
 	await queue.beforeAgentStart(prompts[1] as string);
 	assert.equal(await queue.hasAuthority(accepted.taskId), true);
 });
 
-it("re-offers a wake when starting its agent turn fails", async () => {
+it("retries when the delivery-time Task transition fails", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-start-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
 	const accepted = await plane.accept(activation("wake-start-failure"));
 	const prompts: string[] = [];
+	const logs: Readonly<Record<string, unknown>>[] = [];
 	const queue = new DurableWakeQueue(
 		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
 		tasks,
 		journal,
+		(record) => logs.push(record),
 	);
 	const updateStatus = tasks.updateStatus.bind(tasks);
 	let failOnce = true;
@@ -842,23 +854,22 @@ it("re-offers a wake when starting its agent turn fails", async () => {
 		return updateStatus(principal, taskId, status);
 	};
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setImmediate(resolve));
-	await assert.rejects(queue.beforeAgentStart(prompts[0] as string), /could not start/);
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(prompts.length, 2);
-	await queue.beforeAgentStart(prompts[1] as string);
+	await waitFor(() => prompts.length === 1);
+	assert.ok(logs.some((record) => record.event === "a2a_wake_pump_failed"));
 	assert.equal(await queue.hasAuthority(accepted.taskId), true);
 });
 
-it("re-offers a wake when recording its consumption fails", async () => {
+it("retries when recording delivery-time wake consumption fails", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-consume-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
 	const accepted = await plane.accept(activation("wake-consume-failure"));
 	const prompts: string[] = [];
+	const logs: Readonly<Record<string, unknown>>[] = [];
 	const queue = new DurableWakeQueue(
 		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
 		tasks,
 		journal,
+		(record) => logs.push(record),
 	);
 	const append = journal.append.bind(journal);
 	let failOnce = true;
@@ -870,13 +881,46 @@ it("re-offers a wake when recording its consumption fails", async () => {
 		return append(record, afterAppend);
 	};
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setImmediate(resolve));
-	await assert.rejects(queue.beforeAgentStart(prompts[0] as string), /simulated journal failure/);
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(prompts.length, 2);
-	assert.equal(await queue.hasAuthority(accepted.taskId), false);
-	await queue.beforeAgentStart(prompts[1] as string);
+	await waitFor(() => prompts.length === 1);
+	assert.ok(logs.some((record) => record.event === "a2a_wake_pump_failed"));
 	assert.equal(await queue.hasAuthority(accepted.taskId), true);
+});
+
+it("grants authority at delivery and treats before_agent_start as idempotent confirmation", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-delivery-authority-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("delivery-authority"));
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	const prompts: string[] = [];
+	const updateStatus = tasks.updateStatus.bind(tasks);
+	let workingTransitions = 0;
+	tasks.updateStatus = async (principal, taskId, status) => {
+		if (status.state === "TASK_STATE_WORKING") workingTransitions += 1;
+		return updateStatus(principal, taskId, status);
+	};
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	queue.enqueue(claim);
+	await waitFor(() => prompts.length === 1);
+	assert.equal(await queue.hasAuthority(accepted.taskId), true);
+	assert.equal(workingTransitions, 1);
+	await queue.beforeAgentStart(prompts[0] as string);
+	assert.equal(await queue.hasAuthority(accepted.taskId), true);
+	assert.equal(workingTransitions, 1);
+	const records = (await readFile(join(root, "activation.v1.jsonl"), "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line).record as { kind: string; activationId: string });
+	assert.equal(
+		records.filter(
+			(record) => record.kind === "WOKEN" && record.activationId === claim.activationId,
+		).length,
+		1,
+	);
+	queue.stop();
 });
 
 it("re-offers exactly once after a crash following WOKEN for a non-terminal Task", async () => {
@@ -890,7 +934,7 @@ it("re-offers exactly once after a crash following WOKEN for a non-terminal Task
 		journal,
 	);
 	firstQueue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => firstPrompts.length === 1);
 	await firstQueue.beforeAgentStart(firstPrompts[0] as string);
 	assert.equal(journal.isWoken(journal.claims()[0]?.activationId ?? ""), true);
 	assert.equal(await firstQueue.hasAuthority(accepted.taskId), true);
@@ -904,7 +948,7 @@ it("re-offers exactly once after a crash following WOKEN for a non-terminal Task
 	);
 	await recoveredQueue.replay();
 	await recoveredQueue.replay();
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => recoveredPrompts.length === 1);
 	assert.deepEqual(recoveredPrompts, [taskWakePrompt(accepted.taskId)]);
 	recoveredQueue.stop();
 });
@@ -1060,11 +1104,18 @@ it("terminal replay claims do not consume the pending-wake bound", async () => {
 					},
 				};
 			},
-		} as A2aTaskStore,
+			async updateStatus(_principal: string, taskId: string) {
+				return {
+					id: taskId,
+					contextId: "context",
+					status: { state: "TASK_STATE_WORKING", timestamp: new Date().toISOString() },
+				};
+			},
+		} as unknown as A2aTaskStore,
 		journal,
 	);
 	await queue.replay();
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => prompts.length === 1);
 	assert.deepEqual(prompts, [taskWakePrompt(liveTaskId)]);
 	assert.equal(journal.isWakeFailed(liveClaim.activationId), false);
 	queue.stop();
@@ -1104,6 +1155,61 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	assert.equal(attempts, 3);
 	queue.stop();
+});
+
+it("caps unsettled wake deliveries durably and permits a fresh provider event", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-delivery-cap-"));
+	const storePath = join(root, "tasks.json");
+	const prompts: string[] = [];
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	let runtime = await startChannelsRuntime(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		{
+			storePath,
+			agentInterface: "https://agent.example.test",
+			sources: [],
+			log: (r) => logs.push(r),
+		},
+	);
+	const accepted = await runtime.sourceSink.accept(activation("delivery-cap"));
+	for (let delivery = 1; delivery <= MAX_WAKE_DELIVERIES; delivery += 1) {
+		await waitFor(() => prompts.length === delivery);
+		assert.equal(await runtime.wakeQueue.hasAuthority(accepted.taskId), true);
+		runtime.wakeQueue.agentEnd();
+	}
+	await waitFor(() => logs.some((record) => record.event === "a2a_wake_abandoned"));
+	assert.equal(prompts.length, MAX_WAKE_DELIVERIES);
+	const journalPath = join(root, "activation-journal.v1.jsonl");
+	const records = (await readFile(journalPath, "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line).record as { kind: string });
+	assert.equal(records.filter((record) => record.kind === "WAKE_DELIVERED").length, 5);
+	assert.equal(records.filter((record) => record.kind === "WOKEN").length, 1);
+	assert.equal(records.filter((record) => record.kind === "WAKE_FAILED").length, 1);
+	const evidence = JSON.parse(
+		await readFile(join(root, "activation-evidence.v1.json"), "utf8"),
+	) as { records: Array<{ recordType: string; error?: string }> };
+	assert.ok(
+		evidence.records.some(
+			(record) =>
+				record.recordType === "activation.unhealthy" && record.error?.includes("delivery cap"),
+		),
+	);
+	await runtime.close();
+
+	const recoveredPrompts: string[] = [];
+	runtime = await startChannelsRuntime(
+		{ sendUserMessage: async (prompt: string) => recoveredPrompts.push(prompt) },
+		{ storePath, agentInterface: "https://agent.example.test", sources: [] },
+	);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(recoveredPrompts, [], "startup must not resurrect an over-cap activation");
+	const fresh = await runtime.sourceSink.accept(activation("delivery-cap-recovery"));
+	await waitFor(() => recoveredPrompts.length === 1);
+	assert.notEqual(fresh.taskId, accepted.taskId);
+	assert.equal(await runtime.wakeQueue.hasAuthority(fresh.taskId), true);
+	await runtime.close();
 });
 
 it("bounds the pending wake set and records durable overflow evidence", async () => {
@@ -1295,7 +1401,7 @@ it("does not replay durable wakes until every runtime source has started", async
 		{ storePath, agentInterface: "https://agent.example.test", sources: [] },
 	);
 	await first.sink.accept(activation("runtime-replay"));
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => firstPrompts.length === 1);
 	assert.equal(firstPrompts.length, 1);
 	await first.close();
 
@@ -1324,7 +1430,7 @@ it("does not replay durable wakes until every runtime source has started", async
 	assert.equal(replayedPrompts.length, 0);
 	releaseSource();
 	const restarted = await startup;
-	await new Promise((resolve) => setImmediate(resolve));
+	await waitFor(() => replayedPrompts.length === 1);
 	assert.equal(replayedPrompts.length, 1);
 	await restarted.close();
 });
@@ -1449,15 +1555,18 @@ it("resolves real journal locators only while the active turn owns their Task", 
 			nativeLocator: { channelLocator: locator },
 		}),
 	);
-	await new Promise((resolve) => setImmediate(resolve));
-	await assert.rejects(runtime.sourceSink.taskForLocator("chatto", locator), /not authorized/);
+	await waitFor(() => prompts.length === 1);
 	assert.equal(prompts.length, 1);
+	assert.equal(await runtime.sourceSink.taskForLocator("chatto", locator), accepted.taskId);
 	await runtime.wakeQueue.beforeAgentStart(prompts[0] as string);
 	assert.equal(await runtime.sourceSink.taskForLocator("chatto", locator), accepted.taskId);
 	await assert.rejects(
 		runtime.sourceSink.taskForLocator("chatto", "chatto:v1:foreign"),
 		/not authorized/,
 	);
+	await runtime.taskPlane.taskStore.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_COMPLETED",
+	});
 	runtime.wakeQueue.agentEnd();
 	await assert.rejects(runtime.sourceSink.taskForLocator("chatto", locator), /not authorized/);
 	await runtime.close();
@@ -1925,16 +2034,12 @@ it("claims A2A inbound work before the queue wakes and grants Task authority", a
 			},
 			task.id,
 		);
-		for (let attempt = 0; prompts.length === 0 && attempt < 100; attempt += 1) {
-			await new Promise((resolve) => setImmediate(resolve));
-		}
+		await waitFor(() => prompts.length === 1);
 		assert.equal(accepted.taskId, task.id);
 		assert.deepEqual(prompts, [taskWakePrompt(task.id)]);
 		const journal = await readFile(join(root, "activation-journal.v1.jsonl"), "utf8");
 		assert.match(journal, /"kind":"CLAIM"/);
 		assert.match(journal, /"source":"a2a"/);
-		assert.equal(await runtime.wakeQueue.hasAuthority(task.id), false);
-		await runtime.wakeQueue.beforeAgentStart(prompts[0] ?? "");
 		assert.equal(await runtime.wakeQueue.hasAuthority(task.id), true);
 	} finally {
 		await runtime.close();

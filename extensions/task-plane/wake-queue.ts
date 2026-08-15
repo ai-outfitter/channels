@@ -12,6 +12,7 @@ interface PendingWake {
 
 const MAX_WAKE_ATTEMPTS = 3;
 const WAKE_RETRY_BASE_MS = 10;
+export const MAX_WAKE_DELIVERIES = 5;
 export const MAX_PENDING_WAKES = 128;
 
 export class DurableWakeQueue {
@@ -19,6 +20,7 @@ export class DurableWakeQueue {
 	readonly #tasks: A2aTaskStore;
 	readonly #journal: ActivationJournal;
 	readonly #log: (record: Readonly<Record<string, unknown>>) => void;
+	readonly #recordUnhealthy: (claim: ActivationClaim, error: string) => Promise<void>;
 	#pending: PendingWake[] = [];
 	#offered: PendingWake | undefined;
 	#activeTaskId: string | undefined;
@@ -32,11 +34,13 @@ export class DurableWakeQueue {
 		tasks: A2aTaskStore,
 		journal: ActivationJournal,
 		log: (record: Readonly<Record<string, unknown>>) => void = () => {},
+		recordUnhealthy: (claim: ActivationClaim, error: string) => Promise<void> = async () => {},
 	) {
 		this.#pi = pi;
 		this.#tasks = tasks;
 		this.#journal = journal;
 		this.#log = log;
+		this.#recordUnhealthy = recordUnhealthy;
 	}
 
 	async replay(): Promise<void> {
@@ -101,41 +105,10 @@ export class DurableWakeQueue {
 
 	async beforeAgentStart(prompt: string): Promise<void> {
 		const wake = this.#offered;
-		if (!wake || wake.prompt !== prompt) return;
-		this.#offered = undefined;
-		try {
-			const stored = await this.#tasks.lookup(wake.claim.taskId);
-			if (!stored || isTerminal(stored.task.status.state)) {
-				await this.#consumeSettled(wake.claim);
-				return;
-			}
-			try {
-				const preservingInterruptedState =
-					INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
-					this.#journal.isWoken(wake.claim.activationId) &&
-					!this.#hasLaterAcceptedClaim(wake.claim);
-				if (!preservingInterruptedState) {
-					await this.#tasks.updateStatus(stored.principal, stored.task.id, {
-						state: "TASK_STATE_WORKING",
-					});
-				}
-			} catch {
-				// Cancellation can win between lookup and transition. Re-read before
-				// granting authority; terminal work is consumed without a turn.
-				const current = await this.#tasks.lookup(wake.claim.taskId);
-				if (!current || isTerminal(current.task.status.state)) {
-					await this.#consumeSettled(wake.claim);
-					return;
-				}
-				throw new Error(`task "${wake.claim.taskId}" could not start`);
-			}
-			await this.#markConsumed(wake.claim);
-			this.#activeTaskId = wake.claim.taskId;
-		} catch (error) {
-			this.#restore(wake);
-			void this.#pump();
-			throw error;
-		}
+		// Pi does not necessarily fire this hook for a follow-up drained by an
+		// already-running agent loop. Delivery owns the transition and authority;
+		// when the hook does fire it only confirms the correlation.
+		if (!wake || wake.prompt !== prompt || this.#activeTaskId !== wake.claim.taskId) return;
 	}
 
 	#hasLaterAcceptedClaim(claim: ActivationClaim): boolean {
@@ -157,14 +130,12 @@ export class DurableWakeQueue {
 	}
 
 	agentEnd(): void {
+		const wake = this.#offered;
 		this.#activeTaskId = undefined;
-		// A follow-up can be accepted by Pi while another turn streams without a
-		// matching before_agent_start callback. Do not let that stale correlation
-		// wedge every later wake: put the unclaimed offer back and try it again.
-		if (this.#offered) {
-			this.#pending.unshift(this.#offered);
-			this.#offered = undefined;
-		}
+		this.#offered = undefined;
+		// A delivered wake whose turn did not settle the Task is eligible for a
+		// bounded re-offer. The pump checks terminal state before enforcing the cap.
+		if (wake) this.#pending.unshift(wake);
 		void this.#pump();
 	}
 
@@ -206,13 +177,21 @@ export class DurableWakeQueue {
 				await this.#markConsumed(wake.claim);
 				return;
 			}
+			const deliveries = this.#journal.wakeDeliveries(wake.claim.activationId);
+			if (deliveries >= MAX_WAKE_DELIVERIES) {
+				await this.#failDeliveryCap(wake.claim, deliveries);
+				return;
+			}
+			if (!(await this.#grant(wake, stored))) return;
 			this.#offered = wake;
+			this.#activeTaskId = wake.claim.taskId;
 			try {
 				await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
 				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
 			} catch (error) {
 				this.#offered = undefined;
+				this.#activeTaskId = undefined;
 				wake.attempts += 1;
 				const message = errorMessage(error);
 				this.#log({
@@ -270,13 +249,66 @@ export class DurableWakeQueue {
 		if (
 			this.#stopped ||
 			this.#journal.isWakeFailed(wake.claim.activationId) ||
-			this.#journal.isWoken(wake.claim.activationId) ||
 			this.#offered?.claim.activationId === wake.claim.activationId ||
 			this.#pending.some((pending) => pending.claim.activationId === wake.claim.activationId)
 		) {
 			return;
 		}
 		this.#pending.unshift(wake);
+	}
+
+	async #grant(
+		wake: PendingWake,
+		stored: NonNullable<Awaited<ReturnType<A2aTaskStore["lookup"]>>>,
+	): Promise<boolean> {
+		try {
+			const preservingInterruptedState =
+				INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
+				this.#journal.isWoken(wake.claim.activationId) &&
+				!this.#hasLaterAcceptedClaim(wake.claim);
+			if (!preservingInterruptedState) {
+				await this.#tasks.updateStatus(stored.principal, stored.task.id, {
+					state: "TASK_STATE_WORKING",
+				});
+			}
+		} catch {
+			// Cancellation can win between lookup and transition. Re-read before
+			// granting authority; terminal work is consumed without a turn.
+			const current = await this.#tasks.lookup(wake.claim.taskId);
+			if (!current || isTerminal(current.task.status.state)) {
+				await this.#consumeSettled(wake.claim);
+				return false;
+			}
+			throw new Error(`task "${wake.claim.taskId}" could not start`);
+		}
+		await this.#markConsumed(wake.claim);
+		const delivery = this.#journal.wakeDeliveries(wake.claim.activationId) + 1;
+		await this.#journal.append({
+			kind: "WAKE_DELIVERED",
+			activationId: wake.claim.activationId,
+			delivery,
+			deliveredAt: new Date().toISOString(),
+		});
+		return true;
+	}
+
+	async #failDeliveryCap(claim: ActivationClaim, deliveries: number): Promise<void> {
+		const error = `wake delivery cap ${MAX_WAKE_DELIVERIES} reached without Task settlement`;
+		await this.#recordUnhealthy(claim, error);
+		await this.#journal.append({
+			kind: "WAKE_FAILED",
+			activationId: claim.activationId,
+			attempts: deliveries,
+			error,
+			failedAt: new Date().toISOString(),
+		});
+		this.#log({
+			event: "a2a_wake_abandoned",
+			taskId: claim.taskId,
+			activationId: claim.activationId,
+			attempts: deliveries,
+			error,
+		});
 	}
 
 	/** Retire a wake whose Task is gone or terminal, then look for the next one. */
