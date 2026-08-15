@@ -89,11 +89,17 @@ hooks, queue, and trust boundary remain unchanged. Add the source's row to
 the [source conformance matrix](./a2a-source-conformance.md).
 
 - **`jmap`** (`extensions/sources/jmap.ts`) — JMAP EventSource (SSE, RFC 8620
-  §7.3) on Stalwart; watches the account's `Email` `StateChange` and emits a
-  trusted `new mail` event. It also wakes on JMAP `CalendarAlert` pushes when a
+  §7.3) on Stalwart; reconciles the account's `Email` `StateChange` into exact
+  INBOX email Tasks. Each activation carries an opaque locator in both its
+  native identity and history data. `channel_read` performs one bounded
+  `Email/get` for that ID, and `channel_respond` replies through
+  `EmailSubmission/set` with a deterministic delivery header; exact-header
+  lookup excludes drafts, and a retry reuses a matching draft when creation
+  succeeded before submission failed. Reply response IDs consistently identify
+  the outbound email. Neither action scans the inbox. It also wakes on JMAP
+  `CalendarAlert` pushes when a
   calendar event's alarm fires, allowing scheduled and recurring tasks
-  to be plain calendar events. Reads **no** mail or calendar-event bodies; the
-  `mail` skill (`xin`) does the mail fetch/reply/move. EventSource push is
+  to be plain calendar events. Calendar-event bodies are not read. EventSource push is
   at-most-once: an alert that fires while the source is disconnected is lost,
   so if a missed wake means a missed task, give the event an EMAIL
   alarm as well — that message persists in the mailbox and still fires a
