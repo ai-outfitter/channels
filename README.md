@@ -10,6 +10,19 @@ The wake is a trusted, body-free ping ("there's new activity on `github`").
 Wake prompts contain no message content. For exact items, `channel_read` returns
 fetched content inside explicit untrusted-content markers.
 
+## Versioning
+
+Channels is alpha software. The `v1.x` series is an accident of the initial
+release-please configuration, not a semantic-versioning stability contract.
+Breaking changes to wake prompts, source behavior, environment variables, and
+other profile-facing surfaces can land in any release; those changes are
+recorded in the release notes. Downstream profiles and skills should pin an
+exact revision and adopt new releases deliberately.
+
+Release-please owns version bumps, so contributors should not edit the version
+in `package.json` by hand. When Channels declares stability, this section will
+instead define the surfaces covered by the version number.
+
 ## Install
 
 Install it into pi like any other package (pi loads the raw TypeScript via jiti —

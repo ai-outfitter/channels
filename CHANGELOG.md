@@ -2,13 +2,30 @@
 
 ## Unreleased
 
-- A2A remains enabled by `A2A_SERVER` when native channels are disabled, and no
-  longer requires `A2A_STORE_PATH`. Legacy standalone A2A task files are not
-  merged automatically; complete or export active tasks and retain the old file
-  as an audit archive before upgrading.
-- Explicit `OUTFITTER_CHANNELS` selection now starts transactionally: any selected
-  source failure rolls back all selected sources and reports unhealthy. Automatic
-  detection keeps the 1.7 log-and-skip behavior.
+- **All channel profiles and skills:** Every channel source now sends a
+  Task-scoped wake prompt instead of the 1.7 channel-and-locator wake. Update any
+  profile or skill that matches or parses the old wake text.
+- **GitHub operators:** `GITHUB_NOTIFY_MARK_READ` is retired. Channels ignores a
+  set value and logs one warning at startup. GitHub notifications are now marked
+  read after their exact revision has been durably accepted by the task plane.
+- **Chatto operators:** Channels now dismisses a notification after durable Task
+  acceptance, rather than waiting until after the reply.
+- **JMAP operators:** Email wakes are now limited to mail that enters INBOX,
+  whether newly delivered or moved there. Other Email state changes, including
+  flag changes and mail filed outside INBOX, do not create new Tasks.
+- **Operators with explicit source selection:** An explicit `OUTFITTER_CHANNELS`
+  selection is transactional. If any named source cannot start, no selected
+  source remains running and the runtime reports unhealthy. Auto-detection still
+  logs and skips an individual source that fails to start.
+- **A2A/task-plane operators:** `A2A_STORE_PATH` is no longer required or read for
+  the task store. Tasks created by an earlier release in that file are not
+  migrated; complete or export active Tasks and retain the old file as an audit
+  archive before upgrading.
+- **Runtime operators:** The task-plane store now lives at
+  `${XDG_DATA_HOME:-$HOME/.local/share}/outfitter/channels/task-plane`.
+- **Pi package consumers:** The published package now has one Pi entrypoint,
+  `./extensions/runtime-extension.ts`. Remove assumptions that the former
+  extension entrypoints load independently.
 
 ## [1.7.0](https://github.com/ai-outfitter/channels/compare/v1.6.1...v1.7.0) (2026-08-13)
 
