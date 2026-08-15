@@ -1,10 +1,12 @@
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { A2aTaskStore } from "../a2a/store.ts";
+import { isTerminal } from "../a2a/types.ts";
 import { errorMessage } from "../sources/util.ts";
 import { ActivationJournal } from "./journal.ts";
 import { OriginStore } from "./origins.ts";
 import { createTaskPlane, type TaskPlane } from "./plane.ts";
+import { derivedId } from "./serialize.ts";
 import {
 	ActivationEvidenceStore,
 	ContextStore,
@@ -35,6 +37,7 @@ export interface RuntimeDependencies {
 }
 
 export interface RunningChannelsRuntime {
+	readonly healthy: boolean;
 	readonly taskPlane: TaskPlane;
 	/** Trusted callers may select an explicit taskId through this interface. */
 	readonly sink: TaskActivationSink;
@@ -93,6 +96,7 @@ export async function startChannelsRuntime(
 	const stops: Array<() => Promise<void>> = [];
 	const buffered: Array<() => void> = [];
 	let intakeOpen = false;
+	let listenerHealthy = true;
 	const guardedSink: TaskActivationSink = {
 		accept: async (input) => {
 			if (!intakeOpen) throw new Error("channels intake is not ready");
@@ -110,6 +114,117 @@ export async function startChannelsRuntime(
 				throw new Error("native source continuation cannot select an explicit taskId");
 			}
 			return guardedSink.continue(input);
+		},
+		checkpoint: (principal, source) => checkpoints.get(principal, source),
+		advanceCheckpoint: (principal, source, checkpoint) =>
+			checkpoints.advance(principal, source, checkpoint),
+		async taskForLocator(source, locator) {
+			const claim = [...journal.claims()]
+				.reverse()
+				.find(
+					(entry) =>
+						entry.input.source === source && entry.input.nativeLocator.channelLocator === locator,
+				);
+			if (!claim || !(await wakeQueue.hasAuthority(claim.taskId))) {
+				throw new Error("channel locator is not authorized for the active Task");
+			}
+			return claim.taskId;
+		},
+		async taskIsTerminal(taskId) {
+			const stored = await tasks.lookup(taskId);
+			if (!stored) throw new Error(`task "${taskId}" was not found`);
+			return isTerminal(stored.task.status.state);
+		},
+		recordEvidence: (input) => evidence.appendSource(input),
+		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep every durable delivery transition visible in one state machine
+		async deliver(input, send, reconcile) {
+			const deliveryId = derivedId(
+				"delivery",
+				`${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
+			);
+			let delivery = await deliveries.get(deliveryId);
+			if (delivery?.state === "delivered") return delivery.providerResponseId;
+			if (delivery?.state === "ambiguous") {
+				log({
+					event: "channels_unhealthy",
+					source: input.source,
+					taskId: input.taskId,
+					deliveryId,
+				});
+				throw new Error("outbound delivery is ambiguous");
+			}
+			if (delivery?.state === "sending") {
+				if (delivery.recovery === "lookup" && reconcile) {
+					const recovered = await reconcile();
+					if (recovered) {
+						await deliveries.put({
+							...delivery,
+							state: "delivered",
+							providerResponseId: recovered,
+							updatedAt: new Date().toISOString(),
+						});
+						return recovered;
+					}
+				} else if (delivery.recovery === "ambiguous") {
+					const message = "provider result could not be reconciled after restart";
+					await deliveries.put({
+						...delivery,
+						state: "ambiguous",
+						updatedAt: new Date().toISOString(),
+						error: message,
+					});
+					await evidence.appendUnhealthy(
+						derivedId("delivery", deliveryId),
+						input.taskId,
+						input.source,
+						message,
+					);
+					log({
+						event: "channels_unhealthy",
+						source: input.source,
+						taskId: input.taskId,
+						deliveryId,
+						error: message,
+					});
+					throw new Error("outbound delivery became ambiguous after restart");
+				}
+			}
+			delivery ??= { ...input, deliveryId, state: "prepared", updatedAt: new Date().toISOString() };
+			await deliveries.put({ ...delivery, state: "sending", updatedAt: new Date().toISOString() });
+			try {
+				const providerResponseId = await send();
+				await deliveries.put({
+					...delivery,
+					state: "delivered",
+					...(providerResponseId ? { providerResponseId } : {}),
+					updatedAt: new Date().toISOString(),
+				});
+				return providerResponseId;
+			} catch (error) {
+				const ambiguous = input.recovery === "ambiguous" && !isDeterminateProviderRejection(error);
+				await deliveries.put({
+					...delivery,
+					state: ambiguous ? "ambiguous" : "failed",
+					updatedAt: new Date().toISOString(),
+					error: errorMessage(error),
+				});
+				if (ambiguous) {
+					await evidence.appendUnhealthy(
+						derivedId("delivery", deliveryId),
+						input.taskId,
+						input.source,
+						errorMessage(error),
+					);
+					log({
+						event: "channels_unhealthy",
+						source: input.source,
+						taskId: input.taskId,
+						deliveryId,
+						error: errorMessage(error),
+					});
+				}
+				throw error;
+			}
 		},
 	};
 	try {
@@ -136,7 +251,15 @@ export async function startChannelsRuntime(
 		const failed = sourceResults.find((result) => result.status === "rejected");
 		if (failed?.status === "rejected") throw failed.reason;
 		// 6. External A2A is provider configuration, not local-plane config.
-		if (dependencies.listener) stops.push(await dependencies.listener.start(taskPlane));
+		if (dependencies.listener) {
+			try {
+				stops.push(await dependencies.listener.start(taskPlane));
+			} catch (error) {
+				listenerHealthy = false;
+				log({ event: "listener_start_failed", error: errorMessage(error) });
+				log({ event: "channels_unhealthy", error: errorMessage(error) });
+			}
+		}
 		intakeOpen = true;
 		for (const report of buffered) report();
 		// Pending durable wakes are not offered until the complete runtime has
@@ -152,6 +275,7 @@ export async function startChannelsRuntime(
 	}
 
 	return {
+		healthy: listenerHealthy,
 		taskPlane,
 		sink: guardedSink,
 		sourceSink,
@@ -164,4 +288,27 @@ export async function startChannelsRuntime(
 			wakeQueue.stop();
 		},
 	};
+}
+
+/** A provider response that definitively refused the operation is safe to retry. */
+function isDeterminateProviderRejection(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const value = error as {
+		status?: unknown;
+		statusCode?: unknown;
+		code?: unknown;
+		response?: { status?: unknown };
+		data?: { error?: unknown };
+	};
+	const status = [value.status, value.statusCode, value.response?.status].find(
+		(candidate): candidate is number => typeof candidate === "number",
+	);
+	if (status !== undefined) return status >= 400 && status < 500;
+	// Connect codes that mean the server reached a definite policy/domain
+	// decision. Deadline, canceled, unknown, internal, unavailable, and data-loss
+	// do not prove whether the provider committed the operation.
+	if (typeof value.code === "number")
+		return [3, 5, 6, 7, 8, 9, 10, 11, 12, 16].includes(value.code);
+	// Slack's platform error is an HTTP 200 response with a provider error code.
+	return value.code === "slack_webapi_platform_error" && typeof value.data?.error === "string";
 }

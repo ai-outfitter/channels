@@ -9,6 +9,9 @@
 import { createPromiseClient, type PromiseClient, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { WebSocket } from "undici";
+import { A2aError } from "../a2a/types.ts";
+import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
+import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import { MessageService } from "../vendor/chatto/chatto/api/v1/messages_connect.js";
 import { NotificationService } from "../vendor/chatto/chatto/api/v1/notifications_connect.js";
 import type { NotificationItem } from "../vendor/chatto/chatto/api/v1/notifications_pb.js";
@@ -118,13 +121,15 @@ export function chattoConfigFromEnv(): ChattoConfig | undefined {
 export function createChattoActions(
 	cfg: ChattoConfig,
 	api: ChattoApi = createConnectChattoApi(cfg),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelActions {
 	return {
 		async read(locator): Promise<ChannelReadResult> {
 			const decoded = decodeChattoLocator(locator);
 			assertAllowedRoom(decoded, cfg.roomIds);
+			const taskForLocator = taskSink?.taskForLocator?.bind(taskSink);
 			const notification = await api.getNotification(decoded.notificationId);
-			if (!notification) {
+			if (!notification && !taskForLocator) {
 				return {
 					channel: "chatto",
 					locator,
@@ -132,7 +137,10 @@ export function createChattoActions(
 					messages: [],
 				};
 			}
-			assertMatchingMention(notification, decoded);
+			if (notification) assertMatchingMention(notification, decoded);
+			const taskId = taskForLocator ? await taskForLocator("chatto", locator) : undefined;
+			const handled =
+				taskId && taskSink?.taskIsTerminal ? await taskSink.taskIsTerminal(taskId) : false;
 			const page = decoded.threadRootEventId
 				? await api.getThreadContext({
 						...decoded,
@@ -146,7 +154,7 @@ export function createChattoActions(
 			return {
 				channel: "chatto",
 				locator,
-				handled: false,
+				handled,
 				messages,
 			};
 		},
@@ -155,9 +163,29 @@ export function createChattoActions(
 			const decoded = decodeChattoLocator(locator);
 			assertAllowedRoom(decoded, cfg.roomIds);
 			const notification = await api.getNotification(decoded.notificationId);
-			if (!notification) throw new Error("Chatto notification is already handled");
-			assertMatchingMention(notification, decoded);
-			const responseId = await api.createReply(decoded, response);
+			if (notification) assertMatchingMention(notification, decoded);
+			else if (!taskSink?.taskForLocator) throw new Error("Chatto notification is already handled");
+			const taskForLocator = taskSink?.taskForLocator?.bind(taskSink);
+			const deliver = taskSink?.deliver?.bind(taskSink);
+			let activeTaskId: string | undefined;
+			const responseId =
+				taskForLocator && deliver
+					? await (async () => {
+							const taskId = await taskForLocator("chatto", locator);
+							activeTaskId = taskId;
+							return deliver(
+								{
+									taskId,
+									source: "chatto",
+									operationId: `reply:${locator}`,
+									payloadDigest: contentDigest(response),
+									recovery: "ambiguous",
+								},
+								() => api.createReply(decoded, response),
+							);
+						})()
+					: await api.createReply(decoded, response);
+			if (!responseId) throw new Error("Chatto returned no response message id");
 			const replied = {
 				channel: "chatto",
 				locator,
@@ -165,7 +193,24 @@ export function createChattoActions(
 				responseId,
 			} as const;
 			try {
-				await api.dismiss(decoded.notificationId);
+				if (activeTaskId && deliver) {
+					await deliver(
+						{
+							taskId: activeTaskId,
+							source: "chatto",
+							operationId: `dismiss:${decoded.notificationId}`,
+							payloadDigest: contentDigest({
+								notificationId: decoded.notificationId,
+								dismissed: true,
+							}),
+							recovery: "idempotent",
+						},
+						async () => {
+							await api.dismiss(decoded.notificationId);
+							return decoded.notificationId;
+						},
+					);
+				} else await api.dismiss(decoded.notificationId);
 				return { ...replied, handled: true };
 			} catch (error) {
 				return {
@@ -183,6 +228,7 @@ export function createChattoSource(
 	socketFactory: ChattoSocketFactory = defaultSocketFactory,
 	retryMs: number = RECONNECT_DELAY_MS,
 	api: ChattoApi = createConnectChattoApi(cfg),
+	taskSink?: SourceTaskActivationSink,
 ): ChannelSource {
 	let resumeCursor: string | undefined;
 	const emittedNotificationIds = new Set<string>();
@@ -191,17 +237,26 @@ export function createChattoSource(
 			return supervise(
 				async (signal) => {
 					const viewerId = await api.viewerId();
+					const principal = sourceIdentifier("chatto", viewerId);
+					const checkpoint = taskSink?.checkpoint
+						? await taskSink.checkpoint<{ cursor: string }>(principal, "chatto")
+						: undefined;
+					resumeCursor = checkpoint?.cursor ?? resumeCursor;
 					await runChattoAttempt(
 						cfg,
 						socketFactory,
 						signal,
 						viewerId,
 						resumeCursor,
-						(cursor) => {
+						async (cursor) => {
 							resumeCursor = cursor;
+							await taskSink?.advanceCheckpoint?.(principal, "chatto", { cursor });
 						},
 						emittedNotificationIds,
-						onEvent,
+						async (event) => {
+							if (!taskSink) return onEvent(event);
+							return acceptChattoEvent(taskSink, principal, api, event);
+						},
 					);
 				},
 				log,
@@ -209,6 +264,97 @@ export function createChattoSource(
 			);
 		},
 	};
+}
+
+async function acceptChattoEvent(
+	taskSink: SourceTaskActivationSink,
+	principal: string,
+	api: ChattoApi,
+	event: ChannelEvent,
+): Promise<boolean> {
+	const locator = event.locator?.key;
+	if (!locator) return false;
+	const decoded = decodeChattoLocator(locator);
+	let acceptance: Awaited<ReturnType<SourceTaskActivationSink["accept"]>>;
+	try {
+		acceptance = await taskSink.accept({
+			principal,
+			source: "chatto",
+			providerEventId: sourceIdentifier("event", decoded.notificationId),
+			providerDedupeKey: sourceIdentifier("event", decoded.notificationId),
+			nativeLocator: {
+				notificationId: decoded.notificationId,
+				roomId: decoded.roomId,
+				messageId: decoded.messageEventId,
+				threadRootId: decoded.threadRootEventId ?? decoded.messageEventId,
+				channelLocator: locator,
+			},
+			receivedAt: new Date().toISOString(),
+			conversationKey: sourceIdentifier(
+				"conversation",
+				`${decoded.roomId}\0${decoded.threadRootEventId ?? decoded.messageEventId}`,
+			),
+			parts: [{ data: { channelLocator: locator } }],
+			contentDigest: contentDigest(decoded),
+		});
+	} catch (error) {
+		if (!(error instanceof A2aError) || error.reason !== "DUPLICATE_MESSAGE_ID") throw error;
+		await recordPermanentChattoProjection(
+			taskSink,
+			decoded.notificationId,
+			"duplicate-notification-payload",
+			error,
+		);
+		return true;
+	}
+	const dismiss = async (): Promise<string> => {
+		try {
+			await api.dismiss(decoded.notificationId);
+		} catch (error) {
+			if (connectErrorCode(error) !== "not_found") throw error;
+			await recordPermanentChattoProjection(
+				taskSink,
+				decoded.notificationId,
+				"notification-already-dismissed",
+				error,
+			);
+		}
+		return decoded.notificationId;
+	};
+	if (taskSink.deliver) {
+		await taskSink.deliver(
+			{
+				taskId: acceptance.taskId,
+				source: "chatto",
+				operationId: `dismiss:${decoded.notificationId}`,
+				payloadDigest: contentDigest({
+					notificationId: decoded.notificationId,
+					dismissed: true,
+				}),
+				recovery: "idempotent",
+			},
+			dismiss,
+		);
+	} else await dismiss();
+	return true;
+}
+
+async function recordPermanentChattoProjection(
+	taskSink: SourceTaskActivationSink,
+	notificationId: string,
+	reason: string,
+	error: unknown,
+): Promise<void> {
+	await taskSink.recordEvidence?.({
+		evidenceId: sourceIdentifier(
+			"evidence",
+			`${notificationId}\0${reason}\0${errorMessage(error)}`,
+		),
+		source: "chatto",
+		kind: "permanent-projection-error",
+		detail: { notificationId, reason, error: errorMessage(error) },
+	});
+	log(`advancing past permanent projection error for ${notificationId}: ${reason}`);
 }
 
 export function mentionNotificationEvent(
@@ -254,9 +400,9 @@ async function runChattoAttempt(
 	signal: AbortSignal,
 	viewerId: string,
 	resumeCursor: string | undefined,
-	onCursor: (cursor: string) => void,
+	onCursor: (cursor: string) => Promise<void>,
 	emittedNotificationIds: Set<string>,
-	onEvent: (event: ChannelEvent) => void,
+	onEvent: (event: ChannelEvent) => unknown | Promise<unknown>,
 ): Promise<void> {
 	const socket = socketFactory(realtimeUrl(cfg.baseUrl));
 	socket.binaryType = "arraybuffer";
@@ -264,6 +410,7 @@ async function runChattoAttempt(
 	await new Promise<void>((resolve, reject) => {
 		let settled = false;
 		let heartbeatTimer: NodeJS.Timeout | undefined;
+		let frames: Promise<void> = Promise.resolve();
 		const state = { subscribed: false, heartbeatMs: 75_000 };
 
 		const finish = (error?: Error): void => {
@@ -286,7 +433,10 @@ async function runChattoAttempt(
 		};
 		const abort = (): void => {
 			socket.close(1000, "shutdown");
-			finish();
+			void frames.then(
+				() => finish(),
+				(error) => finish(error as Error),
+			);
 		};
 		const open = (): void => {
 			socket.send(
@@ -303,24 +453,31 @@ async function runChattoAttempt(
 			resetHeartbeat();
 		};
 		const message = (event: ChattoSocketEvent): void => {
-			void handleChattoMessage(event.data, {
-				cfg,
-				socket,
-				state,
-				viewerId,
-				resumeCursor,
-				onCursor,
-				emittedNotificationIds,
-				onEvent,
-				resetHeartbeat,
-			}).catch((error) => {
+			frames = frames.then(() =>
+				handleChattoMessage(event.data, {
+					cfg,
+					socket,
+					state,
+					viewerId,
+					resumeCursor,
+					onCursor,
+					emittedNotificationIds,
+					onEvent,
+					resetHeartbeat,
+				}),
+			);
+			void frames.catch((error) => {
 				socket.close(4002, "invalid frame");
 				finish(error instanceof Error ? error : new Error(String(error)));
 			});
 		};
 		const close = (event: ChattoSocketEvent): void => {
-			if (signal.aborted || event.code === 1000) finish();
-			else finish(new Error(`Chatto realtime socket closed (${event.code ?? "unknown"})`));
+			if (signal.aborted || event.code === 1000) {
+				void frames.then(
+					() => finish(),
+					(error) => finish(error as Error),
+				);
+			} else finish(new Error(`Chatto realtime socket closed (${event.code ?? "unknown"})`));
 		};
 		const socketError = (): void => {
 			finish(new Error("Chatto realtime socket failed"));
@@ -341,19 +498,22 @@ interface ChattoFrameContext {
 	state: { subscribed: boolean; heartbeatMs: number };
 	viewerId: string;
 	resumeCursor: string | undefined;
-	onCursor(cursor: string): void;
+	onCursor(cursor: string): Promise<void>;
 	emittedNotificationIds: Set<string>;
-	onEvent(event: ChannelEvent): unknown;
+	onEvent(event: ChannelEvent): unknown | Promise<unknown>;
 	resetHeartbeat(): void;
 }
 
 async function handleChattoMessage(data: unknown, context: ChattoFrameContext): Promise<void> {
 	const frame = RealtimeServerFrame.fromBinary(await messageBytes(data));
 	context.resetHeartbeat();
-	handleChattoFrame(frame, context);
+	await handleChattoFrame(frame, context);
 }
 
-function handleChattoFrame(frame: RealtimeServerFrame, context: ChattoFrameContext): void {
+async function handleChattoFrame(
+	frame: RealtimeServerFrame,
+	context: ChattoFrameContext,
+): Promise<void> {
 	switch (frame.frame.case) {
 		case "hello":
 			handleChattoHello(frame.frame.value, context);
@@ -362,10 +522,10 @@ function handleChattoFrame(frame: RealtimeServerFrame, context: ChattoFrameConte
 			context.state.subscribed = true;
 			return;
 		case "projectionEvent":
-			handleChattoProjection(frame.frame.value, context);
+			await handleChattoProjection(frame.frame.value, context);
 			return;
 		case "caughtUp":
-			if (frame.frame.value.cursor) context.onCursor(frame.frame.value.cursor);
+			if (frame.frame.value.cursor) await context.onCursor(frame.frame.value.cursor);
 			return;
 		case "error":
 			handleChattoError(frame.frame.value);
@@ -395,28 +555,28 @@ function handleChattoHello(hello: RealtimeServerHello, context: ChattoFrameConte
 	);
 }
 
-function handleChattoProjection(
+async function handleChattoProjection(
 	projection: RealtimeProjectionEvent,
 	context: ChattoFrameContext,
-): void {
+): Promise<void> {
 	if (!context.state.subscribed) throw new Error("Chatto projected events before subscription");
 	for (const operation of projection.operations) {
 		if (operation.operation.case !== "notificationsReplace") continue;
-		handleNotificationReplacement(operation.operation.value, context);
+		await handleNotificationReplacement(operation.operation.value, context);
 	}
-	if (projection.resumeCursor) context.onCursor(projection.resumeCursor);
+	if (projection.resumeCursor) await context.onCursor(projection.resumeCursor);
 }
 
-function handleNotificationReplacement(
+async function handleNotificationReplacement(
 	replacement: RealtimeProjectionNotificationsReplace,
 	context: ChattoFrameContext,
-): void {
+): Promise<void> {
 	const notifications = replacement.page?.notifications ?? [];
 	const currentIds = new Set(notifications.map((notification) => notification.id));
 	for (const notification of notifications) {
 		if (context.emittedNotificationIds.has(notification.id)) continue;
 		const mention = mentionNotificationEvent(notification, context.viewerId, context.cfg.roomIds);
-		if (mention && context.onEvent(mention) === false) currentIds.delete(notification.id);
+		if (mention && (await context.onEvent(mention)) === false) currentIds.delete(notification.id);
 	}
 	context.emittedNotificationIds.clear();
 	for (const id of currentIds) context.emittedNotificationIds.add(id);

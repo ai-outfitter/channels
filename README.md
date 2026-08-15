@@ -245,7 +245,6 @@ act on them.
   export GITHUB_NOTIFY_FILTERS="review_requested,assigned_issue,assigned_pr,author"  # optional; this is the default
   export GITHUB_NOTIFY_POLL_MS="60000" # optional; a floor — GitHub's X-Poll-Interval may raise it
   export GITHUB_API_URL="https://api.github.com"  # optional; for GHES, or derived from GITHUB_SERVER_URL
-  export GITHUB_NOTIFY_MARK_READ="0"   # optional; default off — see below
   ```
 
   | Filter | Wakes on |
@@ -257,16 +256,12 @@ act on them.
   | `mention` | you were @-mentioned |
   | `comment`, `subscribed`, `state_change`, `ci_activity` | as named |
 
-  > **Leave `GITHUB_NOTIFY_MARK_READ` off if the agent reads its own
-  > notifications.** Marking a thread read in the same poll that emits the wake
-  > removes the item the woken agent then goes looking for, and it concludes it
-  > has no work. Let the agent mark the thread read after it acts.
-
-  A wake from this channel carries **no locator**: it reports only *that* work
-  exists, never *what*, because issue and PR titles are attacker-controlled text.
-  Find the work by querying your own assignments (`gh search issues --assignee
-  @me --state open`), not by reading the notification list — a thread that was
-  already marked read is invisible there, but the assignment is not.
+  `GITHUB_NOTIFY_MARK_READ` is retired. If it is set, Channels ignores it and
+  logs one startup warning. Task-plane intake accepts the exact notification
+  revision durably and then marks that notification read. The woken Task carries
+  the exact repository, subject kind, and number; do not scan assignments or the
+  notification inbox during the turn. See the
+  [GitHub acknowledgment migration note](docs/a2a-source-conformance.md#migration-note-github-acknowledgment).
 
 ### Slack — `slack`
 

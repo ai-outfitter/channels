@@ -33,6 +33,7 @@ import {
 } from "../extensions/sources/slack-config.ts";
 import type { ChannelActions, ChannelEvent, ChannelSource } from "../extensions/sources/types.ts";
 import { supervise } from "../extensions/sources/util.ts";
+import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
 test("local Slack preflight defaults to channels the bot has joined", () => {
 	assert.deepEqual(
@@ -279,6 +280,166 @@ test("Slack source authenticates, acknowledges mentions, emits, and disconnects"
 
 	await stop();
 	assert.equal(socket.disconnected, true);
+});
+
+test("Slack thread replies create new Tasks and duplicate provider events keep one identity", async () => {
+	const socket = new FakeSocket();
+	const activations: NativeActivation[] = [];
+	const tasks = new Map<string, string>();
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			activations.push(input);
+			const taskId = tasks.get(input.providerDedupeKey) ?? `task-${tasks.size + 1}`;
+			tasks.set(input.providerDedupeKey, taskId);
+			return {
+				activationId: `activation-${taskId}`,
+				taskId,
+				contextId: "context-thread",
+				disposition:
+					activations.filter((item) => item.providerDedupeKey === input.providerDedupeKey).length >
+					1
+						? "duplicate"
+						: "created",
+			};
+		},
+		async continue() {
+			throw new Error("Slack must not continue a Task");
+		},
+	};
+	const source = createSlackSource(
+		{ appToken: "xapp-test", botToken: "xoxb-test", channelIds: new Set() },
+		{
+			socket: () => fakeSocketClient(socket),
+			web: () => fakeWebClient({ auth: { test: async () => ({ ok: true, user_id: "UBOT" }) } }),
+		},
+		0,
+		sink,
+	);
+	const legacy: ChannelEvent[] = [];
+	const stop = await source.start((event) => legacy.push(event));
+	await waitFor(() => socket.started);
+	const emit = (eventId: string, ts: string) =>
+		socket.emit("slack_event", {
+			ack: async () => {},
+			type: "events_api",
+			body: {
+				event_id: eventId,
+				team_id: "TWORKSPACE",
+				event: {
+					type: "app_mention",
+					channel: "C0123ABCD",
+					ts,
+					thread_ts: "1721840000.000001",
+					text: "untrusted mention",
+				},
+			},
+		});
+	emit("Ev-one", "1721840001.000001");
+	emit("Ev-two", "1721840002.000001");
+	emit("Ev-two", "1721840002.000001");
+	await waitFor(() => activations.length === 3);
+	await stop();
+	assert.equal(legacy.length, 0);
+	assert.equal(new Set(activations.map((item) => item.providerDedupeKey)).size, 2);
+	assert.equal(new Set(activations.map((item) => item.conversationKey)).size, 1);
+	assert.equal(tasks.size, 2, "the thread reply is a new Task; redelivery returns the prior Task");
+	assert.ok(activations.every((item) => item.parts.some((part) => part.data)));
+});
+
+test("Slack leaves a failed acceptance unacked and a redelivery acks after durable acceptance", async () => {
+	const socket = new FakeSocket();
+	const order: string[] = [];
+	let attempts = 0;
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			attempts += 1;
+			order.push(`accept:${attempts}`);
+			if (attempts === 1) throw new Error("journal unavailable");
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+	};
+	const source = createSlackSource(
+		{ appToken: "xapp-test", botToken: "xoxb-test", channelIds: new Set() },
+		{
+			socket: () => fakeSocketClient(socket),
+			web: () => fakeWebClient({ auth: { test: async () => ({ ok: true, user_id: "UBOT" }) } }),
+		},
+		0,
+		sink,
+	);
+	const stop = await source.start(() => {});
+	await waitFor(() => socket.started);
+	const envelope = () => ({
+		ack: async () => order.push("ack"),
+		type: "events_api",
+		body: {
+			event_id: "Ev-redelivered",
+			team_id: "TWORKSPACE",
+			event: {
+				type: "app_mention",
+				channel: "C0123ABCD",
+				ts: "1721840001.000001",
+				text: "investigate",
+			},
+		},
+	});
+	socket.emit("slack_event", envelope());
+	await waitFor(() => attempts === 1);
+	assert.deepEqual(order, ["accept:1"]);
+	socket.emit("slack_event", envelope());
+	await waitFor(() => order.includes("ack"));
+	assert.deepEqual(order, ["accept:1", "accept:2", "ack"]);
+	await stop();
+});
+
+test("Slack records and acknowledges a permanently malformed work envelope", async () => {
+	const socket = new FakeSocket();
+	const evidence: Array<{ kind: string; detail?: Readonly<Record<string, string>> }> = [];
+	let acknowledgements = 0;
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			throw new Error("malformed work must not reach acceptance");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async recordEvidence(input) {
+			evidence.push(input);
+		},
+	};
+	const source = createSlackSource(
+		{ appToken: "xapp-test", botToken: "xoxb-test", channelIds: new Set() },
+		{
+			socket: () => fakeSocketClient(socket),
+			web: () => fakeWebClient({ auth: { test: async () => ({ ok: true, user_id: "UBOT" }) } }),
+		},
+		0,
+		sink,
+	);
+	const stop = await source.start(() => {});
+	await waitFor(() => socket.started);
+	socket.emit("slack_event", {
+		ack: async () => {
+			acknowledgements += 1;
+		},
+		type: "events_api",
+		body: {
+			event: {
+				type: "app_mention",
+				channel: "C0123ABCD",
+				ts: "1721840001.000001",
+				text: "missing durable provider identity",
+			},
+		},
+	});
+	await waitFor(() => acknowledgements === 1);
+	assert.equal(evidence.length, 1);
+	assert.equal(evidence[0]?.kind, "malformed-envelope");
+	assert.match(evidence[0]?.detail?.reason ?? "", /missing event_id or workspace/);
+	await stop();
 });
 
 test("Slack acknowledges subscribed non-mention envelopes without emitting work", async () => {

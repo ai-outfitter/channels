@@ -31,6 +31,7 @@ export interface TaskPlaneDependencies {
 }
 
 export interface TaskPlane extends TaskActivationSink {
+	readonly taskStore: A2aTaskStore;
 	beginNew(principal: string, contextId: string): ReturnType<A2aTaskStore["beginNew"]>;
 	replayIncomplete(): Promise<void>;
 	recordReplyAnchor(
@@ -156,6 +157,7 @@ export function createTaskPlane(dependencies: TaskPlaneDependencies): TaskPlane 
 		});
 
 	const plane: TaskPlane = {
+		taskStore: dependencies.tasks,
 		accept: (input) => submit(input),
 		async continue(input: NativeContinuation) {
 			if (input.taskId) {
@@ -271,7 +273,11 @@ function validateActivation(input: NativeActivation): void {
 	if (locatorFields.length === 0) throw new Error("nativeLocator is required");
 	for (const [field, value] of locatorFields) {
 		validateIdentifier(field, "nativeLocator field");
-		validateIdentifier(value, `nativeLocator.${field}`);
+		if (typeof value !== "string" || value.length === 0 || value.length > 4096) {
+			throw new Error(
+				`nativeLocator.${field} must be a non-empty string of at most 4096 characters`,
+			);
+		}
 	}
 	if (input.parts.length === 0) throw new Error("activation parts are required");
 }

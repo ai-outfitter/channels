@@ -3,6 +3,7 @@ import test from "node:test";
 import channelEventsExtension, { MAX_SIGNAL_ENTRIES_PER_WAKE } from "../extensions/index.ts";
 import { createJmapSource } from "../extensions/sources/jmap.ts";
 import type { ChannelEvent, ChannelSource } from "../extensions/sources/types.ts";
+import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
 const ACCOUNT_ID = "account-1";
 const CALENDARS_ACCOUNT_ID = "calendars-1";
@@ -24,9 +25,13 @@ const STATE_CHANGE = JSON.stringify({
 	changed: { [ACCOUNT_ID]: { Email: "state-2" } },
 });
 
-function sessionResponse(url: string): Response {
+function sessionResponse(url: string, maxObjectsInGet = 256): Response {
 	const response = Response.json({
+		apiUrl: "https://jmap.example/api/{accountId}",
 		eventSourceUrl: "https://jmap.example/events?types={types}&closeafter={closeafter}&ping={ping}",
+		capabilities: {
+			"urn:ietf:params:jmap:core": { maxObjectsInGet },
+		},
 		primaryAccounts: {
 			"urn:ietf:params:jmap:mail": ACCOUNT_ID,
 			"urn:ietf:params:jmap:calendars": CALENDARS_ACCOUNT_ID,
@@ -98,6 +103,456 @@ test("a calendarAlert frame wakes with the event uid", async () => {
 		]),
 		["calendar alert"],
 	);
+});
+
+test("JMAP restart resumes Email/changes and accepts each exact email before checkpoint", async () => {
+	const originalFetch = globalThis.fetch;
+	let checkpoint: { state: string } | undefined = { state: "state-1" };
+	const accepted: NativeActivation[] = [];
+	const order: string[] = [];
+	const sinceStates: string[] = [];
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			accepted.push(input);
+			order.push(`accept:${input.nativeLocator.emailId}`);
+			return {
+				activationId: `activation-${input.nativeLocator.emailId}`,
+				taskId: `task-${input.nativeLocator.emailId}`,
+				contextId: "mail-thread",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T | undefined;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { state: string };
+			order.push(`checkpoint:${checkpoint.state}`);
+		},
+	};
+	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: the protocol fixture keeps each JMAP method response beside the assertion that consumes it
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) return sessionResponse(url);
+		if (init?.method === "POST") {
+			const request = JSON.parse(String(init.body)) as {
+				methodCalls: [[string, Record<string, unknown>, string]];
+			};
+			const [method, args] = request.methodCalls[0];
+			if (method === "Mailbox/get") {
+				return Response.json({
+					methodResponses: [[method, { list: [{ id: "inbox", role: "inbox" }] }, "c1"]],
+				});
+			}
+			if (method === "Email/changes") {
+				const sinceState = String(args.sinceState);
+				sinceStates.push(sinceState);
+				const suffix = sinceState === "state-1" ? "1" : "2";
+				return Response.json({
+					methodResponses: [
+						[
+							method,
+							{
+								oldState: sinceState,
+								newState: `state-${Number(suffix) + 1}`,
+								created: [`email-${suffix}`],
+							},
+							"c1",
+						],
+					],
+				});
+			}
+			const suffix = checkpoint?.state === "state-1" ? "1" : "2";
+			return Response.json({
+				methodResponses: [
+					[
+						method,
+						{
+							state: checkpoint?.state,
+							list: [
+								{ id: `email-${suffix}`, threadId: "thread/one", mailboxIds: { inbox: true } },
+							],
+						},
+						"c1",
+					],
+				],
+			});
+		}
+		return sseResponse([]);
+	}) as typeof fetch;
+	try {
+		for (const expected of [1, 2]) {
+			const source = createJmapSource(CONFIG, 1000, sink);
+			const stop = await source.start(() => {});
+			try {
+				await waitFor(() => accepted.length === expected);
+			} finally {
+				await stop();
+			}
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+	assert.deepEqual(sinceStates.slice(0, 2), ["state-1", "state-2"]);
+	assert.deepEqual(order, [
+		"accept:email-1",
+		"checkpoint:state-2",
+		"accept:email-2",
+		"checkpoint:state-3",
+	]);
+	assert.deepEqual(
+		accepted.map((input) => [input.nativeLocator.accountId, input.nativeLocator.emailId]),
+		[
+			[ACCOUNT_ID, "email-1"],
+			[ACCOUNT_ID, "email-2"],
+		],
+	);
+});
+
+test("JMAP updated mail creates one Task only when it newly enters INBOX", async () => {
+	const originalFetch = globalThis.fetch;
+	const acceptanceAttempts: string[] = [];
+	const tasks = new Map<string, string>([["old-inbox", "task-old-inbox"]]);
+	let checkpoint = { state: "state-1" };
+	const requestedIds: string[][] = [];
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			const emailId = input.nativeLocator.emailId ?? "";
+			acceptanceAttempts.push(emailId);
+			const priorTaskId = tasks.get(emailId);
+			if (priorTaskId) {
+				return {
+					activationId: `activation-${emailId}`,
+					taskId: priorTaskId,
+					contextId: "c",
+					disposition: "duplicate",
+				};
+			}
+			const taskId = `task-${emailId}`;
+			tasks.set(emailId, taskId);
+			return {
+				activationId: `activation-${emailId}`,
+				taskId,
+				contextId: "c",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { state: string };
+		},
+	};
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) return sessionResponse(url);
+		if (init?.method !== "POST") return sseResponse([]);
+		const request = JSON.parse(String(init.body)) as {
+			methodCalls: [[string, Record<string, unknown>, string]];
+		};
+		const [method, args] = request.methodCalls[0];
+		if (method === "Mailbox/get")
+			return Response.json({
+				methodResponses: [[method, { list: [{ id: "inbox", role: "inbox" }] }, "c1"]],
+			});
+		if (method === "Email/changes")
+			return Response.json({
+				methodResponses: [
+					[
+						method,
+						{
+							oldState: "state-1",
+							newState: "state-2",
+							updated: ["moved-to-inbox", "old-inbox", "moved-to-archive"],
+						},
+						"c1",
+					],
+				],
+			});
+		requestedIds.push(args.ids as string[]);
+		return Response.json({
+			methodResponses: [
+				[
+					method,
+					{
+						list: [
+							{ id: "moved-to-inbox", threadId: "thread-1", mailboxIds: { inbox: true } },
+							{ id: "old-inbox", threadId: "thread-2", mailboxIds: { inbox: true } },
+							{
+								id: "moved-to-archive",
+								threadId: "thread-3",
+								mailboxIds: { archive: true },
+							},
+						],
+					},
+					"c1",
+				],
+			],
+		});
+	}) as typeof fetch;
+	let stop: (() => Promise<void>) | undefined;
+	try {
+		stop = await createJmapSource(CONFIG, 1000, sink).start(() => {});
+		await waitFor(() => checkpoint.state === "state-2");
+	} finally {
+		await stop?.();
+		globalThis.fetch = originalFetch;
+	}
+	assert.deepEqual(requestedIds, [["moved-to-inbox", "old-inbox", "moved-to-archive"]]);
+	assert.deepEqual(acceptanceAttempts, ["moved-to-inbox", "old-inbox"]);
+	assert.deepEqual([...tasks.keys()], ["old-inbox", "moved-to-inbox"]);
+});
+
+test("JMAP chunks an Email/get backlog to the advertised server limit", async () => {
+	const originalFetch = globalThis.fetch;
+	let checkpoint = { state: "state-1" };
+	const accepted: string[] = [];
+	const requestedChunks: string[][] = [];
+	const ids = ["mail-1", "mail-2", "mail-3", "mail-4", "mail-5"];
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			accepted.push(input.nativeLocator.emailId ?? "");
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { state: string };
+		},
+	};
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) return sessionResponse(url, 2);
+		if (init?.method !== "POST") return sseResponse([]);
+		const request = JSON.parse(String(init.body)) as {
+			methodCalls: [[string, Record<string, unknown>, string]];
+		};
+		const [method, args] = request.methodCalls[0];
+		if (method === "Mailbox/get") {
+			return Response.json({
+				methodResponses: [[method, { list: [{ id: "inbox", role: "inbox" }] }, "c1"]],
+			});
+		}
+		if (method === "Email/changes") {
+			return Response.json({
+				methodResponses: [
+					[method, { oldState: "state-1", newState: "state-2", created: ids }, "c1"],
+				],
+			});
+		}
+		const chunk = args.ids as string[];
+		requestedChunks.push(chunk);
+		return Response.json({
+			methodResponses: [
+				[
+					method,
+					{
+						list: chunk.map((id) => ({
+							id,
+							threadId: `thread-${id}`,
+							mailboxIds: { inbox: true },
+						})),
+					},
+					"c1",
+				],
+			],
+		});
+	}) as typeof fetch;
+	const stop = await createJmapSource(CONFIG, 1000, sink).start(() => {});
+	try {
+		await waitFor(() => checkpoint.state === "state-2");
+	} finally {
+		await stop();
+		globalThis.fetch = originalFetch;
+	}
+	assert.deepEqual(requestedChunks, [ids.slice(0, 2), ids.slice(2, 4), ids.slice(4)]);
+	assert.deepEqual(accepted, ids);
+});
+
+test("a failing startup reconcile opens SSE and retries without a StateChange", async () => {
+	const originalFetch = globalThis.fetch;
+	let changesCalls = 0;
+	let streamOpened = false;
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return { state: "state-1" } as T;
+		},
+		async advanceCheckpoint() {},
+	};
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) return sessionResponse(url);
+		if (init?.method !== "POST") {
+			streamOpened = true;
+			return sseResponse([]);
+		}
+		const request = JSON.parse(String(init.body)) as {
+			methodCalls: [[string, Record<string, unknown>, string]];
+		};
+		const [method] = request.methodCalls[0];
+		if (method === "Mailbox/get") {
+			return Response.json({
+				methodResponses: [[method, { list: [{ id: "inbox", role: "inbox" }] }, "c1"]],
+			});
+		}
+		changesCalls += 1;
+		return new Response("temporary", { status: 503 });
+	}) as typeof fetch;
+	const stop = await createJmapSource(CONFIG, 10, sink).start(() => {});
+	try {
+		await waitFor(() => streamOpened && changesCalls >= 3);
+	} finally {
+		await stop();
+		globalThis.fetch = originalFetch;
+	}
+	assert.equal(streamOpened, true);
+	assert.equal(changesCalls >= 3, true);
+});
+
+test("JMAP resynchronizes a stale changes state through a bounded INBOX query", async () => {
+	const originalFetch = globalThis.fetch;
+	let checkpoint = { state: "stale-state" };
+	const accepted: string[] = [];
+	const evidence: Array<{ kind: string; detail?: Readonly<Record<string, string>> }> = [];
+	let queryArguments: Record<string, unknown> | undefined;
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			accepted.push(input.nativeLocator.emailId ?? "");
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { state: string };
+		},
+		async recordEvidence(input) {
+			evidence.push(input);
+		},
+	};
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) return sessionResponse(url);
+		if (init?.method !== "POST") return sseResponse([]);
+		const request = JSON.parse(String(init.body)) as {
+			methodCalls: [[string, Record<string, unknown>, string]];
+		};
+		const [method, args] = request.methodCalls[0];
+		if (method === "Mailbox/get") {
+			return Response.json({
+				methodResponses: [[method, { list: [{ id: "inbox", role: "inbox" }] }, "c1"]],
+			});
+		}
+		if (method === "Email/changes") {
+			return Response.json({
+				methodResponses: [["error", { type: "cannotCalculateChanges" }, "c1"]],
+			});
+		}
+		if (method === "Email/query") {
+			queryArguments = args;
+			return Response.json({ methodResponses: [[method, { ids: ["mail-1"] }, "c1"]] });
+		}
+		if (Array.isArray(args.ids) && args.ids.length === 0) {
+			return Response.json({ methodResponses: [[method, { state: "current-state" }, "c1"]] });
+		}
+		return Response.json({
+			methodResponses: [
+				[
+					method,
+					{ list: [{ id: "mail-1", threadId: "thread-1", mailboxIds: { inbox: true } }] },
+					"c1",
+				],
+			],
+		});
+	}) as typeof fetch;
+	const stop = await createJmapSource(CONFIG, 1000, sink).start(() => {});
+	try {
+		await waitFor(() => checkpoint.state === "current-state");
+	} finally {
+		await stop();
+		globalThis.fetch = originalFetch;
+	}
+	assert.deepEqual(accepted, ["mail-1"]);
+	assert.deepEqual(queryArguments?.filter, { inMailbox: "inbox" });
+	assert.equal(queryArguments?.limit, 100);
+	assert.equal(evidence.length, 1);
+	assert.equal(evidence[0]?.kind, "checkpoint-resync");
+	assert.equal(evidence[0]?.detail?.staleState, "stale-state");
+	assert.equal(evidence[0]?.detail?.currentState, "current-state");
+});
+
+test("a transient JMAP reconcile failure is logged and retried", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalError = console.error;
+	const logs: string[] = [];
+	console.error = (message: string) => logs.push(message);
+	let checkpoint = { state: "state-1" };
+	let changesCalls = 0;
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			throw new Error("no created mail expected");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { state: string };
+		},
+	};
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/.well-known/jmap")) return sessionResponse(url);
+		if (init?.method !== "POST")
+			return sseResponse([`data: ${STATE_CHANGE}\n\n`, `data: ${STATE_CHANGE}\n\n`]);
+		const request = JSON.parse(String(init.body)) as {
+			methodCalls: [[string, Record<string, unknown>, string]];
+		};
+		const [method] = request.methodCalls[0];
+		if (method === "Mailbox/get")
+			return Response.json({
+				methodResponses: [[method, { list: [{ id: "inbox", role: "inbox" }] }, "c1"]],
+			});
+		changesCalls += 1;
+		if (changesCalls === 2) return new Response("temporary", { status: 503 });
+		return Response.json({
+			methodResponses: [
+				[method, { oldState: checkpoint.state, newState: `state-${changesCalls + 1}` }, "c1"],
+			],
+		});
+	}) as typeof fetch;
+	const stop = await createJmapSource(CONFIG, 10, sink).start(() => {});
+	try {
+		await waitFor(() => changesCalls >= 3);
+	} finally {
+		await stop();
+		globalThis.fetch = originalFetch;
+		console.error = originalError;
+	}
+	assert.equal(changesCalls >= 3, true);
+	assert.ok(logs.some((line) => line.includes("email reconcile attempt") && line.includes("503")));
 });
 
 test("a uid outside the conservative charset falls back to the generic summary", async () => {

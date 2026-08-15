@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { A2aError } from "../extensions/a2a/types.ts";
 import {
 	type ChattoApi,
 	type ChattoConfig,
@@ -9,6 +10,7 @@ import {
 	createChattoSource,
 	mentionNotificationEvent,
 } from "../extensions/sources/chatto.ts";
+import type { SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 import { Message } from "../extensions/vendor/chatto/chatto/api/v1/message_types_pb.js";
 import {
 	ListNotificationsResponse,
@@ -153,6 +155,53 @@ test("Chatto reads dismissed notifications as handled and rejects mismatched loc
 		).read(locator),
 		/outside CHATTO_ROOM_IDS/,
 	);
+});
+
+test("Chatto reads and answers a Task after intake dismissed its notification", async () => {
+	const notification = mention("notification-1", "room-1", "message-1", "user-1");
+	const locator = mentionNotificationEvent(notification, "bot-1", new Set())?.locator?.key;
+	assert.ok(locator);
+	const replies: string[] = [];
+	const api = fakeApi({
+		notification,
+		roomPage: timeline([timelineMessage("message-1", "user-1", "hello")]),
+		onReply: () => replies.push("reply"),
+	});
+	await api.dismiss("notification-1");
+	assert.equal(await api.getNotification("notification-1"), undefined, "dismiss returns NOT_FOUND");
+	const sink: SourceTaskActivationSink = {
+		async taskIsTerminal(taskId) {
+			assert.equal(taskId, "task-1");
+			return terminal;
+		},
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async taskForLocator(source, key) {
+			assert.equal(source, "chatto");
+			assert.equal(key, locator);
+			return "task-1";
+		},
+		async deliver(_input, send) {
+			return send();
+		},
+	};
+	let terminal = false;
+	const actions = createChattoActions(config, api, sink);
+	const context = await actions.read(locator);
+	assert.equal(context.handled, false);
+	assert.equal(context.messages.find((message) => message.target)?.text, "hello");
+	terminal = true;
+	assert.equal(
+		(await actions.read(locator)).handled,
+		true,
+		"durable terminal Task state is handled",
+	);
+	assert.equal((await actions.respond(locator, "answer")).responseId, "response-1");
+	assert.deepEqual(replies, ["reply"]);
 });
 
 test("Chatto replies into the correct thread and preserves partial success", async () => {
@@ -310,6 +359,142 @@ test("Chatto source negotiates protocol v2, resumes, filters, and shuts down", a
 	assert.equal(second.closed, true);
 });
 
+test("Chatto resumes its durable cursor and dismisses only after Task acceptance", async () => {
+	const socket = new FakeSocket();
+	const order: string[] = [];
+	let checkpoint = { cursor: "cursor-old" };
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			order.push(`accept:${input.nativeLocator.notificationId}`);
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { cursor: string };
+			order.push(`checkpoint:${checkpoint.cursor}`);
+		},
+		async deliver(_input, send) {
+			order.push("delivery");
+			return send();
+		},
+	};
+	const source = createChattoSource(
+		config,
+		() => socket,
+		1000,
+		fakeApi({ viewer: "bot-1", onDismiss: () => order.push("dismiss") }),
+		sink,
+	);
+	const stop = await source.start(() => {});
+	await waitFor(() => socket.handlers.has("open"));
+	socket.emit("open", {});
+	socket.emit("message", { data: serverHello() });
+	await waitFor(() => socket.sent.length >= 2);
+	const subscribe = RealtimeClientFrame.fromBinary(socket.sent[1] ?? new Uint8Array());
+	if (subscribe.frame.case !== "subscribeEvents") throw new Error("expected subscription");
+	assert.equal(subscribe.frame.value.resumeCursor, "cursor-old");
+	socket.emit("message", {
+		data: new RealtimeServerFrame({
+			frame: { case: "subscribed", value: new RealtimeSubscribed() },
+		}).toBinary(),
+	});
+	socket.emit("message", {
+		data: notificationProjection(
+			"cursor-new",
+			mention("notification-1", "room-1", "message-1", "user-1"),
+		),
+	});
+	await waitFor(() => checkpoint.cursor === "cursor-new");
+	await stop();
+	assert.deepEqual(order, [
+		"accept:notification-1",
+		"delivery",
+		"dismiss",
+		"checkpoint:cursor-new",
+	]);
+});
+
+test("Chatto advances past already-dismissed and mutated-duplicate notifications", async () => {
+	const socket = new FakeSocket();
+	let checkpoint: { cursor: string } | undefined;
+	const evidence: Array<{ detail?: Readonly<Record<string, string>> }> = [];
+	let accepts = 0;
+	const sink: SourceTaskActivationSink = {
+		async accept() {
+			accepts += 1;
+			if (accepts === 2) {
+				throw new A2aError(
+					409,
+					"DUPLICATE_MESSAGE_ID",
+					"provider dedupe key was reused with a different activation",
+				);
+			}
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async checkpoint<T>() {
+			return checkpoint as T | undefined;
+		},
+		async advanceCheckpoint(_principal, _source, value) {
+			checkpoint = value as { cursor: string };
+		},
+		async recordEvidence(input) {
+			evidence.push(input);
+		},
+		async deliver(_input, send) {
+			return send();
+		},
+	};
+	const notFound = Object.assign(new Error("notification not found"), { code: 5 });
+	const source = createChattoSource(
+		config,
+		() => socket,
+		1000,
+		fakeApi({ viewer: "bot-1", dismissError: notFound }),
+		sink,
+	);
+	const stop = await source.start(() => {});
+	try {
+		await waitFor(() => socket.handlers.has("open"));
+		socket.emit("open", {});
+		socket.emit("message", { data: serverHello() });
+		await waitFor(() => socket.sent.length >= 2);
+		socket.emit("message", {
+			data: new RealtimeServerFrame({
+				frame: { case: "subscribed", value: new RealtimeSubscribed() },
+			}).toBinary(),
+		});
+		socket.emit("message", {
+			data: notificationProjection(
+				"cursor-dismissed",
+				mention("notification-1", "room-1", "message-1", "user-1"),
+			),
+		});
+		await waitFor(() => checkpoint?.cursor === "cursor-dismissed");
+		socket.emit("message", {
+			data: notificationProjection(
+				"cursor-duplicate",
+				mention("notification-2", "room-1", "mutated-message", "user-1"),
+			),
+		});
+		await waitFor(() => checkpoint?.cursor === "cursor-duplicate");
+		assert.equal(socket.closed, false);
+		assert.deepEqual(
+			evidence.map((entry) => entry.detail?.reason),
+			["notification-already-dismissed", "duplicate-notification-payload"],
+		);
+	} finally {
+		await stop();
+	}
+});
+
 function mention(
 	id: string,
 	roomId: string,
@@ -359,15 +544,17 @@ function fakeApi(
 		threadPage?: RoomTimelinePage;
 		onThread?: () => void;
 		onReply?: (locator: { messageEventId: string; threadRootEventId?: string }) => void;
+		onDismiss?: () => void;
 		dismissError?: Error;
 	} = {},
 ): ChattoApi {
+	let dismissed = false;
 	return {
 		async viewerId() {
 			return options.viewer ?? "bot-1";
 		},
 		async getNotification() {
-			return options.notification;
+			return dismissed ? undefined : options.notification;
 		},
 		async getRoomContext() {
 			return options.roomPage ?? timeline([]);
@@ -381,7 +568,9 @@ function fakeApi(
 			return "response-1";
 		},
 		async dismiss() {
+			options.onDismiss?.();
 			if (options.dismissError) throw options.dismissError;
+			dismissed = true;
 		},
 	};
 }

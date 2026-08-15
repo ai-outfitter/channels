@@ -10,9 +10,11 @@ import { ActivationJournal } from "../extensions/task-plane/journal.ts";
 import { OriginStore } from "../extensions/task-plane/origins.ts";
 import { createTaskPlane, type TaskPlane } from "../extensions/task-plane/plane.ts";
 import { startChannelsRuntime } from "../extensions/task-plane/runtime.ts";
+import { derivedId } from "../extensions/task-plane/serialize.ts";
 import {
 	ActivationEvidenceStore,
 	ContextStore,
+	OutboundDeliveryStore,
 	ReplyAnchorStore,
 } from "../extensions/task-plane/stores.ts";
 import type { NativeActivation, SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
@@ -71,6 +73,23 @@ async function fixture(
 }
 
 describe("durable native activation acceptance", () => {
+	it("preserves raw locator values without widening principal identifiers", async () => {
+		const root = await mkdtemp(join(tmpdir(), "channels-locator-values-"));
+		const { plane } = await fixture(root);
+		await plane.accept(
+			activation("raw-locator", {
+				nativeLocator: {
+					accountId: "person@example.test",
+					url: "https://provider.example/items/one?revision=2",
+				},
+			}),
+		);
+		await assert.rejects(
+			plane.accept(activation("bad-principal", { principal: "person@example.test" })),
+			/principal/,
+		);
+	});
+
 	for (let crashStep = 1; crashStep <= 10; crashStep += 1) {
 		it(`recovers an acceptance interrupted after step ${crashStep}`, async () => {
 			const root = await mkdtemp(join(tmpdir(), "channels-crash-"));
@@ -967,9 +986,286 @@ it("gives native sources a sink that rejects explicit taskId continuations", asy
 	await running.close();
 });
 
+it("resolves real journal locators only while the active turn owns their Task", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-real-locator-"));
+	const prompts: string[] = [];
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.taskForLocator);
+	const locator = "chatto:v1:real-journal-claim";
+	const accepted = await runtime.sourceSink.accept(
+		activation("real-locator", {
+			source: "chatto",
+			nativeLocator: { channelLocator: locator },
+		}),
+	);
+	await new Promise((resolve) => setImmediate(resolve));
+	await assert.rejects(runtime.sourceSink.taskForLocator("chatto", locator), /not authorized/);
+	assert.equal(prompts.length, 1);
+	await runtime.wakeQueue.beforeAgentStart(prompts[0] as string);
+	assert.equal(await runtime.sourceSink.taskForLocator("chatto", locator), accepted.taskId);
+	await assert.rejects(
+		runtime.sourceSink.taskForLocator("chatto", "chatto:v1:foreign"),
+		/not authorized/,
+	);
+	runtime.wakeQueue.agentEnd();
+	await assert.rejects(runtime.sourceSink.taskForLocator("chatto", locator), /not authorized/);
+	await runtime.close();
+});
+
+it("persists source evidence that is not attached to a Task", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-source-evidence-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.recordEvidence);
+	await runtime.sourceSink.recordEvidence({
+		evidenceId: "evidence-permanent-envelope",
+		source: "slack",
+		kind: "malformed-envelope",
+		detail: { reason: "missing event_id" },
+	});
+	const stored = JSON.parse(await readFile(join(root, "activation-evidence.v1.json"), "utf8")) as {
+		records: Array<Record<string, unknown>>;
+	};
+	assert.deepEqual(stored.records, [
+		{
+			evidenceId: "evidence-permanent-envelope",
+			source: "slack",
+			kind: "malformed-envelope",
+			detail: { reason: "missing event_id" },
+			recordType: "source.evidence",
+			recordedAt: stored.records[0]?.recordedAt,
+		},
+	]);
+	await runtime.close();
+});
+
+it("reconciles outbound delivery crashes before retry and fails closed after an ambiguous send", async () => {
+	for (const recovery of ["idempotent", "ambiguous"] as const) {
+		const root = await mkdtemp(join(tmpdir(), `channels-delivery-${recovery}-`));
+		const input = {
+			taskId: "task-delivery",
+			source: "github",
+			operationId: "mark-read:notification-1",
+			payloadDigest: digest("read"),
+			recovery,
+		};
+		const deliveryId = derivedId(
+			"delivery",
+			`${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
+		);
+		const store = new OutboundDeliveryStore(join(root, "outbound-deliveries.v1.json"));
+		await store.put({
+			...input,
+			deliveryId,
+			state: "sending",
+			updatedAt: new Date().toISOString(),
+		});
+		const runtime = await startChannelsRuntime(
+			{ sendUserMessage() {} },
+			{
+				storePath: join(root, "tasks.json"),
+				agentInterface: "https://agent.example.test",
+				sources: [],
+			},
+		);
+		let sends = 0;
+		if (recovery === "idempotent") {
+			assert.equal(
+				await runtime.sourceSink.deliver?.(input, async () => {
+					sends += 1;
+					return "notification-1";
+				}),
+				"notification-1",
+			);
+			assert.equal(
+				(await new OutboundDeliveryStore(store.path).get(deliveryId))?.state,
+				"delivered",
+			);
+			assert.equal(sends, 1, "an idempotent mutation is safe to retry after crash-before");
+		} else {
+			assert.ok(runtime.sourceSink.deliver);
+			await assert.rejects(
+				runtime.sourceSink.deliver(input, async () => {
+					sends += 1;
+					return "unexpected";
+				}),
+				/became ambiguous/,
+			);
+			assert.equal(
+				(await new OutboundDeliveryStore(store.path).get(deliveryId))?.state,
+				"ambiguous",
+			);
+			assert.equal(sends, 0, "crash-after with no recovery method is never retried");
+		}
+		await runtime.close();
+	}
+});
+
+it("distinguishes determinate rejection from ambiguous delivery and permits revised text", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-delivery-states-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.deliver);
+	const base = {
+		taskId: "task-delivery",
+		source: "chatto",
+		operationId: "reply:locator",
+		recovery: "idempotent" as const,
+	};
+	const first = { ...base, payloadDigest: digest("first") };
+	const firstId = derivedId(
+		"delivery",
+		`${first.taskId}\0${first.source}\0${first.operationId}\0${first.payloadDigest}`,
+	);
+	const deliveryStore = new OutboundDeliveryStore(join(root, "outbound-deliveries.v1.json"));
+	await deliveryStore.put({
+		...first,
+		deliveryId: firstId,
+		state: "failed",
+		updatedAt: new Date().toISOString(),
+		error: "rejected",
+	});
+	let sends = 0;
+	assert.equal(
+		await runtime.sourceSink.deliver(first, async () => `response-${++sends}`),
+		"response-1",
+	);
+	assert.equal(
+		await runtime.sourceSink.deliver(first, async () => `response-${++sends}`),
+		"response-1",
+	);
+	const revised = { ...base, payloadDigest: digest("revised") };
+	assert.equal(
+		await runtime.sourceSink.deliver(revised, async () => `response-${++sends}`),
+		"response-2",
+	);
+	assert.equal(sends, 2, "true duplicates short-circuit while revised text gets a new operation");
+
+	const rejected = {
+		...base,
+		operationId: "reply:rejected",
+		payloadDigest: digest("provider-rejected"),
+		recovery: "ambiguous" as const,
+	};
+	await assert.rejects(
+		runtime.sourceSink.deliver(rejected, async () => {
+			throw Object.assign(new Error("invalid request"), { status: 400 });
+		}),
+		/invalid request/,
+	);
+	const rejectedId = derivedId(
+		"delivery",
+		`${rejected.taskId}\0${rejected.source}\0${rejected.operationId}\0${rejected.payloadDigest}`,
+	);
+	assert.equal(
+		(await new OutboundDeliveryStore(deliveryStore.path).get(rejectedId))?.state,
+		"failed",
+	);
+	assert.equal(
+		await runtime.sourceSink.deliver(rejected, async () => "accepted-after-rejection"),
+		"accepted-after-rejection",
+	);
+
+	const ambiguous = {
+		...base,
+		operationId: "reply:ambiguous",
+		payloadDigest: digest("timeout"),
+		recovery: "ambiguous" as const,
+	};
+	await assert.rejects(
+		runtime.sourceSink.deliver(ambiguous, async () => {
+			throw new Error("client timeout");
+		}),
+		/client timeout/,
+	);
+	let retries = 0;
+	await assert.rejects(
+		runtime.sourceSink.deliver(ambiguous, async () => {
+			retries += 1;
+			return "duplicate";
+		}),
+		/ambiguous/,
+	);
+	assert.equal(retries, 0);
+	const ambiguousId = derivedId(
+		"delivery",
+		`${ambiguous.taskId}\0${ambiguous.source}\0${ambiguous.operationId}\0${ambiguous.payloadDigest}`,
+	);
+	assert.equal(
+		(await new OutboundDeliveryStore(deliveryStore.path).get(ambiguousId))?.state,
+		"ambiguous",
+	);
+	const reworded = { ...ambiguous, payloadDigest: digest("reworded after timeout") };
+	assert.equal(
+		await runtime.sourceSink.deliver(reworded, async () => "response-reworded"),
+		"response-reworded",
+		"production ambiguous recovery permits a distinct operation for revised text",
+	);
+	await runtime.close();
+});
+
+it("keeps sources running when the optional A2A listener cannot start", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-listener-isolation-"));
+	let sourceStopped = 0;
+	const logs: Array<Readonly<Record<string, unknown>>> = [];
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [
+				{
+					name: "native",
+					async start() {
+						return async () => {
+							sourceStopped += 1;
+						};
+					},
+				},
+			],
+			listener: {
+				async start() {
+					throw new Error("address in use");
+				},
+			},
+			log: (record) => logs.push(record),
+		},
+	);
+	assert.equal(runtime.healthy, false);
+	assert.equal(sourceStopped, 0);
+	await runtime.sink.accept(activation("after-listener-failure"));
+	assert.ok(logs.some((record) => record.event === "listener_start_failed"));
+	await runtime.close();
+	assert.equal(sourceStopped, 1);
+});
+
 it("publishes one stateless Pi entrypoint that reloads with Jiti moduleCache disabled", async () => {
 	const manifest = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8"));
 	assert.deepEqual(manifest.pi.extensions, ["./extensions/runtime-extension.ts"]);
+	assert.doesNotMatch(
+		await readFile(join(process.cwd(), "extensions", "a2a-extension.ts"), "utf8"),
+		/export default function a2aServerExtension/,
+		"the retired standalone server must not remain callable without the shared task store",
+	);
 	const { createJiti } = (await import(
 		join(
 			process.cwd(),

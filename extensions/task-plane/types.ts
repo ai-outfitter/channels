@@ -42,13 +42,45 @@ export interface TaskActivationSink {
 export interface SourceTaskActivationSink {
 	accept(input: NativeActivation): Promise<ActivationAcceptance>;
 	continue(input: NativeSourceContinuation): Promise<ActivationAcceptance>;
+	checkpoint?<T>(principal: string, source: string): Promise<T | undefined>;
+	advanceCheckpoint?<T>(principal: string, source: string, checkpoint: T): Promise<void>;
+	/** Return the active Task represented by an exact native channel locator. */
+	taskForLocator?(source: string, locator: string): Promise<string>;
+	/** Report whether a task selected through a native locator is durably terminal. */
+	taskIsTerminal?(taskId: string): Promise<boolean>;
+	/** Persist source-level evidence that does not create or belong to a Task. */
+	recordEvidence?(input: SourceEvidenceInput): Promise<void>;
+	deliver?(
+		input: OutboundDeliveryInput,
+		send: () => Promise<string | undefined>,
+		reconcile?: () => Promise<string | undefined>,
+	): Promise<string | undefined>;
+}
+
+export interface SourceEvidenceInput {
+	readonly evidenceId: string;
+	readonly source: string;
+	readonly kind: string;
+	readonly detail?: Readonly<Record<string, string>>;
 }
 
 export interface OutboundDelivery {
 	readonly deliveryId: string;
 	readonly taskId: string;
 	readonly source: string;
+	readonly operationId: string;
+	readonly payloadDigest: string;
+	readonly recovery: "idempotent" | "lookup" | "ambiguous";
 	readonly state: "prepared" | "sending" | "delivered" | "failed" | "ambiguous";
 	readonly updatedAt: string;
 	readonly providerResponseId?: string;
+	readonly error?: string;
+}
+
+export interface OutboundDeliveryInput {
+	readonly taskId: string;
+	readonly source: string;
+	readonly operationId: string;
+	readonly payloadDigest: string;
+	readonly recovery: "idempotent" | "lookup" | "ambiguous";
 }
