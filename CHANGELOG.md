@@ -52,7 +52,7 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
-## [2.0.0](https://github.com/ai-outfitter/channels/compare/v1.7.0...v2.0.0) (2026-08-16)
+## [1.8.0](https://github.com/ai-outfitter/channels/compare/v1.7.0...v1.8.0) (2026-08-16)
 
 
 ### ⚠ BREAKING CHANGES
