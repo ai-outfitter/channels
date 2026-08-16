@@ -159,11 +159,16 @@ export async function startChannelsRuntime(
 		async deliver(input, send, reconcile) {
 			const deliveryId = derivedId(
 				"delivery",
-				`${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
+				input.payloadPolicy === "fixed"
+					? `${input.taskId}\0${input.source}\0${input.operationId}`
+					: `${input.taskId}\0${input.source}\0${input.operationId}\0${input.payloadDigest}`,
 			);
 			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep every durable delivery transition visible in one state machine
 			const run = async (): Promise<string | undefined> => {
 				let delivery = await deliveries.get(deliveryId);
+				if (delivery && delivery.payloadDigest !== input.payloadDigest) {
+					throw new Error("operation id already exists with different content");
+				}
 				if (delivery?.state === "delivered") return delivery.providerResponseId;
 				if (delivery?.state === "ambiguous") {
 					log({

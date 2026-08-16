@@ -36,10 +36,13 @@ import type {
 	ChannelActions,
 	ChannelContextMessage,
 	ChannelEvent,
+	ChannelPublisher,
+	ChannelPublishResult,
 	ChannelReadResult,
 	ChannelRespondResult,
 	ChannelSource,
 } from "./types.ts";
+import { CHANNEL_OPERATION_ID } from "./types.ts";
 import { parseList, RECONNECT_DELAY_MS, scopedLog, supervise } from "./util.ts";
 
 const log = scopedLog("chatto");
@@ -71,6 +74,10 @@ export interface ChattoApi {
 	): Promise<RoomTimelinePage>;
 	createReply(locator: ChattoLocator, body: string): Promise<string>;
 	dismiss(notificationId: string): Promise<void>;
+}
+
+export interface ChattoPublishApi {
+	createRoomMessage(roomId: string, body: string): Promise<string>;
 }
 
 interface ChattoSocketEvent {
@@ -212,6 +219,49 @@ export function createChattoActions(
 					warning: `Dismissing the notification failed: ${errorMessage(error)}`,
 				};
 			}
+		},
+	};
+}
+
+/** Create the adapter for new top-level Chatto room messages. */
+export function createChattoPublisher(
+	cfg: ChattoConfig,
+	api: ChattoPublishApi | undefined,
+	taskSink: SourceTaskActivationSink,
+): ChannelPublisher {
+	api ??= createConnectChattoApi(cfg);
+	return {
+		async publish(input): Promise<ChannelPublishResult> {
+			if (!STRUCTURAL_ID.test(input.target)) throw new Error("invalid Chatto room id");
+			if (!cfg.roomIds.has(input.target)) {
+				throw new Error("Chatto target is outside CHATTO_ROOM_IDS");
+			}
+			if (!CHANNEL_OPERATION_ID.test(input.operationId)) {
+				throw new Error("operation id must be 1-128 allowed ASCII characters");
+			}
+			const contentBytes = Buffer.byteLength(input.content);
+			if (contentBytes < 1 || contentBytes > 40_000) {
+				throw new Error("content must be 1-40000 UTF-8 bytes");
+			}
+			if (!taskSink.deliver) throw new Error("Chatto publication state is not configured");
+			const providerMessageId = await taskSink.deliver(
+				{
+					taskId: sourceIdentifier("publication", "chatto"),
+					source: "chatto",
+					operationId: input.operationId,
+					payloadDigest: contentDigest({ target: input.target, content: input.content }),
+					recovery: "ambiguous",
+					payloadPolicy: "fixed",
+				},
+				() => api.createRoomMessage(input.target, input.content),
+			);
+			if (!providerMessageId) throw new Error("Chatto returned no message id");
+			return {
+				channel: "chatto",
+				target: input.target,
+				operationId: input.operationId,
+				providerMessageId,
+			};
 		},
 	};
 }
@@ -581,7 +631,7 @@ function handleChattoError(error: RealtimeError): void {
 	log(`realtime warning ${error.code}: ${error.message}`);
 }
 
-function createConnectChattoApi(cfg: ChattoConfig): ChattoApi {
+function createConnectChattoApi(cfg: ChattoConfig): ChattoApi & ChattoPublishApi {
 	const transport = chattoTransport(cfg);
 	const notifications = createPromiseClient(NotificationService, transport);
 	const rooms = createPromiseClient(RoomService, transport);
@@ -597,7 +647,7 @@ function connectApi(clients: {
 	threads: PromiseClient<typeof ThreadService>;
 	messages: PromiseClient<typeof MessageService>;
 	viewer: PromiseClient<typeof ViewerService>;
-}): ChattoApi {
+}): ChattoApi & ChattoPublishApi {
 	return {
 		async viewerId() {
 			const response = await clients.viewer.getViewer({});
@@ -642,6 +692,11 @@ function connectApi(clients: {
 				inReplyTo: locator.messageEventId,
 			});
 			if (!response.message?.id) throw new Error("Chatto returned no response message id");
+			return response.message.id;
+		},
+		async createRoomMessage(roomId, body) {
+			const response = await clients.messages.createMessage({ roomId, body });
+			if (!response.message?.id) throw new Error("Chatto returned no message id");
 			return response.message.id;
 		},
 		async dismiss(notificationId) {

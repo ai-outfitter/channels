@@ -9,11 +9,13 @@ import { Type } from "typebox";
 import type {
 	ChannelActions,
 	ChannelContextMessage,
+	ChannelPublisher,
 	ChannelReadResult,
 	ChannelRespondResult,
 } from "./sources/types.ts";
 
 export type ChannelActionsResolver = (locator: string) => Promise<ChannelActions>;
+export type ChannelPublisherResolver = (channel: string) => Promise<ChannelPublisher>;
 
 export function registerChannelTools(
 	pi: ExtensionAPI,
@@ -71,6 +73,62 @@ export function registerChannelTools(
 			const result = await actions.respond(params.locator, params.response);
 			return {
 				content: [{ type: "text", text: renderResponse(result) }],
+				details: result,
+			};
+		},
+	});
+}
+
+/** Register the channel-neutral contract for a new top-level publication. */
+export function registerChannelPublishTool(
+	pi: ExtensionAPI,
+	resolvePublisher: ChannelPublisherResolver,
+): void {
+	pi.registerTool({
+		name: "channel_publish",
+		label: "Publish channel content",
+		description: "Publish new top-level content to one configured channel target.",
+		promptSnippet: "Use channel_publish for a new top-level channel message.",
+		promptGuidelines: [
+			"Use a stable operation_id for each intended publication.",
+			"Do not retry when the tool reports an ambiguous provider result.",
+		],
+		parameters: Type.Object({
+			channel: Type.String({
+				minLength: 1,
+				maxLength: 64,
+				description: "Configured channel adapter name.",
+			}),
+			target: Type.String({
+				minLength: 1,
+				maxLength: 128,
+				description: "Configured target identifier.",
+			}),
+			operation_id: Type.String({
+				minLength: 1,
+				maxLength: 128,
+				description: "Stable identifier for this publication operation.",
+			}),
+			content: Type.String({
+				minLength: 1,
+				maxLength: 40_000,
+				description: "Content to publish.",
+			}),
+		}),
+		async execute(_toolCallId, params) {
+			const publisher = await resolvePublisher(params.channel);
+			const result = await publisher.publish({
+				target: params.target,
+				operationId: params.operation_id,
+				content: params.content,
+			});
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Published channel message ${result.providerMessageId}.`,
+					},
+				],
 				details: result,
 			};
 		},

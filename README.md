@@ -62,7 +62,8 @@ new session — that's expected.
 ## Pair each channel with a skill
 
 The extension provides wake transport plus `channel_read` and
-`channel_respond`. Skills teach the agent when to use them. Responder skills
+`channel_respond`. It also provides `channel_publish` for configured adapters.
+Skills teach the agent when to use them. Responder skills
 live in this repository (for example
 [`dev/slack-responder/SKILL.md`](dev/slack-responder/SKILL.md)) or in a
 catalog you control — the
@@ -109,6 +110,17 @@ pi --mode rpc
 
 Messages are committed atomically before send returns, survive process restarts,
 and are idempotent when the sender retries with the same message ID.
+
+A scheduled process can send one filesystem message without a running sender
+session. The command uses `AGENT_SPOOL_PATH` and the same spool contract:
+
+```bash
+outfitter-channel-send scheduler resident wake-2026-08-15 "Run the scheduled task."
+```
+
+The four arguments are `sender`, `recipient`, `message_id`, and `body`. A retry
+with the same message ID and body returns success. Reuse with different content
+fails. The recipient reads the message after its resident session starts again.
 
 For remote clients, use the same endpoint/principal variables with:
 
@@ -325,6 +337,29 @@ wakes for mention notifications. `channel_read` validates the exact notification
 and reads up to ten room or thread messages; `channel_respond` replies in the
 correct thread and dismisses that notification.
 
+`channel_publish` posts a new top-level room message. Publication requires an
+explicit `CHATTO_ROOM_IDS` entry for the target. The tool records each
+`operation_id` before it sends. A retry with the same content returns the first
+Chatto message ID. Reuse with different content fails. A confirmed provider
+rejection permits a retry. An ambiguous result stops automatic retry and
+requires operator reconciliation. Stop the resident session before
+reconciliation. If Chatto contains the message, record its provider message ID:
+
+```bash
+export CHANNELS_TASK_STORE_PATH="$HOME/.local/share/outfitter/channels/task-plane"
+outfitter-channel-reconcile chatto OPERATION_ID delivered PROVIDER_MESSAGE_ID
+```
+
+If an operator confirms that Chatto did not create the message, mark the
+operation retryable instead:
+
+```bash
+outfitter-channel-reconcile chatto OPERATION_ID retryable
+```
+
+Restart the resident session after the command succeeds. Do not mark an
+operation retryable when the provider result is still unknown.
+
 - **Prerequisites:** a Chatto identity and bearer token that can read the watched
   rooms and notifications, post messages and thread replies, and dismiss its own
   notifications.
@@ -333,11 +368,12 @@ correct thread and dismisses that notification.
   ```bash
   export CHATTO_BASE_URL="https://chatto.example.com"
   export CHATTO_TOKEN="…"
-  export CHATTO_ROOM_IDS="room-id-1,room-id-2"  # optional
+  export CHATTO_ROOM_IDS="room-id-1,room-id-2"  # optional intake; required publish allowlist
   ```
 
-  Omit `CHATTO_ROOM_IDS` to use every room visible to the identity. This adapter
-  is pinned to the protocol-v2 schema recorded in
+  Omit `CHATTO_ROOM_IDS` to accept mentions and replies from every room visible
+  to the identity. Omission disables `channel_publish`; publication always
+  requires an explicit target entry. This adapter is pinned to the protocol-v2 schema recorded in
   [`extensions/vendor/chatto/SCHEMA.md`](extensions/vendor/chatto/SCHEMA.md).
   Chatto `v0.4.16` does not expose that schema; use the pinned revision or a
   later protocol-v2-compatible release described in the

@@ -5,6 +5,8 @@
  * handle; the extension calls `stop` from the inference-free `session_shutdown`
  * hook.
  */
+export const CHANNEL_OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+
 export interface ChannelSource {
 	/**
 	 * Open the push connection and invoke `onEvent` once per received signal.
@@ -72,6 +74,26 @@ export interface ChannelRespondResult {
 	handled: boolean;
 	responseId?: string;
 	warning?: string;
+}
+
+/** Channel-neutral input for a new top-level publication. */
+export interface ChannelPublishInput {
+	target: string;
+	operationId: string;
+	content: string;
+}
+
+/** Channel-neutral outcome for a top-level publication. */
+export interface ChannelPublishResult {
+	channel: string;
+	target: string;
+	operationId: string;
+	providerMessageId: string;
+}
+
+/** An adapter that publishes new top-level channel content. */
+export interface ChannelPublisher {
+	publish(input: ChannelPublishInput): Promise<ChannelPublishResult>;
 }
 
 /** Operations a channel adapter exposes to the agent-facing tools. */

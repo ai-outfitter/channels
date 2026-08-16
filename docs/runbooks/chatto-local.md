@@ -53,9 +53,38 @@ pi -e ./extensions/index.ts
 ```
 
 `CHATTO_BASE_URL` must be the HTTP(S) server origin. Omit `CHATTO_ROOM_IDS` only
-when every room visible to the bot is intentionally in scope. A partial
-configuration is detected at startup and does not prevent other selected
-channels from starting.
+when every room visible to the bot is intentionally in scope for intake and
+replies. Omission disables top-level publication. `channel_publish` always
+requires an explicit target entry in `CHATTO_ROOM_IDS`. A partial configuration
+is detected at startup and does not prevent other selected channels from
+starting.
+
+## Verify top-level publication
+
+Call `channel_publish` with `channel: "chatto"`, the allowlisted room ID as
+`target`, a stable `operation_id`, and the message body as `content`.
+Confirm that Chatto creates a top-level room message. A retry with the same
+operation ID and content must return the first message ID without a second post.
+A retry with changed target or content must fail.
+
+If the tool reports an ambiguous provider result, do not retry it. Stop Pi so
+the operator command has exclusive access to the task-plane store. Inspect
+Chatto for the intended message. If it exists, record its provider message ID:
+
+```bash
+export CHANNELS_TASK_STORE_PATH="$HOME/.local/share/outfitter/channels/task-plane"
+outfitter-channel-reconcile chatto OPERATION_ID delivered PROVIDER_MESSAGE_ID
+```
+
+If the message does not exist and the provider result is confirmed absent, mark
+the operation retryable:
+
+```bash
+outfitter-channel-reconcile chatto OPERATION_ID retryable
+```
+
+Restart Pi after reconciliation. Never use `retryable` while the provider
+result remains unknown because a retry can create a duplicate message.
 
 ## Verify the round trip
 
@@ -92,6 +121,7 @@ the reply automatically.
 | No mention wake arrives | Confirm both identities are room members, the event creates a mention notification, and the room ID is allowlisted. |
 | Read fails after a wake | Confirm the notification and message still exist and the bot retains room/timeline access. |
 | Reply succeeds but handled is false | Grant notification-dismiss permission or fix the server error; do not resend the reply. |
+| Publication is ambiguous | Stop Pi, inspect Chatto, reconcile the operation as delivered or confirmed retryable, then restart Pi. |
 
 When finished, stop Pi and clear the secret:
 
