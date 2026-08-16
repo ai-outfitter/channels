@@ -283,6 +283,10 @@ interface DeliveryData {
 	deliveries: Record<string, OutboundDelivery>;
 }
 
+type FixedDeliveryResolution =
+	| { readonly state: "delivered"; readonly providerResponseId: string }
+	| { readonly state: "retryable" };
+
 export class OutboundDeliveryStore extends JsonStore<DeliveryData> {
 	constructor(path: string) {
 		super(path, { version: 1, deliveries: {} });
@@ -303,6 +307,25 @@ export class OutboundDeliveryStore extends JsonStore<DeliveryData> {
 		return this.run(async () => this.data.deliveries[deliveryId]);
 	}
 
+	async reconcileFixed(
+		deliveryId: string,
+		resolution: FixedDeliveryResolution,
+	): Promise<OutboundDelivery> {
+		return this.run(async () => {
+			const delivery = this.data.deliveries[deliveryId];
+			if (!delivery) throw new Error("publication operation was not found");
+			if (delivery.payloadPolicy !== "fixed") {
+				throw new Error("delivery is not a fixed publication operation");
+			}
+			const prior = priorFixedReconciliation(delivery, resolution);
+			if (prior) return prior;
+			const reconciled = reconciledFixedDelivery(delivery, resolution);
+			this.data.deliveries[deliveryId] = reconciled;
+			await this.persist();
+			return reconciled;
+		});
+	}
+
 	async pending(): Promise<readonly OutboundDelivery[]> {
 		return this.run(async () =>
 			Object.values(this.data.deliveries).filter((delivery) => delivery.state === "sending"),
@@ -315,12 +338,53 @@ export class OutboundDeliveryStore extends JsonStore<DeliveryData> {
 			this.data.deliveries = Object.fromEntries(
 				Object.entries(this.data.deliveries).filter(
 					([, delivery]) =>
-						retainedTaskIds.has(delivery.taskId) || Date.parse(delivery.updatedAt) >= cutoff,
+						delivery.payloadPolicy === "fixed" ||
+						retainedTaskIds.has(delivery.taskId) ||
+						Date.parse(delivery.updatedAt) >= cutoff,
 				),
 			);
 			await this.persist();
 		});
 	}
+}
+
+function priorFixedReconciliation(
+	delivery: OutboundDelivery,
+	resolution: FixedDeliveryResolution,
+): OutboundDelivery | undefined {
+	if (delivery.state === "ambiguous") return undefined;
+	if (delivery.state === "failed" && resolution.state === "retryable") return delivery;
+	if (
+		delivery.state === "delivered" &&
+		resolution.state === "delivered" &&
+		delivery.providerResponseId === resolution.providerResponseId
+	) {
+		return delivery;
+	}
+	if (delivery.state === "delivered") {
+		throw new Error("publication operation is already delivered");
+	}
+	throw new Error("publication operation is not ambiguous");
+}
+
+function reconciledFixedDelivery(
+	delivery: OutboundDelivery,
+	resolution: FixedDeliveryResolution,
+): OutboundDelivery {
+	return {
+		deliveryId: delivery.deliveryId,
+		taskId: delivery.taskId,
+		source: delivery.source,
+		operationId: delivery.operationId,
+		payloadDigest: delivery.payloadDigest,
+		recovery: delivery.recovery,
+		payloadPolicy: "fixed",
+		state: resolution.state === "delivered" ? "delivered" : "failed",
+		updatedAt: new Date().toISOString(),
+		...(resolution.state === "delivered"
+			? { providerResponseId: resolution.providerResponseId }
+			: {}),
+	};
 }
 
 interface ActivationEvidenceRecord {

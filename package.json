@@ -10,12 +10,22 @@
 	},
 	"homepage": "https://github.com/ai-outfitter/channels#readme",
 	"bugs": "https://github.com/ai-outfitter/channels/issues",
+	"exports": {
+		".": "./extensions/runtime-extension.ts",
+		"./channel-send": "./extensions/agent/channel-send.ts",
+		"./*": "./*"
+	},
+	"bin": {
+		"outfitter-channel-reconcile": "./dist/bin/outfitter-channel-reconcile.js",
+		"outfitter-channel-send": "./dist/bin/outfitter-channel-send.js"
+	},
 	"keywords": [
 		"pi-package",
 		"ai-outfitter",
 		"channels"
 	],
 	"files": [
+		"dist",
 		"extensions",
 		"docs"
 	],
@@ -28,16 +38,18 @@
 		"access": "public"
 	},
 	"scripts": {
+		"build:cli": "tsc --project tsconfig.cli.json",
+		"prepack": "npm run build:cli",
 		"dev:slack": "bash dev/run-slack-local.sh",
 		"dev:slack:cli": "bash dev/run-slack-cli-local.sh",
 		"setup:slack": "bash dev/setup-slack-cli-app.sh",
 		"verify:slack": "node --experimental-strip-types dev/slack-verify.ts",
 		"relay": "node --experimental-strip-types extensions/relay/server.ts",
-		"lint": "biome check dev/*.ts extensions/ tests/",
-		"format": "biome check --write dev/*.ts extensions/ tests/",
+		"lint": "biome check bin/*.ts dev/*.ts extensions/ tests/",
+		"format": "biome check --write bin/*.ts dev/*.ts extensions/ tests/",
 		"typecheck": "tsc --noEmit",
-		"test": "node --test --experimental-strip-types tests/*.test.ts",
-		"check": "biome check dev/*.ts extensions/ tests/ && tsc --noEmit && npm test"
+		"test": "npm run build:cli && node --test --experimental-strip-types tests/*.test.ts",
+		"check": "biome check bin/*.ts dev/*.ts extensions/ tests/ && tsc --noEmit && npm test"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"

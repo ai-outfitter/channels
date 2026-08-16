@@ -41,6 +41,12 @@ const FILE_MODE = 0o600;
 const LOCK_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 10;
 
+interface ScheduledSendReceipt {
+	readonly version: 1;
+	readonly message: AgentMessageV1;
+	readonly published: boolean;
+}
+
 export class FilesystemAgentTransport implements AgentTransport {
 	readonly endpoint: AgentEndpoint;
 	readonly #root: string;
@@ -123,6 +129,8 @@ export class FilesystemAgentTransport implements AgentTransport {
 				: { replyTo: validateIdentifier(input.replyTo, "reply target") }),
 		});
 		await ensureDirectory(this.#inbox(recipient));
+		const receiptPath = this.#scheduledReceiptPath(message);
+		if (receiptPath) return this.#sendScheduled(message, receiptPath);
 		return withDirectoryLock(join(this.#inbox(recipient), ".queue-lock"), async () => {
 			const path = this.#messagePath(recipient, id);
 			const existing = await optionalJson<{
@@ -243,6 +251,7 @@ export class FilesystemAgentTransport implements AgentTransport {
 				if (envelope.version !== 1) continue;
 				const message = validateMessage(envelope.message);
 				if (message.recipient !== endpoint) continue;
+				if (!(await this.#scheduledMessageIsPublished(message))) continue;
 				messages.push(message);
 			} catch {
 				// Atomic writes prevent partial JSON. Ignore corrupt administrator-owned files.
@@ -265,6 +274,9 @@ export class FilesystemAgentTransport implements AgentTransport {
 		if (message.recipient !== this.endpoint.id) {
 			throw new Error("agent message was not delivered to this endpoint");
 		}
+		const receiptPath = this.#scheduledReceiptPath(message);
+		const receipt = receiptPath ? await optionalJson<ScheduledSendReceipt>(receiptPath) : undefined;
+		if (receipt && !receipt.published) throw new Error("scheduled agent message is not committed");
 		const stored = this.#journal.recordMessage(message, "delivered");
 		await durableUnlink(path);
 		return stored;
@@ -284,6 +296,70 @@ export class FilesystemAgentTransport implements AgentTransport {
 
 	#messagePath(endpoint: string, id: string): string {
 		return join(this.#inbox(endpoint), `${encodeURIComponent(id)}.json`);
+	}
+
+	#scheduledReceiptPath(message: AgentMessageV1): string | undefined {
+		if (!message.conversationId.startsWith("scheduled:")) return undefined;
+		return join(
+			this.#root,
+			"scheduled-send-receipts",
+			encodeURIComponent(message.sender),
+			`${encodeURIComponent(message.id)}.json`,
+		);
+	}
+
+	async #scheduledMessageIsPublished(message: AgentMessageV1): Promise<boolean> {
+		const receiptPath = this.#scheduledReceiptPath(message);
+		if (!receiptPath) return true;
+		const receipt = await optionalJson<ScheduledSendReceipt>(receiptPath);
+		return !receipt || receipt.published;
+	}
+
+	async #sendScheduled(message: AgentMessageV1, receiptPath: string): Promise<AgentSendResult> {
+		await ensureDirectory(dirname(receiptPath));
+		return withDirectoryLock(`${receiptPath}.lock`, async () => {
+			const receipt = await optionalJson<ScheduledSendReceipt>(receiptPath);
+			const canonical = receipt ? validateMessage(receipt.message) : message;
+			if (receipt && !sameImmutableMessage(canonical, message)) {
+				throw new Error(`message id "${message.id}" already exists with different content`);
+			}
+			if (receipt?.published) {
+				const stored = this.#journal.recordMessage(canonical, "accepted");
+				return { message: stored.message, state: stored.state, duplicate: true };
+			}
+			if (!receipt) {
+				await atomicJson(
+					receiptPath,
+					{ version: 1, message: canonical, published: false } satisfies ScheduledSendReceipt,
+					true,
+				);
+			}
+			await withDirectoryLock(join(this.#inbox(canonical.recipient), ".queue-lock"), async () => {
+				const path = this.#messagePath(canonical.recipient, canonical.id);
+				const existing = await optionalJson<{
+					readonly version: 1;
+					readonly message: AgentMessageV1;
+				}>(path);
+				if (existing) {
+					if (!sameImmutableMessage(validateMessage(existing.message), canonical)) {
+						throw new Error(`message id "${canonical.id}" already exists with different content`);
+					}
+					return;
+				}
+				const pending = await this.#queuedMessages(canonical.recipient);
+				if (pending.length >= AGENT_MAX_PENDING_MESSAGES) {
+					throw new Error(`recipient queue is full (${AGENT_MAX_PENDING_MESSAGES})`);
+				}
+				await atomicJson(path, { version: 1, message: canonical }, true);
+			});
+			await atomicJson(receiptPath, {
+				version: 1,
+				message: canonical,
+				published: true,
+			} satisfies ScheduledSendReceipt);
+			const stored = this.#journal.recordMessage(canonical, "accepted");
+			return { message: stored.message, state: stored.state, duplicate: Boolean(receipt) };
+		});
 	}
 }
 

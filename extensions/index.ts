@@ -20,9 +20,9 @@
 import type { ExtensionAPI, MessageUpdateEvent } from "@earendil-works/pi-coding-agent";
 import { AgentSessionJournal } from "./agent/journal.ts";
 import { registerAgentTools } from "./agent-tools.ts";
-import { registerChannelTools } from "./channel-tools.ts";
+import { registerChannelPublishTool, registerChannelTools } from "./channel-tools.ts";
 import type { AgentChannelActions } from "./sources/agent.ts";
-import type { ChannelActions, ChannelSource } from "./sources/types.ts";
+import type { ChannelActions, ChannelPublisher, ChannelSource } from "./sources/types.ts";
 import { errorMessage, parseList, scopedLog } from "./sources/util.ts";
 import type { SourceTaskActivationSink } from "./task-plane/types.ts";
 
@@ -41,6 +41,8 @@ export interface SourceRegistration {
 		journal: AgentSessionJournal | undefined,
 		taskSink: SourceTaskActivationSink,
 	): Promise<ChannelActions | undefined>;
+	/** Load the adapter for new top-level publications, when supported. */
+	loadPublisher?(taskSink: SourceTaskActivationSink): Promise<ChannelPublisher | undefined>;
 	/** Load the native agent channel's discovery/send actions, when supported. */
 	loadAgentActions?(journal?: AgentSessionJournal): Promise<AgentChannelActions | undefined>;
 	/** Load a forwarder that streams Pi assistant text events as previews. */
@@ -184,6 +186,11 @@ export function createSourceRegistry(
 				const cfg = m.chattoConfigFromEnv();
 				return cfg ? m.createChattoActions(cfg, undefined, taskSink) : undefined;
 			},
+			async loadPublisher(taskSink) {
+				const m = await importOnce("./sources/chatto.ts", () => import("./sources/chatto.ts"));
+				const cfg = m.chattoConfigFromEnv();
+				return cfg ? m.createChattoPublisher(cfg, undefined, taskSink) : undefined;
+			},
 		},
 		mattermost: {
 			configured: () =>
@@ -247,6 +254,7 @@ export default function channelEventsExtension(
 	const wanted =
 		selection === undefined ? Object.keys(sources) : [...new Set(parseList(selection))];
 	const actionCache = new Map<string, Promise<ChannelActions>>();
+	const publisherCache = new Map<string, Promise<ChannelPublisher>>();
 	let agentActions: Promise<AgentChannelActions> | undefined;
 	const agentJournal = new AgentSessionJournal((customType, data) => {
 		pi.appendEntry(customType, data);
@@ -282,6 +290,29 @@ export default function channelEventsExtension(
 			actionCache.set(channel, actions);
 		}
 		return actions;
+	});
+	registerChannelPublishTool(pi, async (channel) => {
+		if (!/^[a-z][a-z0-9-]*$/.test(channel)) throw new Error("invalid channel name");
+		if (!wanted.includes(channel)) throw new Error(`channel "${channel}" is not selected`);
+		const registration = sources[channel];
+		if (!registration?.loadPublisher) {
+			throw new Error(`channel "${channel}" does not support publication`);
+		}
+		let publisher = publisherCache.get(channel);
+		if (!publisher) {
+			publisher = registration
+				.loadPublisher(taskSink())
+				.then((loaded) => {
+					if (!loaded) throw new Error(`channel "${channel}" publication is not configured`);
+					return loaded;
+				})
+				.catch((error) => {
+					publisherCache.delete(channel);
+					throw error;
+				});
+			publisherCache.set(channel, publisher);
+		}
+		return publisher;
 	});
 	registerAgentTools(pi, async () => {
 		if (!wanted.includes("agent")) throw new Error('channel "agent" is not selected');

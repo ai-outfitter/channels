@@ -75,6 +75,8 @@ export interface OutboundDelivery {
 	readonly operationId: string;
 	readonly payloadDigest: string;
 	readonly recovery: "idempotent" | "lookup" | "ambiguous";
+	/** Bind this operation ID to one payload digest. */
+	readonly payloadPolicy?: "fixed";
 	readonly state: "prepared" | "sending" | "delivered" | "failed" | "ambiguous";
 	readonly updatedAt: string;
 	readonly providerResponseId?: string;
@@ -87,4 +89,6 @@ export interface OutboundDeliveryInput {
 	readonly operationId: string;
 	readonly payloadDigest: string;
 	readonly recovery: "idempotent" | "lookup" | "ambiguous";
+	/** Reject reuse of the operation ID with a different payload digest. */
+	readonly payloadPolicy?: "fixed";
 }
