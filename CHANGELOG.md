@@ -52,6 +52,32 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [2.0.0](https://github.com/ai-outfitter/channels/compare/v1.7.0...v2.0.0) (2026-08-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **a2a:** every agent wake now flows through the task plane with one active Task authority; the pre-task-plane wake paths are removed.
+
+### Features
+
+* **channels:** add idempotent scheduled publication ([#58](https://github.com/ai-outfitter/channels/issues/58)) ([8e8879a](https://github.com/ai-outfitter/channels/commit/8e8879aa064a9f39370fe08ea8f242fd4c411c17))
+* **jmap:** task-bound exact-item read and reply ([856f1d4](https://github.com/ai-outfitter/channels/commit/856f1d4dee72ab5de9754d4417b1993df2215ecb))
+* **sources:** route remaining work sources through the task plane ([aebfa4c](https://github.com/ai-outfitter/channels/commit/aebfa4c1d6aca2b01faf23f33ef58191aaa2b7c9))
+* **sources:** route Slack, Chatto, GitHub, and JMAP through the task plane ([9eada94](https://github.com/ai-outfitter/channels/commit/9eada946595b3ca15cb167f6ed54c1eb89d896a6))
+
+
+### Bug Fixes
+
+* **a2a:** grant wake authority at delivery and cap re-offers ([7bd019e](https://github.com/ai-outfitter/channels/commit/7bd019eeb928a09f062de090d2d8e35bb30a7d77))
+* **a2a:** harden the task plane per adversarial review ([2c83115](https://github.com/ai-outfitter/channels/commit/2c831159380773dbba4f691025b8e98f5de70cdf))
+* **sources:** evaluate each source module once under concurrent import ([5c2e305](https://github.com/ai-outfitter/channels/commit/5c2e3056db815a7d3664347a7f6bb64f78eae515))
+
+
+### Code Refactoring
+
+* **a2a:** remove the legacy wake paths ([2dadd05](https://github.com/ai-outfitter/channels/commit/2dadd051db3892e3a91b3e1527f32acab1a0353d))
+
 ## [1.7.0](https://github.com/ai-outfitter/channels/compare/v1.6.1...v1.7.0) (2026-08-13)
 
 
