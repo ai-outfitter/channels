@@ -21,9 +21,7 @@ if (!channel || !operationId || (!delivered && !retryable)) {
 				storeRoot,
 				channel,
 				operationId,
-				resolution: delivered
-					? { state: "delivered", providerMessageId }
-					: { state: "retryable" },
+				resolution: delivered ? { state: "delivered", providerMessageId } : { state: "retryable" },
 			});
 			console.log(JSON.stringify(result));
 		} catch (error) {

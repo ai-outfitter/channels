@@ -3,11 +3,14 @@
 	"vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
 	"files": {
 		"includes": [
+			"bin/**/*.ts",
 			"dev/**/*.ts",
+			"dev/**/*.mjs",
 			"!dev/nonprod-bot",
 			"extensions/**/*.ts",
 			"!extensions/vendor",
-			"tests/**/*.ts"
+			"tests/**/*.ts",
+			"tests/**/*.mjs"
 		]
 	},
 	"formatter": {
