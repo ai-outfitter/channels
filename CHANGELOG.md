@@ -52,6 +52,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.8.1](https://github.com/ai-outfitter/channels/compare/v1.8.0...v1.8.1) (2026-08-16)
+
+
+### Bug Fixes
+
+* **release:** preserve packaged CLI commands ([#61](https://github.com/ai-outfitter/channels/issues/61)) ([b75af88](https://github.com/ai-outfitter/channels/commit/b75af887b0720d0ca188339b834a5adac486dbf5))
+
 ## [1.8.0](https://github.com/ai-outfitter/channels/compare/v1.7.0...v1.8.0) (2026-08-16)
 
 
