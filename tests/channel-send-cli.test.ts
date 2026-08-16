@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -76,6 +76,15 @@ test("packaged outfitter-channel-send runs as JavaScript and derives its princip
 		assert.equal(JSON.parse(await runPackagedSend(args, env)).status, "duplicate");
 	} finally {
 		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("packaged channel commands are executable npm bins", {
+	skip: process.platform === "win32",
+}, async () => {
+	for (const command of ["outfitter-channel-send.js", "outfitter-channel-reconcile.js"]) {
+		const commandStat = await stat(join(process.cwd(), "dist/bin", command));
+		assert.notEqual(commandStat.mode & 0o111, 0, `${command} must be executable`);
 	}
 });
 
