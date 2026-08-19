@@ -66,6 +66,7 @@ const config: GithubConfig = {
 	token: "t",
 	api: API,
 	filters: new Set(["review_requested", "assigned_issue", "assigned_pr", "author"]),
+	orgs: new Set<string>(),
 	pollMs: 10_000,
 	markRead: false,
 };
@@ -82,6 +83,12 @@ function note(id: string, reason: string, type = "PullRequest", updated = "2026-
 		},
 		repository: { full_name: "o/r" },
 	};
+}
+
+/** The same notification, but on a repository owned by `owner`. */
+function noteIn(owner: string, id: string, reason = "review_requested") {
+	const n = note(id, reason);
+	return { ...n, repository: { full_name: `${owner}/r` } };
 }
 
 /** Let the source's first (immediate) poll settle. */
@@ -649,6 +656,7 @@ test("config: token precedence, API base derivation, and safe defaults", () => {
 			"GITHUB_API_URL",
 			"GITHUB_SERVER_URL",
 			"GITHUB_NOTIFY_FILTERS",
+			"GITHUB_NOTIFY_ORGS",
 			"GITHUB_NOTIFY_MARK_READ",
 		]) {
 			delete process.env[key];
@@ -662,6 +670,7 @@ test("config: token precedence, API base derivation, and safe defaults", () => {
 		assert.equal(fallback?.markRead, false, "mark-read must default off");
 		assert.ok(fallback?.filters.has("author"), "author is a default filter");
 		assert.ok(fallback?.filters.has("assigned_pr"), "assigned_pr is a default filter");
+		assert.equal(fallback?.orgs.size, 0, "no allowlist means every owner is allowed");
 
 		process.env.GITHUB_NOTIFY_TOKEN = "poller";
 		assert.equal(githubConfigFromEnv()?.token, "poller", "poller token wins");
@@ -680,5 +689,126 @@ test("config: token precedence, API base derivation, and safe defaults", () => {
 		assert.equal(githubConfigFromEnv()?.markRead, true);
 	} finally {
 		restore();
+	}
+});
+
+test("an organization allowlist admits only its own owners", async () => {
+	const { events, stop, restore } = await run(
+		{ ...config, orgs: new Set(["unsupervisedcom"]) },
+		{
+			[`${API}/user`]: { body: { login: "bot", id: 123 } },
+			[`${API}/notifications`]: {
+				body: [noteIn("Unsupervisedcom", "1"), noteIn("ai-outfitter", "2")],
+			},
+			[`${API}/notifications/threads/1`]: { body: {} },
+		},
+	);
+	await stop();
+	restore();
+	// One account, two deployments: this one wakes on its own organization only.
+	assert.deepEqual(events, [{ channel: "github", summary: "review_requested" }]);
+});
+
+test("owner matching ignores case, because GitHub logins do", async () => {
+	const { events, stop, restore } = await run(
+		{ ...config, orgs: new Set(["ai-outfitter"]) },
+		{
+			[`${API}/user`]: { body: { login: "bot", id: 123 } },
+			[`${API}/notifications`]: { body: [noteIn("AI-Outfitter", "1")] },
+			[`${API}/notifications/threads/1`]: { body: {} },
+		},
+	);
+	await stop();
+	restore();
+	assert.deepEqual(events, [{ channel: "github", summary: "review_requested" }]);
+});
+
+test("an empty organization allowlist admits every owner", async () => {
+	const { events, stop, restore } = await run(config, {
+		[`${API}/user`]: { body: { login: "bot", id: 123 } },
+		[`${API}/notifications`]: {
+			body: [noteIn("Unsupervisedcom", "1"), noteIn("ai-outfitter", "2")],
+		},
+		[`${API}/notifications/threads/1`]: { body: {} },
+		[`${API}/notifications/threads/2`]: { body: {} },
+	});
+	await stop();
+	restore();
+	assert.equal(events.length, 2, "an unset allowlist must not filter");
+});
+
+test("an excluded owner is never accepted and never marked read", async () => {
+	// The load-bearing property: `GET /notifications` is account-wide, so this
+	// deployment must leave the other organization's thread unread for the
+	// deployment that owns it.
+	const accepted: string[] = [];
+	const taskSink: SourceTaskActivationSink = {
+		async accept(input: NativeActivation) {
+			accepted.push(String(input.nativeLocator.owner));
+			return { activationId: "a", taskId: "t", contextId: "c", disposition: "created" as const };
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async deliver(_input, send) {
+			return send();
+		},
+	};
+	const { calls, stop, restore } = await run(
+		{ ...config, orgs: new Set(["unsupervisedcom"]) },
+		{
+			[`${API}/user`]: { body: { login: "bot", id: 123 } },
+			[`${API}/notifications`]: {
+				body: [noteIn("Unsupervisedcom", "1"), noteIn("ai-outfitter", "2")],
+			},
+			[`${API}/notifications/threads/1`]: { body: {} },
+			[`${API}/notifications/threads/2`]: { body: {} },
+		},
+		taskSink,
+	);
+	await stop();
+	restore();
+	assert.deepEqual(accepted, ["Unsupervisedcom"]);
+	const patched = calls.filter((c) => c.method === "PATCH").map((c) => c.url);
+	assert.deepEqual(patched, [`${API}/notifications/threads/1`]);
+});
+
+test("an allowlist does not change how an unparseable repository is reported", async () => {
+	const lines: string[] = [];
+	const original = console.error;
+	console.error = (msg: unknown) => lines.push(String(msg));
+	let result: Awaited<ReturnType<typeof run>> | undefined;
+	try {
+		result = await run(
+			{ ...config, orgs: new Set(["unsupervisedcom"]) },
+			{
+				[`${API}/user`]: { body: { login: "bot", id: 123 } },
+				[`${API}/notifications`]: {
+					body: [{ ...note("1", "review_requested"), repository: {} }],
+				},
+			},
+		);
+	} finally {
+		await result?.stop();
+		result?.restore();
+		console.error = original;
+	}
+	assert.deepEqual(result?.events, []);
+	assert.ok(
+		lines.some((l) => l.includes("no exact subject identity")),
+		`expected the existing identity failure, got: ${lines.join(" | ")}`,
+	);
+});
+
+test("config: the organization allowlist is a lowercased, comma/space list", () => {
+	const env = { ...process.env };
+	try {
+		process.env.GITHUB_NOTIFY_TOKEN = "t";
+		process.env.GITHUB_NOTIFY_ORGS = "Unsupervisedcom, ai-outfitter";
+		assert.deepEqual([...(githubConfigFromEnv()?.orgs ?? [])], ["unsupervisedcom", "ai-outfitter"]);
+		process.env.GITHUB_NOTIFY_ORGS = "  ";
+		assert.equal(githubConfigFromEnv()?.orgs.size, 0, "a blank list means no filtering");
+	} finally {
+		process.env = { ...env };
 	}
 });

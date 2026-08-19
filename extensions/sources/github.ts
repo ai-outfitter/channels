@@ -23,6 +23,15 @@
  * `assign` is not a filter name. GitHub sends it for both issues and pull
  * requests, so this source splits it into `assigned_issue` and `assigned_pr`.
  *
+ * Organization allowlist (env `GITHUB_NOTIFY_ORGS`, comma/space list,
+ * case-insensitive; unset means no filtering): only notifications whose
+ * repository owner is named here are considered. `GET /notifications` is
+ * account-wide, so one machine account deployed once per organization wakes
+ * every deployment on every thread. Each deployment names its own organization
+ * and ignores the rest. A notification outside the allowlist is dropped before
+ * acceptance, so it is never marked read and the deployment that owns it still
+ * finds it.
+ *
  * Security invariant: every request URL is built from the configured API base.
  * A URL taken from a notification payload is **never** fetched. A payload URL
  * points at the public host, which from inside a network that reaches the forge
@@ -49,6 +58,8 @@ export interface GithubConfig {
 	token: string;
 	api: string;
 	filters: Set<string>;
+	/** Lowercased owner logins; empty means every owner is allowed. */
+	orgs: Set<string>;
 	pollMs: number;
 	markRead: boolean;
 }
@@ -109,11 +120,15 @@ export function githubConfigFromEnv(): GithubConfig | undefined {
 			log(`filter "${name}" is not a GitHub notification reason; it will never match`);
 		}
 	}
+	// GitHub logins are case-insensitive, so the allowlist is compared in one case.
+	const orgs = new Set(
+		parseList(process.env.GITHUB_NOTIFY_ORGS).map((owner) => owner.toLowerCase()),
+	);
 	const pollMs = Number(process.env.GITHUB_NOTIFY_POLL_MS) || DEFAULT_POLL_MS;
 	// Retained in the config shape for source API compatibility. Task-plane intake
 	// owns mark-read-after-acceptance; this retired variable is ignored.
 	const markRead = process.env.GITHUB_NOTIFY_MARK_READ === "1";
-	return { token, api: apiFromEnv(), filters, pollMs, markRead };
+	return { token, api: apiFromEnv(), filters, orgs, pollMs, markRead };
 }
 
 interface Notification {
@@ -306,7 +321,9 @@ async function authenticatedIdentity(request: Request_): Promise<{ login: string
 function announceIdentity(cfg: GithubConfig, who: string): void {
 	log(
 		`watching notifications as ${who}; ` +
-			`filters=[${[...cfg.filters].join(",")}] interval=${cfg.pollMs}ms ` +
+			`filters=[${[...cfg.filters].join(",")}] ` +
+			(cfg.orgs.size > 0 ? `orgs=[${[...cfg.orgs].join(",")}] ` : "") +
+			`interval=${cfg.pollMs}ms ` +
 			`api=${cfg.api} acknowledgment=after-acceptance`,
 	);
 }
@@ -331,8 +348,8 @@ async function emitNew(
 			batch.add(key);
 			continue;
 		}
-		const reason = classify(n);
-		if (!reason || !cfg.filters.has(reason)) {
+		const reason = actionableReason(cfg, n);
+		if (!reason) {
 			batch.add(key);
 			continue;
 		}
@@ -380,6 +397,20 @@ async function emitNew(
 	return { seen: batch, complete };
 }
 
+/**
+ * The matched reason to act on, or nothing when this notification needs no work
+ * — because no configured filter matches it, or because the organization
+ * allowlist does not name its owner.
+ */
+function actionableReason(cfg: GithubConfig, n: Notification): string | undefined {
+	const reason = classify(n);
+	if (!reason || !cfg.filters.has(reason)) return undefined;
+	const excluded = excludedOwner(cfg, n);
+	if (!excluded) return reason;
+	log(`skipping notification ${n.id}: owner ${excluded} is not in GITHUB_NOTIFY_ORGS`);
+	return undefined;
+}
+
 async function deliverMarkRead(
 	taskSink: SourceTaskActivationSink,
 	taskId: string,
@@ -415,6 +446,24 @@ async function markRead(n: Notification, request: Request_): Promise<void> {
 
 class PermanentNotificationError extends Error {}
 
+/** `owner/repo`, split into its two segments. */
+const REPOSITORY_FULL_NAME = /^([^/]+)\/([^/]+)$/;
+
+/**
+ * The repository owner that the allowlist refuses, or nothing when the
+ * notification may proceed. The drop happens before acceptance, never after: an
+ * acknowledged notification is marked read for the whole account, which would
+ * hide it from the deployment whose allowlist does name this owner. An owner
+ * that cannot be parsed proceeds to the locator, which reports it as an
+ * exact-identity failure exactly as it did before the allowlist existed.
+ */
+function excludedOwner(cfg: GithubConfig, n: Notification): string | undefined {
+	if (cfg.orgs.size === 0) return undefined;
+	const owner = n.repository?.full_name?.match(REPOSITORY_FULL_NAME)?.[1];
+	if (!owner || cfg.orgs.has(owner.toLowerCase())) return undefined;
+	return owner;
+}
+
 function notificationLocator(
 	n: Notification,
 	api: string,
@@ -427,7 +476,7 @@ function notificationLocator(
 	displayUrl: string;
 } {
 	const repository = n.repository?.full_name;
-	const match = repository?.match(/^([^/]+)\/([^/]+)$/);
+	const match = repository?.match(REPOSITORY_FULL_NAME);
 	const number = n.subject?.url?.match(/\/(?:issues|pulls)\/(\d+)$/)?.[1];
 	if (!match || !number || !n.subject?.type)
 		throw new PermanentNotificationError("GitHub notification has no exact subject identity");
