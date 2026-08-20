@@ -273,6 +273,7 @@ act on them.
   ```bash
   export GITHUB_NOTIFY_TOKEN="ghp_…"   # classic PAT; falls back to GITHUB_TOKEN
   export GITHUB_NOTIFY_FILTERS="review_requested,assigned_issue,assigned_pr,author"  # optional; this is the default
+  export GITHUB_NOTIFY_ORGS="ai-outfitter"  # optional; only wake on these owners
   export GITHUB_NOTIFY_POLL_MS="60000" # optional; a floor — GitHub's X-Poll-Interval may raise it
   export GITHUB_API_URL="https://api.github.com"  # optional; for GHES, or derived from GITHUB_SERVER_URL
   ```
@@ -285,6 +286,16 @@ act on them.
   | `author` | activity on a thread you opened — this is what tells you a review landed on **your own** PR |
   | `mention` | you were @-mentioned |
   | `comment`, `subscribed`, `state_change`, `ci_activity` | as named |
+
+  `GITHUB_NOTIFY_ORGS` is a comma/space list of organization or user logins,
+  matched case-insensitively against the notified repository's owner. Unset, it
+  filters nothing. Set, a notification from any other owner is dropped **before**
+  acceptance — no Task, no wake, and no mark-read, so the notification stays
+  unread on the account. That last part is the point: `GET /notifications` is
+  account-wide, so one machine account that belongs to two organizations and runs
+  one agent per organization has both agents woken by every thread. Give each
+  deployment the same token and its own `GITHUB_NOTIFY_ORGS`, and each one wakes
+  on its own work and leaves the other's alone.
 
   `GITHUB_NOTIFY_MARK_READ` is retired. If it is set, Channels ignores it and
   logs one startup warning. Task-plane intake accepts the exact notification

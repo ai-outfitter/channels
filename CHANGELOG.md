@@ -33,6 +33,12 @@
 - **GitHub operators:** `GITHUB_NOTIFY_MARK_READ` is retired. Channels ignores a
   set value and logs one warning at startup. GitHub notifications are now marked
   read after their exact revision has been durably accepted by the task plane.
+- **GitHub operators:** `GITHUB_NOTIFY_ORGS` is a new optional allowlist of
+  repository owners. When it is set, a notification from another owner creates
+  no Task, wakes no agent, and is not marked read, so a second deployment of the
+  same account still receives it. Unset, nothing is filtered. This lets one
+  machine account that belongs to two organizations run one resident agent per
+  organization.
 - **Chatto operators:** Channels now dismisses a notification after durable Task
   acceptance, rather than waiting until after the reply.
 - **JMAP operators:** Email wakes are now limited to mail that enters INBOX,
