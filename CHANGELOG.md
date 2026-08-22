@@ -58,6 +58,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.9.0](https://github.com/ai-outfitter/channels/compare/v1.8.0...v1.9.0) (2026-08-20)
+
+
+### Features
+
+* **github:** scope notification wakes to an org allowlist ([#62](https://github.com/ai-outfitter/channels/issues/62)) ([e37f11a](https://github.com/ai-outfitter/channels/commit/e37f11aefc58660785c99fbb2db0d7a979bd361d))
+
 ## [1.8.0](https://github.com/ai-outfitter/channels/compare/v1.7.0...v1.8.0) (2026-08-16)
 
 
