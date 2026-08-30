@@ -217,9 +217,9 @@ Spawns `signal-cli … jsonRpc` and wakes on each incoming Signal message. The
 
 ### GitHub notifications — `github`
 
-GitHub has no push transport, so this channel **polls your notifications** and
-wakes you **only when one matches your filters**. Pair with `gh`/a GitHub skill to
-act on them.
+Channels 1.5.0 has no GitHub webhook source. This channel **polls your
+notifications** and wakes you **only when one matches your filters**. Pair with
+`gh` or a GitHub skill to act on them.
 
 - **Prerequisites:** a **classic** PAT with the `notifications` scope.
   `GET /notifications` accepts classic PATs only — a fine-grained PAT and a
@@ -256,6 +256,12 @@ act on them.
   Find the work by querying your own assignments (`gh search issues --assignee
   @me --state open`), not by reading the notification list — a thread that was
   already marked read is invisible there, but the assignment is not.
+
+  Do not put the classic notification token in a coding agent that works on a
+  repository that MUST stay private. The current source and the coding tools
+  share one Pi process. See
+  [Private repository agent channels](docs/private-repository-agents.md) for the
+  organization-scoped design and the current implementation limits.
 
 ### Slack — `slack`
 
@@ -365,7 +371,8 @@ direct conversation; replies preserve that address and add a
 
 ```bash
 pi install git:github.com/ai-outfitter/channels
-export GITHUB_TOKEN="ghp_…"            # + any other channels' vars
+export OUTFITTER_CHANNELS=github
+export GITHUB_NOTIFY_TOKEN="ghp_…"     # classic PAT with notifications scope
 pi                                     # keep this session running
 ```
 
@@ -392,6 +399,9 @@ convention are in
 Native agent-to-agent and authorized operator-to-agent chat, including the
 identity model and boundaries from observation/control/lifecycle, is specified in
 [Agent Session Gateway](docs/agent-session-gateway.md).
+
+For a coding agent that works on a repository that MUST stay private, see
+[Private repository agent channels](docs/private-repository-agents.md).
 
 ## Add a channel
 

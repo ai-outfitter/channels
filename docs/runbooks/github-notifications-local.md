@@ -3,6 +3,10 @@
 This runbook connects the current Channels checkout to a real GitHub account.
 It then verifies one assignment-to-wake round trip on your workstation.
 
+Do not use this process as a protected coding agent. A repository that MUST stay
+private needs a separate wake boundary. See
+[Private repository agent channels](../private-repository-agents.md).
+
 The `github` source polls GitHub. It needs outbound HTTPS. It does not need an
 inbound listener, a public URL, or a tunnel.
 
@@ -167,6 +171,10 @@ a broad credential. Repository work should use the narrowest token that does
 the job. Put the classic token in `GITHUB_NOTIFY_TOKEN` and the working token
 in `GITHUB_TOKEN`. The source reads the first and falls back to the second;
 `gh` reads the second. Deliver both as secrets, never in an image or a manifest.
+
+These variable names do not isolate the credentials. Both tokens are in the Pi
+process environment. A protected coding agent MUST keep the classic token in a
+separate wake-only process.
 
 **Expect a restart to lose pending work.** The poller reports only threads
 updated after it started. A deployment restarts the pod, so anything assigned
