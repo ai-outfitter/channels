@@ -3,6 +3,8 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { derivedId } from "../extensions/task-plane/serialize.ts";
 import {
 	isPathInside,
 	type TaskSessionFactory,
@@ -98,6 +100,44 @@ test("Task session host releases terminal sessions without deleting durable hist
 	assert.equal(created, 2);
 	assert.equal(closed, 2);
 	assert.equal(sessionIds[1], sessionIds[0]);
+});
+
+test("Task session host ignores stale duplicate paths for a durable session", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-stale-path-"));
+	const sessionDir = join(root, "sessions");
+	const sessionId = derivedId("task", "task");
+	const manager = SessionManager.create(root, sessionDir, { id: sessionId });
+	manager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "persist" }],
+		timestamp: Date.now(),
+	} as never);
+	const sessionFile = manager.getSessionFile();
+	assert.ok(sessionFile);
+	const listAll = SessionManager.listAll;
+	SessionManager.listAll = async () =>
+		[
+			{ id: sessionId, path: sessionFile },
+			{ id: sessionId, path: join(sessionDir, "missing.jsonl") },
+		] as Awaited<ReturnType<typeof SessionManager.listAll>>;
+	try {
+		const host = new TaskSessionHost({
+			cwd: root,
+			sessionDir,
+			customTools: [],
+			excludedExtensionRoot: root,
+			createSession: async ({ sessionManager }) => ({
+				sessionId: sessionManager.getSessionId(),
+				sessionFile: sessionManager.getSessionFile(),
+				async prompt() {},
+				async close() {},
+			}),
+		});
+		await host.run("task", "resume");
+		await host.close();
+	} finally {
+		SessionManager.listAll = listAll;
+	}
 });
 
 test("extension containment uses path boundaries", () => {

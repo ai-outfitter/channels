@@ -103,12 +103,16 @@ export class TaskSessionHost implements TaskTurnRunner {
 	async #create(taskId: string): Promise<TaskSession> {
 		const sessionId = derivedId("task", taskId);
 		const sessionPaths = await this.#sessionPaths;
-		const existingPaths = sessionPaths.get(sessionId) ?? [];
+		const existingPaths = [
+			...new Set(
+				(sessionPaths.get(sessionId) ?? []).map((path) => resolve(path)).filter(existsSync),
+			),
+		];
+		sessionPaths.set(sessionId, existingPaths);
 		if (existingPaths.length > 1) {
 			throw new Error(`multiple Pi sessions exist for task "${taskId}"`);
 		}
-		const existingPath =
-			existingPaths[0] && existsSync(existingPaths[0]) ? existingPaths[0] : undefined;
+		const existingPath = existingPaths[0];
 		const sessionManager = existingPath
 			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
 			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });

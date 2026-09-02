@@ -9,6 +9,7 @@ interface PendingWake {
 	readonly claim: ActivationClaim;
 	readonly prompt: string;
 	attempts: number;
+	turnComplete: boolean;
 }
 
 const MAX_WAKE_ATTEMPTS = 3;
@@ -29,6 +30,7 @@ export class DurableWakeQueue {
 	#pumping = false;
 	#pumpFailures = 0;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
+	readonly #retired = new Set<string>();
 	#stopped = false;
 
 	constructor(
@@ -58,6 +60,13 @@ export class DurableWakeQueue {
 					await this.#consumeSettled(claim);
 					continue;
 				}
+				if (
+					INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
+					this.#journal.isWoken(claim.activationId) &&
+					!this.#hasLaterAcceptedClaim(claim)
+				) {
+					continue;
+				}
 				this.#enqueue(claim, true);
 			}
 		}
@@ -71,6 +80,7 @@ export class DurableWakeQueue {
 		if (
 			this.#stopped ||
 			this.#journal.isWakeFailed(claim.activationId) ||
+			this.#retired.has(claim.activationId) ||
 			(!recovering && this.#journal.isWoken(claim.activationId)) ||
 			this.#pending.some((wake) => wake.claim.activationId === claim.activationId) ||
 			this.#offered?.claim.activationId === claim.activationId
@@ -103,7 +113,12 @@ export class DurableWakeQueue {
 				});
 			return;
 		}
-		this.#pending.push({ claim, prompt: taskWakePrompt(claim.taskId), attempts: 0 });
+		this.#pending.push({
+			claim,
+			prompt: taskWakePrompt(claim.taskId),
+			attempts: 0,
+			turnComplete: false,
+		});
 		void this.#pump();
 	}
 
@@ -164,6 +179,7 @@ export class DurableWakeQueue {
 		this.#pending = [];
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
+		this.#retired.clear();
 	}
 
 	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: wake delivery and durable retry transitions remain one state machine
@@ -178,7 +194,12 @@ export class DurableWakeQueue {
 			const stored = await this.#tasks.lookup(wake.claim.taskId);
 			if (!stored || isTerminal(stored.task.status.state)) {
 				// The finally block below re-pumps, so consume without recursing.
-				await this.#markConsumed(wake.claim);
+				await this.#consumeSettled(wake.claim);
+				return;
+			}
+			if (wake.turnComplete) {
+				await this.#finishTaskTurn(wake);
+				this.#pumpFailures = 0;
 				return;
 			}
 			const deliveries = this.#journal.wakeDeliveries(wake.claim.activationId);
@@ -189,31 +210,35 @@ export class DurableWakeQueue {
 			if (!(await this.#grant(wake, stored))) return;
 			this.#offered = wake;
 			this.#activeTaskId = wake.claim.taskId;
-			try {
-				if (this.#taskTurns) {
+			if (this.#taskTurns) {
+				try {
 					await this.#taskTurns.run(wake.claim.taskId, wake.prompt);
-					await this.#finishTaskTurn(wake);
-				} else {
-					await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
+				} catch (error) {
+					await this.#handleTaskTurnFailure(wake, error);
+					return;
 				}
+				wake.turnComplete = true;
+				wake.attempts = 0;
+				await this.#finishTaskTurn(wake);
 				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
-			} catch (error) {
-				this.#offered = undefined;
-				this.#activeTaskId = undefined;
-				wake.attempts += 1;
-				const message = errorMessage(error);
-				this.#log({
-					event: "a2a_wake_failed",
-					taskId: wake.claim.taskId,
-					attempt: wake.attempts,
-					error: message,
-				});
-				if (wake.attempts >= MAX_WAKE_ATTEMPTS) {
-					if (this.#taskTurns) {
-						await this.#taskTurns.release(wake.claim.taskId);
-						await this.#recordUnhealthy(wake.claim, message);
-					} else {
+			} else {
+				try {
+					await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
+					this.#pumpFailures = 0;
+					this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
+				} catch (error) {
+					this.#offered = undefined;
+					this.#activeTaskId = undefined;
+					wake.attempts += 1;
+					const message = errorMessage(error);
+					this.#log({
+						event: "a2a_wake_failed",
+						taskId: wake.claim.taskId,
+						attempt: wake.attempts,
+						error: message,
+					});
+					if (wake.attempts >= MAX_WAKE_ATTEMPTS) {
 						await this.#journal.append({
 							kind: "WAKE_FAILED",
 							activationId: wake.claim.activationId,
@@ -221,21 +246,25 @@ export class DurableWakeQueue {
 							error: message,
 							failedAt: new Date().toISOString(),
 						});
+						this.#log({
+							event: "a2a_wake_abandoned",
+							taskId: wake.claim.taskId,
+							attempts: wake.attempts,
+							error: message,
+						});
+					} else {
+						this.#pending.unshift(wake);
+						const retryDelayMs = WAKE_RETRY_BASE_MS * 2 ** (wake.attempts - 1);
+						await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
 					}
-					this.#log({
-						event: this.#taskTurns ? "a2a_task_turn_paused" : "a2a_wake_abandoned",
-						taskId: wake.claim.taskId,
-						attempts: wake.attempts,
-						error: message,
-					});
-				} else {
-					this.#pending.unshift(wake);
-					const retryDelayMs = WAKE_RETRY_BASE_MS * 2 ** (wake.attempts - 1);
-					await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
 				}
 			}
 		} catch (error) {
 			failed = true;
+			if (wake?.turnComplete) {
+				this.#offered = undefined;
+				this.#activeTaskId = undefined;
+			}
 			if (wake) this.#restore(wake);
 			this.#pumpFailures += 1;
 			this.#log({
@@ -270,14 +299,57 @@ export class DurableWakeQueue {
 		) {
 			await this.#taskTurns?.release(wake.claim.taskId);
 		} else {
+			wake.turnComplete = false;
 			this.#pending.unshift(wake);
 		}
+	}
+
+	async #handleTaskTurnFailure(wake: PendingWake, error: unknown): Promise<void> {
+		this.#offered = undefined;
+		this.#activeTaskId = undefined;
+		wake.attempts += 1;
+		const message = errorMessage(error);
+		this.#log({
+			event: "a2a_wake_failed",
+			taskId: wake.claim.taskId,
+			attempt: wake.attempts,
+			error: message,
+		});
+		if (wake.attempts < MAX_WAKE_ATTEMPTS) {
+			this.#pending.unshift(wake);
+			const retryDelayMs = WAKE_RETRY_BASE_MS * 2 ** (wake.attempts - 1);
+			await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+			return;
+		}
+
+		this.#retired.add(wake.claim.activationId);
+		await this.#taskTurns?.release(wake.claim.taskId).catch((releaseError) => {
+			this.#log({
+				event: "a2a_task_turn_release_failed",
+				taskId: wake.claim.taskId,
+				error: errorMessage(releaseError),
+			});
+		});
+		await this.#recordUnhealthy(wake.claim, message).catch((evidenceError) => {
+			this.#log({
+				event: "a2a_task_turn_evidence_failed",
+				taskId: wake.claim.taskId,
+				error: errorMessage(evidenceError),
+			});
+		});
+		this.#log({
+			event: "a2a_task_turn_paused",
+			taskId: wake.claim.taskId,
+			attempts: wake.attempts,
+			error: message,
+		});
 	}
 
 	#restore(wake: PendingWake): void {
 		if (
 			this.#stopped ||
 			this.#journal.isWakeFailed(wake.claim.activationId) ||
+			this.#retired.has(wake.claim.activationId) ||
 			this.#offered?.claim.activationId === wake.claim.activationId ||
 			this.#pending.some((pending) => pending.claim.activationId === wake.claim.activationId)
 		) {
@@ -323,15 +395,36 @@ export class DurableWakeQueue {
 
 	async #failDeliveryCap(claim: ActivationClaim, deliveries: number): Promise<void> {
 		const error = `wake delivery cap ${MAX_WAKE_DELIVERIES} reached without Task settlement`;
-		await this.#taskTurns?.release(claim.taskId);
-		await this.#recordUnhealthy(claim, error);
-		await this.#journal.append({
-			kind: "WAKE_FAILED",
-			activationId: claim.activationId,
-			attempts: deliveries,
-			error,
-			failedAt: new Date().toISOString(),
+		this.#retired.add(claim.activationId);
+		await this.#taskTurns?.release(claim.taskId).catch((releaseError) => {
+			this.#log({
+				event: "a2a_task_turn_release_failed",
+				taskId: claim.taskId,
+				error: errorMessage(releaseError),
+			});
 		});
+		await this.#recordUnhealthy(claim, error).catch((evidenceError) => {
+			this.#log({
+				event: "a2a_task_turn_evidence_failed",
+				taskId: claim.taskId,
+				error: errorMessage(evidenceError),
+			});
+		});
+		await this.#journal
+			.append({
+				kind: "WAKE_FAILED",
+				activationId: claim.activationId,
+				attempts: deliveries,
+				error,
+				failedAt: new Date().toISOString(),
+			})
+			.catch((journalError) => {
+				this.#log({
+					event: "a2a_wake_failure_evidence_failed",
+					taskId: claim.taskId,
+					error: errorMessage(journalError),
+				});
+			});
 		this.#log({
 			event: "a2a_wake_abandoned",
 			taskId: claim.taskId,
@@ -343,6 +436,7 @@ export class DurableWakeQueue {
 
 	/** Retire a wake whose Task is gone or terminal, then look for the next one. */
 	async #consumeSettled(claim: ActivationClaim): Promise<void> {
+		await this.#taskTurns?.release(claim.taskId);
 		await this.#markConsumed(claim);
 		void this.#pump();
 	}
