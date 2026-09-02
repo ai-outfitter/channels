@@ -1,17 +1,30 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { RunningA2aServer } from "./a2a/server.ts";
 import { type A2aToolAccess, createA2aRuntimeListener, registerA2aTools } from "./a2a-extension.ts";
-import channelEventsExtension, { type SourceRegistration } from "./index.ts";
+import channelEventsExtension, { locatorChannel, type SourceRegistration } from "./index.ts";
 import relayExtension from "./relay-extension.ts";
+import type { TaskPlane } from "./task-plane/plane.ts";
 import { type RunningChannelsRuntime, startChannelsRuntime } from "./task-plane/runtime.ts";
+import {
+	TaskSessionHost,
+	type TaskSessionHostOptions,
+	type TaskTurnRunner,
+} from "./task-plane/task-sessions.ts";
+import type { SourceTaskActivationSink } from "./task-plane/types.ts";
+
+type TaskSessionOwner = TaskTurnRunner & { close(): Promise<void> };
 
 export interface ChannelsRuntimeExtensionDependencies {
 	readonly startRuntime?: typeof startChannelsRuntime;
 	readonly sources?: Readonly<Record<string, SourceRegistration>>;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
+	readonly createTaskSessionHost?: (options: TaskSessionHostOptions) => TaskSessionOwner;
 }
+
+const CHANNELS_PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
  * The package's sole Pi entrypoint. The relay remains a separate session plane;
@@ -28,18 +41,33 @@ export default function channelsRuntimeExtension(
 	let stopped = false;
 	let taskPlaneHealthy = false;
 	let a2aServer: RunningA2aServer | undefined;
+	let taskSessions: TaskSessionOwner | undefined;
+	let startingTaskPlane: TaskPlane | undefined;
+	let startingWakeQueue: RunningChannelsRuntime["wakeQueue"] | undefined;
+	let startingSourceSink: SourceTaskActivationSink | undefined;
+	let closing: Promise<void> | undefined;
+	const taskTools: ToolDefinition[] = [];
+	const taskToolPi = captureTools(pi, taskTools, async (locator) => {
+		const sourceSink = runtime?.sourceSink ?? startingSourceSink;
+		if (!sourceSink?.taskForLocator) throw new Error("task plane is not running");
+		await sourceSink.taskForLocator(locatorChannel(locator), locator);
+	});
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
 	const taskPlaneEnabled = selection !== "off" && selection !== "none";
 	const startRuntime = dependencies.startRuntime ?? startChannelsRuntime;
 	const log =
 		dependencies.log ??
 		((record: Readonly<Record<string, unknown>>): void => console.error(JSON.stringify(record)));
-	const listener = createA2aRuntimeListener({ log }, (server) => {
-		a2aServer = server;
-	});
+	const listener = createA2aRuntimeListener(
+		{ log },
+		(server) => {
+			a2aServer = server;
+		},
+		(taskId) => (runtime?.wakeQueue ?? startingWakeQueue)?.cancelTask(taskId),
+	);
 	const taskAccess = (): A2aToolAccess | undefined => {
 		if (a2aServer) return a2aServer;
-		const store = runtime?.taskPlane.taskStore;
+		const store = runtime?.taskPlane.taskStore ?? startingTaskPlane?.taskStore;
 		if (!store) return undefined;
 		return {
 			readTask: async (taskId) => (await store.lookup(taskId))?.task,
@@ -68,21 +96,48 @@ export default function channelsRuntimeExtension(
 	};
 	if (taskPlaneEnabled || listener) {
 		registerA2aTools(
-			pi,
+			taskToolPi,
 			taskAccess,
-			async (taskId) => runtime?.wakeQueue.hasAuthority(taskId) ?? false,
+			async (taskId) => (runtime?.wakeQueue ?? startingWakeQueue)?.hasAuthority(taskId) ?? false,
 			(taskId) => {
-				const queue = runtime?.wakeQueue;
+				const queue = runtime?.wakeQueue ?? startingWakeQueue;
 				return queue !== undefined && queue.sourceForTask(taskId) === "a2a";
 			},
 		);
 	}
+	const closeTaskPlane = (): Promise<void> => {
+		if (closing) return closing;
+		const loaded = runtime;
+		const sessions = taskSessions;
+		runtime = undefined;
+		taskSessions = undefined;
+		startingTaskPlane = undefined;
+		startingWakeQueue = undefined;
+		startingSourceSink = undefined;
+		const operation = (async () => {
+			try {
+				await loaded?.close();
+			} finally {
+				await sessions?.close();
+			}
+		})();
+		closing = operation;
+		void operation.then(
+			() => {
+				if (closing === operation) closing = undefined;
+			},
+			() => {
+				if (closing === operation) closing = undefined;
+			},
+		);
+		return operation;
+	};
 
 	// Register the task plane first. Pi dispatches lifecycle hooks in
 	// registration order, so the durable local plane is ready before any
 	// source or optional listener can accept work.
 	if (taskPlaneEnabled || listener) {
-		pi.on("session_start", async () => {
+		pi.on("session_start", async (_event, context) => {
 			if (runtime) {
 				taskPlaneHealthy = runtime.healthy;
 				return;
@@ -90,7 +145,10 @@ export default function channelsRuntimeExtension(
 			if (starting) return starting;
 			stopped = false;
 			taskPlaneHealthy = false;
+			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep coordinator, Task-session host, listener, and shutdown-race startup atomic
 			starting = (async () => {
+				await closing;
+				if (stopped) return;
 				const taskPlaneRoot =
 					process.env.CHANNELS_TASK_STORE_PATH?.trim() ||
 					join(
@@ -99,46 +157,74 @@ export default function channelsRuntimeExtension(
 						"channels",
 						"task-plane",
 					);
-				const loaded = await startRuntime(pi, {
-					storePath: join(taskPlaneRoot, "tasks.json"),
-					originStorePath: join(taskPlaneRoot, "origins.json"),
-					agentInterface:
-						process.env.A2A_PUBLIC_URL?.trim() ||
-						`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
-					// Channel sources receive the guarded sink from this runtime after it opens.
-					sources: [],
-					...(listener ? { listener } : {}),
+				const taskSessionOptions = {
+					cwd: context?.cwd ?? process.cwd(),
+					sessionDir: join(taskPlaneRoot, "pi-sessions"),
+					projectTrusted: context?.isProjectTrusted() ?? false,
+					customTools: taskTools,
+					excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 					log,
-				});
-				if (stopped) await loaded.close();
-				else {
-					runtime = loaded;
-					taskPlaneHealthy = loaded.healthy;
+				};
+				const sessionOwner = dependencies.createTaskSessionHost
+					? dependencies.createTaskSessionHost(taskSessionOptions)
+					: new TaskSessionHost(taskSessionOptions);
+				taskSessions = sessionOwner;
+				try {
+					const loaded = await startRuntime(pi, {
+						storePath: join(taskPlaneRoot, "tasks.json"),
+						originStorePath: join(taskPlaneRoot, "origins.json"),
+						agentInterface:
+							process.env.A2A_PUBLIC_URL?.trim() ||
+							`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
+						// Channel sources receive the guarded sink from this runtime after it opens.
+						sources: [],
+						taskTurnRunner: sessionOwner,
+						taskPlaneReady: (taskPlane, wakeQueue, sourceSink) => {
+							startingTaskPlane = taskPlane;
+							startingWakeQueue = wakeQueue;
+							startingSourceSink = sourceSink;
+						},
+						...(listener ? { listener } : {}),
+						log,
+					});
+					if (stopped) await loaded.close();
+					else {
+						runtime = loaded;
+						startingTaskPlane = undefined;
+						startingWakeQueue = undefined;
+						startingSourceSink = undefined;
+						taskPlaneHealthy = loaded.healthy;
+					}
+				} catch (error) {
+					if (taskSessions === sessionOwner) taskSessions = undefined;
+					startingTaskPlane = undefined;
+					startingWakeQueue = undefined;
+					startingSourceSink = undefined;
+					await sessionOwner.close().catch(() => {});
+					throw error;
 				}
 			})();
 			try {
 				await starting;
 			} finally {
 				starting = undefined;
+				if (!runtime) startingTaskPlane = undefined;
 			}
 		});
 	}
-	pi.on("before_agent_start", async (event) => runtime?.wakeQueue.beforeAgentStart(event.prompt));
-	pi.on("agent_end", () => runtime?.wakeQueue.agentEnd());
-
 	const channels = channelEventsExtension(
-		pi,
+		taskToolPi,
 		() => {
-			if (!runtime) throw new Error("task plane is not running");
-			return runtime.sourceSink;
+			const sourceSink = runtime?.sourceSink ?? startingSourceSink;
+			if (!sourceSink) throw new Error("task plane is not running");
+			return sourceSink;
 		},
 		dependencies.sources,
 		async () => {
 			taskPlaneHealthy = false;
-			const loaded = runtime;
-			runtime = undefined;
-			await loaded?.close();
+			await closeTaskPlane();
 		},
+		() => !stopped && runtime !== undefined,
 	);
 
 	// Channel shutdown was registered immediately above. Registering the plane
@@ -147,9 +233,7 @@ export default function channelsRuntimeExtension(
 		stopped = true;
 		taskPlaneHealthy = false;
 		await starting?.catch(() => {});
-		const loaded = runtime;
-		runtime = undefined;
-		await loaded?.close();
+		await closeTaskPlane();
 	});
 
 	relayExtension(pi);
@@ -160,4 +244,45 @@ export default function channelsRuntimeExtension(
 			else log({ event: "channels_unhealthy" });
 		});
 	}
+}
+
+function captureTools(
+	pi: ExtensionAPI,
+	captured: ToolDefinition[],
+	authorizeChannelLocator: (locator: string) => Promise<void>,
+): ExtensionAPI {
+	return new Proxy(pi, {
+		get(target, property) {
+			if (property === "registerTool") {
+				return (tool: ToolDefinition): void => {
+					if (isTaskTool(tool.name)) {
+						captured.push(scopeTaskTool(tool, authorizeChannelLocator));
+					}
+					target.registerTool(tool);
+				};
+			}
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+function scopeTaskTool(
+	tool: ToolDefinition,
+	authorizeChannelLocator: (locator: string) => Promise<void>,
+): ToolDefinition {
+	if (tool.name !== "channel_read" && tool.name !== "channel_respond") return tool;
+	return {
+		...tool,
+		async execute(toolCallId, params, signal, onUpdate, context) {
+			const locator = (params as { locator?: unknown }).locator;
+			if (typeof locator !== "string") throw new Error("channel locator is required");
+			await authorizeChannelLocator(locator);
+			return tool.execute(toolCallId, params, signal, onUpdate, context);
+		},
+	};
+}
+
+function isTaskTool(name: string): boolean {
+	return name.startsWith("a2a_") || name === "channel_read" || name === "channel_respond";
 }
