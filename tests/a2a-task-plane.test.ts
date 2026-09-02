@@ -20,6 +20,7 @@ after(async () => {
 async function launch(
 	executor: A2aExecutor,
 	overrides: Partial<A2aServerConfig> = {},
+	onTaskCanceled: (taskId: string) => void | Promise<void> = () => {},
 ): Promise<RunningA2aServer> {
 	const directory = await mkdtemp(join(tmpdir(), "a2a-test-"));
 	const config: A2aServerConfig = {
@@ -37,7 +38,7 @@ async function launch(
 		blockingTimeoutMs: 2_000,
 		...overrides,
 	};
-	const server = await startA2aServer(config, executor);
+	const server = await startA2aServer(config, executor, undefined, onTaskCanceled);
 	cleanups.push(async () => {
 		await server.close();
 		await rm(directory, { recursive: true, force: true });
@@ -402,7 +403,10 @@ describe("a2a task plane", () => {
 			await controller.status("TASK_STATE_WORKING");
 			return undefined;
 		};
-		const server = await launch(parkingExecutor);
+		const canceledTaskIds: string[] = [];
+		const server = await launch(parkingExecutor, {}, (taskId) => {
+			canceledTaskIds.push(taskId);
+		});
 		const created = await send(server, "token-a", {
 			message: userMessage("m-19", "cancel me"),
 			configuration: { returnImmediately: true },
@@ -415,6 +419,7 @@ describe("a2a task plane", () => {
 		assert.equal(canceled.status, 200);
 		const canceledBody = (await canceled.json()) as A2aTask;
 		assert.equal(canceledBody.status.state, "TASK_STATE_CANCELED");
+		assert.deepEqual(canceledTaskIds, [task.id]);
 		const again = await fetch(`${server.url}/tasks/${task.id}:cancel`, {
 			method: "POST",
 			headers: { authorization: "Bearer token-a" },

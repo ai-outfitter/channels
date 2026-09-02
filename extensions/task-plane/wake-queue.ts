@@ -34,6 +34,7 @@ export class DurableWakeQueue {
 	#pumpFailures = 0;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	readonly #retired = new Set<string>();
+	readonly #canceledTaskIds = new Set<string>();
 	readonly #retainedTaskIds = new Set<string>();
 	readonly #taskReleases = new Map<string, Promise<void>>();
 	#stopped = false;
@@ -164,6 +165,23 @@ export class DurableWakeQueue {
 		return this.#journal.claims().find((claim) => claim.taskId === taskId)?.input.source;
 	}
 
+	async cancelTask(taskId: string): Promise<void> {
+		this.#canceledTaskIds.add(taskId);
+		for (const wake of this.#pending) {
+			if (wake.claim.taskId === taskId) this.#retired.add(wake.claim.activationId);
+		}
+		this.#pending = this.#pending.filter((wake) => wake.claim.taskId !== taskId);
+		if (this.#offered?.claim.taskId === taskId) {
+			this.#retired.add(this.#offered.claim.activationId);
+			this.#offered = undefined;
+		}
+		if (this.#activeTaskId === taskId) this.#activeTaskId = undefined;
+		await this.#releaseTask(taskId).catch((error) => {
+			this.#log({ event: "a2a_task_cancel_release_failed", taskId, error: errorMessage(error) });
+		});
+		this.#schedulePump();
+	}
+
 	stop(): Promise<void> {
 		if (this.#stopPromise) return this.#stopPromise;
 		this.#stopped = true;
@@ -173,6 +191,7 @@ export class DurableWakeQueue {
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
 		this.#retired.clear();
+		this.#canceledTaskIds.clear();
 		const pump = this.#pumpPromise;
 		const retainedTaskIds = [...this.#retainedTaskIds];
 		this.#stopPromise = (async () => {
@@ -232,6 +251,10 @@ export class DurableWakeQueue {
 			}
 			if (!(await this.#grant(wake, stored))) return;
 			if (this.#stopped) return;
+			if (this.#canceledTaskIds.has(wake.claim.taskId)) {
+				await this.#consumeSettled(wake.claim);
+				return;
+			}
 			this.#offered = wake;
 			this.#activeTaskId = wake.claim.taskId;
 			if (this.#taskTurns) {
@@ -326,6 +349,7 @@ export class DurableWakeQueue {
 			isTerminal(stored.task.status.state) ||
 			INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)
 		) {
+			this.#canceledTaskIds.delete(wake.claim.taskId);
 			await this.#releaseTask(wake.claim.taskId);
 		} else {
 			wake.turnComplete = false;
@@ -365,6 +389,7 @@ export class DurableWakeQueue {
 		) {
 			this.#offered = undefined;
 			this.#activeTaskId = undefined;
+			this.#canceledTaskIds.delete(wake.claim.taskId);
 			await this.#releaseTask(wake.claim.taskId);
 			this.#log({
 				event: "a2a_task_turn_settled_after_failure",
@@ -495,6 +520,7 @@ export class DurableWakeQueue {
 
 	/** Retire a wake whose Task is gone or terminal, then look for the next one. */
 	async #consumeSettled(claim: ActivationClaim): Promise<void> {
+		this.#canceledTaskIds.delete(claim.taskId);
 		await this.#releaseTask(claim.taskId);
 		await this.#markConsumed(claim);
 		this.#schedulePump();

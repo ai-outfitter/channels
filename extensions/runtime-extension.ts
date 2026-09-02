@@ -54,9 +54,13 @@ export default function channelsRuntimeExtension(
 	const log =
 		dependencies.log ??
 		((record: Readonly<Record<string, unknown>>): void => console.error(JSON.stringify(record)));
-	const listener = createA2aRuntimeListener({ log }, (server) => {
-		a2aServer = server;
-	});
+	const listener = createA2aRuntimeListener(
+		{ log },
+		(server) => {
+			a2aServer = server;
+		},
+		(taskId) => (runtime?.wakeQueue ?? startingWakeQueue)?.cancelTask(taskId),
+	);
 	const taskAccess = (): A2aToolAccess | undefined => {
 		if (a2aServer) return a2aServer;
 		const store = runtime?.taskPlane.taskStore ?? startingTaskPlane?.taskStore;
@@ -152,6 +156,7 @@ export default function channelsRuntimeExtension(
 				const taskSessionOptions = {
 					cwd: context?.cwd ?? process.cwd(),
 					sessionDir: join(taskPlaneRoot, "pi-sessions"),
+					projectTrusted: context?.isProjectTrusted() ?? false,
 					customTools: taskTools,
 					excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 					log,

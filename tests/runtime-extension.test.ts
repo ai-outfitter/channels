@@ -648,6 +648,7 @@ test("Task tools use startup authority and source access while replay opens a Ta
 				},
 				createTaskSessionHost: (options) => {
 					sessionToolNames = options.customTools.map((tool) => tool.name).sort();
+					assert.equal(options.projectTrusted, false);
 					return {
 						async run() {},
 						async release() {},
