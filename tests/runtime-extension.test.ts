@@ -609,6 +609,7 @@ test("Task tools use startup authority and source access while replay opens a Ta
 		async () => {
 			const { pi, handlers, tools } = fakePi();
 			const loaded = running();
+			let sessionToolNames: string[] = [];
 			const task = {
 				id: "replayed",
 				contextId: "context-replayed",
@@ -645,11 +646,14 @@ test("Task tools use startup authority and source access while replay opens a Ta
 						},
 					},
 				},
-				createTaskSessionHost: () => ({
-					async run() {},
-					async release() {},
-					async close() {},
-				}),
+				createTaskSessionHost: (options) => {
+					sessionToolNames = options.customTools.map((tool) => tool.name).sort();
+					return {
+						async run() {},
+						async release() {},
+						async close() {},
+					};
+				},
 				startRuntime: async (_pi, dependencies) => {
 					dependencies.taskPlaneReady?.(loaded.taskPlane, loaded.wakeQueue, loaded.sourceSink);
 					await tools.get("a2a_read_task")?.execute("call", { taskId: task.id });
@@ -661,6 +665,16 @@ test("Task tools use startup authority and source access while replay opens a Ta
 			assert.deepEqual(await fire(handlers, "session_start"), []);
 			assert.equal(readDuringStartup, true);
 			assert.equal(sourceSinkWorkedDuringStartup, true);
+			assert.deepEqual(sessionToolNames, [
+				"a2a_complete_task",
+				"a2a_read_task",
+				"a2a_require_input",
+				"channel_read",
+				"channel_respond",
+			]);
+			assert.ok(tools.has("channel_publish"), "top-level resident keeps publication tools");
+			assert.ok(tools.has("agent_list"), "top-level resident keeps agent discovery tools");
+			assert.ok(tools.has("agent_send"), "top-level resident keeps outbound agent tools");
 			await fire(handlers, "session_shutdown");
 		},
 	);
