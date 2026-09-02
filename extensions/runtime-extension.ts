@@ -215,6 +215,7 @@ export default function channelsRuntimeExtension(
 			taskPlaneHealthy = false;
 			await closeTaskPlane();
 		},
+		() => !stopped && runtime !== undefined,
 	);
 
 	// Channel shutdown was registered immediately above. Registering the plane

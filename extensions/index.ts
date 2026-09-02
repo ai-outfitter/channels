@@ -245,6 +245,7 @@ export default function channelEventsExtension(
 	taskSink: () => SourceTaskActivationSink,
 	sources: Readonly<Record<string, SourceRegistration>> = createSourceRegistry(),
 	onTransactionalFailure: () => void | Promise<void> = () => {},
+	canStart: () => boolean = () => true,
 ): ChannelEventsLifecycle | undefined {
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
 	if (selection === "off" || selection === "none") return undefined;
@@ -376,6 +377,7 @@ export default function channelEventsExtension(
 
 	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup deliberately keeps staging, rollback, shutdown races, and readiness in one lifecycle transaction
 	pi.on("session_start", async (_event, ctx) => {
+		if (!canStart()) return;
 		if (stops.length > 0 || starting) return; // idempotent across reload / concurrent fires
 		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
 		starting = true;

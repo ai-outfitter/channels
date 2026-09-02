@@ -183,11 +183,13 @@ test("reports ready only when both task-plane and channel startup succeed", asyn
 
 test("concurrent runtime shutdowns share the active cleanup barrier", async () => {
 	await withEnv(
-		{ OUTFITTER_CHANNELS: "", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
 		async () => {
 			const { pi, handlers } = fakePi();
-			let starts = 0;
-			let closes = 0;
+			let runtimeStarts = 0;
+			let runtimeCloses = 0;
+			let sourceStarts = 0;
+			let sourceStops = 0;
 			let closeStarted = (): void => {};
 			const closing = new Promise<void>((resolve) => {
 				closeStarted = resolve;
@@ -197,12 +199,25 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 				finishClose = resolve;
 			});
 			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({
+							async start() {
+								sourceStarts += 1;
+								return async () => {
+									sourceStops += 1;
+								};
+							},
+						}),
+					},
+				},
 				startRuntime: async () => {
-					starts += 1;
+					runtimeStarts += 1;
 					return running(async () => {
-						closes += 1;
+						runtimeCloses += 1;
 						closeStarted();
-						if (closes === 1) await closeBlocked;
+						if (runtimeCloses === 1) await closeBlocked;
 					});
 				},
 				createTaskSessionHost: () => ({
@@ -212,28 +227,31 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 				}),
 			});
 			await fire(handlers, "session_start");
-			const shutdown = handlers.get("session_shutdown")?.at(-1);
-			assert.ok(shutdown);
-			const first = Promise.resolve(shutdown());
+			assert.equal(sourceStarts, 1);
+			const first = fire(handlers, "session_shutdown");
 			await closing;
 			const restart = fire(handlers, "session_start");
 			let secondShutdownResolved = false;
-			const secondShutdown = Promise.resolve(shutdown()).then(() => {
+			const secondShutdown = fire(handlers, "session_shutdown").then(() => {
 				secondShutdownResolved = true;
 			});
 			await new Promise((resolve) => setImmediate(resolve));
-			assert.equal(starts, 1, "restart must wait for the active cleanup barrier");
+			assert.equal(runtimeStarts, 1, "restart must wait for the active cleanup barrier");
 			assert.equal(secondShutdownResolved, false);
 			finishClose();
 			await Promise.all([first, restart, secondShutdown]);
 			assert.equal(secondShutdownResolved, true);
-			assert.equal(starts, 1, "the overlapping shutdown must cancel the waiting restart");
-			assert.equal(closes, 1);
+			assert.equal(runtimeStarts, 1, "the overlapping shutdown must cancel the waiting restart");
+			assert.equal(runtimeCloses, 1);
+			assert.equal(sourceStarts, 1, "the canceled start event must not restart channel sources");
+			assert.equal(sourceStops, 1);
 
 			await fire(handlers, "session_start");
-			assert.equal(starts, 2, "a later clean start remains available");
+			assert.equal(runtimeStarts, 2, "a later clean start remains available");
+			assert.equal(sourceStarts, 2);
 			await fire(handlers, "session_shutdown");
-			assert.equal(closes, 2);
+			assert.equal(runtimeCloses, 2);
+			assert.equal(sourceStops, 2);
 		},
 	);
 });
