@@ -994,6 +994,46 @@ it("stop releases a retained Task session while its next wake is being prepared"
 	assert.equal(releases, 1, "stop must release the retained Task session");
 });
 
+it("external Task cancellation aborts and releases its active session", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-cancel-active-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("wake-cancel-active"));
+	let turnStarted = (): void => {};
+	const running = new Promise<void>((resolve) => {
+		turnStarted = resolve;
+	});
+	let abortTurn = (): void => {};
+	const blocked = new Promise<void>((resolve) => {
+		abortTurn = resolve;
+	});
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turnStarted();
+				await blocked;
+				throw new Error("Task session aborted");
+			},
+			async release() {
+				releases += 1;
+				abortTurn();
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await running;
+	await tasks.updateStatus("source:user", accepted.taskId, { state: "TASK_STATE_CANCELED" });
+	await queue.cancelTask(accepted.taskId);
+	await waitFor(() => releases === 1);
+	assert.equal(await queue.hasAuthority(accepted.taskId), false);
+	await queue.stop();
+});
+
 it("retries when the delivery-time Task transition fails", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-start-failure-"));
 	const { plane, tasks, journal } = await fixture(root);

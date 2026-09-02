@@ -27,6 +27,7 @@ export interface TaskSessionFactoryInput {
 	readonly taskId: string;
 	readonly cwd: string;
 	readonly agentDir: string;
+	readonly projectTrusted: boolean;
 	readonly sessionManager: SessionManager;
 	readonly customTools: readonly ToolDefinition[];
 	readonly excludedExtensionRoot: string;
@@ -40,6 +41,7 @@ export interface TaskSessionHostOptions {
 	readonly customTools: readonly ToolDefinition[];
 	readonly excludedExtensionRoot: string;
 	readonly agentDir?: string;
+	readonly projectTrusted?: boolean;
 	readonly createSession?: TaskSessionFactory;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -140,6 +142,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 				taskId,
 				cwd: this.#options.cwd,
 				agentDir: this.#options.agentDir ?? getAgentDir(),
+				projectTrusted: this.#options.projectTrusted ?? false,
 				sessionManager,
 				customTools: this.#options.customTools,
 				excludedExtensionRoot: this.#options.excludedExtensionRoot,
@@ -162,7 +165,9 @@ export class TaskSessionHost implements TaskTurnRunner {
 }
 
 async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<TaskSession> {
-	const settingsManager = SettingsManager.create(input.cwd, input.agentDir);
+	const settingsManager = SettingsManager.create(input.cwd, input.agentDir, {
+		projectTrusted: input.projectTrusted,
+	});
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: input.cwd,
 		agentDir: input.agentDir,
