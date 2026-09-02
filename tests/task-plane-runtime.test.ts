@@ -2317,10 +2317,38 @@ it("runtime close joins an in-flight outbound delivery", async () => {
 	});
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(closeResolved, false);
+	await assert.rejects(
+		runtime.sourceSink.deliver(
+			{
+				taskId: "task-too-late",
+				source: "slack",
+				operationId: "reply:too-late",
+				payloadDigest: digest("too late"),
+				recovery: "lookup",
+			},
+			async () => "must-not-send",
+			async () => undefined,
+		),
+		/delivery is closed/,
+	);
 	finishSend();
 	assert.equal(await delivery, "provider-close");
 	await close;
 	assert.equal(closeResolved, true);
+	await assert.rejects(
+		runtime.sourceSink.deliver(
+			{
+				taskId: "task-after-close",
+				source: "slack",
+				operationId: "reply:after-close",
+				payloadDigest: digest("after close"),
+				recovery: "lookup",
+			},
+			async () => "must-not-send",
+			async () => undefined,
+		),
+		/delivery is closed/,
+	);
 });
 
 it("fails closed when lookup recovery has no reconciler and records one-prefix evidence", async () => {
