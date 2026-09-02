@@ -158,14 +158,17 @@ export class DurableWakeQueue {
 		return this.#journal.claims().find((claim) => claim.taskId === taskId)?.input.source;
 	}
 
-	stop(): void {
+	async stop(): Promise<void> {
+		if (this.#stopped) return;
 		this.#stopped = true;
 		if (this.#retryTimer) clearTimeout(this.#retryTimer);
 		this.#retryTimer = undefined;
 		this.#pending = [];
+		const activeTaskId = this.#activeTaskId;
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
 		this.#retired.clear();
+		if (activeTaskId) await this.#taskTurns?.release(activeTaskId).catch(() => {});
 	}
 
 	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: wake delivery and durable retry transitions remain one state machine
@@ -195,21 +198,25 @@ export class DurableWakeQueue {
 				return;
 			}
 			if (!(await this.#grant(wake, stored))) return;
+			if (this.#stopped) return;
 			this.#offered = wake;
 			this.#activeTaskId = wake.claim.taskId;
 			if (this.#taskTurns) {
 				try {
 					await this.#taskTurns.run(wake.claim.taskId, wake.prompt);
 				} catch (error) {
+					if (this.#stopped) return;
 					await this.#handleTaskTurnFailure(wake, error);
 					return;
 				}
+				if (this.#stopped) return;
 				wake.turnComplete = true;
 				wake.attempts = 0;
 				await this.#finishTaskTurn(wake);
 				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
 			} else {
+				if (this.#stopped) return;
 				try {
 					await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
 					this.#pumpFailures = 0;
@@ -279,6 +286,7 @@ export class DurableWakeQueue {
 		const stored = await this.#tasks.lookup(wake.claim.taskId);
 		this.#activeTaskId = undefined;
 		this.#offered = undefined;
+		if (this.#stopped) return;
 		if (
 			!stored ||
 			isTerminal(stored.task.status.state) ||
@@ -310,6 +318,11 @@ export class DurableWakeQueue {
 			this.#offered = undefined;
 			this.#activeTaskId = undefined;
 			throw lookupError;
+		}
+		if (this.#stopped) {
+			this.#offered = undefined;
+			this.#activeTaskId = undefined;
+			return;
 		}
 		if (
 			!stored ||
