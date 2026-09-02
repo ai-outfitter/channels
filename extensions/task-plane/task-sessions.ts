@@ -47,10 +47,18 @@ export interface TaskSessionHostOptions {
 export class TaskSessionHost implements TaskTurnRunner {
 	readonly #options: TaskSessionHostOptions;
 	readonly #sessions = new Map<string, Promise<TaskSession>>();
+	readonly #sessionPaths: Promise<Map<string, string[]>>;
 	#closed = false;
 
 	constructor(options: TaskSessionHostOptions) {
 		this.#options = options;
+		this.#sessionPaths = SessionManager.listAll(options.sessionDir).then((sessions) => {
+			const paths = new Map<string, string[]>();
+			for (const session of sessions) {
+				paths.set(session.id, [...(paths.get(session.id) ?? []), session.path]);
+			}
+			return paths;
+		});
 	}
 
 	async run(taskId: string, prompt: string): Promise<void> {
@@ -93,14 +101,13 @@ export class TaskSessionHost implements TaskTurnRunner {
 
 	async #create(taskId: string): Promise<TaskSession> {
 		const sessionId = derivedId("task", taskId);
-		const existing = (await SessionManager.listAll(this.#options.sessionDir)).filter(
-			(session) => session.id === sessionId,
-		);
-		if (existing.length > 1) {
+		const sessionPaths = await this.#sessionPaths;
+		const existingPaths = sessionPaths.get(sessionId) ?? [];
+		if (existingPaths.length > 1) {
 			throw new Error(`multiple Pi sessions exist for task "${taskId}"`);
 		}
-		const sessionManager = existing[0]
-			? SessionManager.open(existing[0].path, this.#options.sessionDir, this.#options.cwd)
+		const sessionManager = existingPaths[0]
+			? SessionManager.open(existingPaths[0], this.#options.sessionDir, this.#options.cwd)
 			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
 		const createSession = this.#options.createSession ?? createPiTaskSession;
 		const session = await createSession({
@@ -111,8 +118,10 @@ export class TaskSessionHost implements TaskTurnRunner {
 			customTools: this.#options.customTools,
 			excludedExtensionRoot: this.#options.excludedExtensionRoot,
 		});
+		const sessionFile = sessionManager.getSessionFile();
+		if (sessionFile) sessionPaths.set(sessionId, [sessionFile]);
 		this.#options.log?.({
-			event: existing[0] ? "task_session_reopened" : "task_session_created",
+			event: existingPaths[0] ? "task_session_reopened" : "task_session_created",
 			taskId,
 			sessionId: session.sessionId,
 		});
