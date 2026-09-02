@@ -140,6 +140,59 @@ test("Task session host ignores stale duplicate paths for a durable session", as
 	}
 });
 
+test("Task session host reopens a partial durable session after factory failure", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-partial-"));
+	let attempts = 0;
+	let reopenedEntries = 0;
+	const host = new TaskSessionHost({
+		cwd: root,
+		sessionDir: join(root, "sessions"),
+		customTools: [],
+		excludedExtensionRoot: root,
+		createSession: async ({ sessionManager }) => {
+			attempts += 1;
+			if (attempts === 1) {
+				sessionManager.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: "partial" }],
+					timestamp: Date.now(),
+				} as never);
+				throw new Error("binding failed");
+			}
+			reopenedEntries = sessionManager.getEntries().length;
+			return {
+				sessionId: sessionManager.getSessionId(),
+				sessionFile: sessionManager.getSessionFile(),
+				async prompt() {},
+				async close() {},
+			};
+		},
+	});
+	await assert.rejects(host.run("task", "first"), /binding failed/);
+	await host.run("task", "retry");
+	assert.ok(reopenedEntries > 0);
+	await host.close();
+});
+
+test("Task session host retains an eager index failure for the first Task turn", async () => {
+	const listAll = SessionManager.listAll;
+	SessionManager.listAll = async () => {
+		throw new Error("session directory unreadable");
+	};
+	try {
+		const host = new TaskSessionHost({
+			cwd: tmpdir(),
+			sessionDir: join(tmpdir(), "unreadable-sessions"),
+			customTools: [],
+			excludedExtensionRoot: tmpdir(),
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		await assert.rejects(host.run("task", "prompt"), /session directory unreadable/);
+	} finally {
+		SessionManager.listAll = listAll;
+	}
+});
+
 test("extension containment uses path boundaries", () => {
 	const root = join(tmpdir(), "channels-package");
 	assert.equal(isPathInside(root, root), true);

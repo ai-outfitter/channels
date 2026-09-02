@@ -1113,6 +1113,40 @@ it("replays only the newest continuation claim for an interrupted Task", async (
 	replayed.stop();
 });
 
+it("does not fall back to an older claim when the newest Task activation failed", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-newest-failed-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("older-activation"));
+	await tasks.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_INPUT_REQUIRED",
+		message: {
+			messageId: "question-before-failed-continuation",
+			role: "ROLE_AGENT",
+			parts: [{ text: "Continue?" }],
+		},
+	});
+	await plane.continue({ ...activation("failed-continuation"), taskId: accepted.taskId });
+	const newestClaim = journal.claims().at(-1);
+	assert.ok(newestClaim);
+	await journal.append({
+		kind: "WAKE_FAILED",
+		activationId: newestClaim.activationId,
+		attempts: MAX_WAKE_DELIVERIES,
+		error: "delivery cap",
+		failedAt: new Date().toISOString(),
+	});
+	const prompts: string[] = [];
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	await replayed.replay();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(prompts, []);
+	replayed.stop();
+});
+
 it("terminal replay claims do not consume the pending-wake bound", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-terminal-replay-"));
 	const journal = new ActivationJournal(join(root, "activation.jsonl"));
@@ -1207,11 +1241,12 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	setTimeout(() => {
 		timerFired = true;
 	}, 5);
-	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await waitFor(() => timerFired && attempts === 3);
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	queue.enqueue(claim);
+	await waitFor(() => timerFired && journal.isWakeFailed(claim.activationId));
 	assert.equal(timerFired, true);
 	assert.equal(attempts, 3);
-	assert.equal(journal.isWakeFailed(journal.claims()[0]?.activationId ?? ""), true);
+	assert.equal(journal.isWakeFailed(claim.activationId), true);
 	assert.equal(
 		logs.some((record) => record.event === "a2a_wake_abandoned"),
 		true,
@@ -1280,6 +1315,49 @@ it("pauses a failing Task turn without poisoning restart recovery", async () => 
 	await waitFor(() => recovered === 1);
 	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
 	replayed.stop();
+});
+
+it("does not retry a rejected turn that already requested caller input", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-failed-after-input-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-failed-after-input"));
+	let turns = 0;
+	let releases = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run(taskId) {
+				turns += 1;
+				await tasks.updateStatus("source:user", taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+					message: {
+						messageId: "question-after-failure",
+						role: "ROLE_AGENT",
+						parts: [{ text: "Need input" }],
+					},
+				});
+				throw new Error("provider failed after tool completion");
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(turns, 1);
+	assert.equal(
+		(await tasks.lookup(accepted.taskId))?.task.status.state,
+		"TASK_STATE_INPUT_REQUIRED",
+	);
+	assert.ok(logs.some((record) => record.event === "a2a_task_turn_settled_after_failure"));
+	queue.stop();
 });
 
 it("does not rerun a completed Task turn when settlement lookup fails", async () => {

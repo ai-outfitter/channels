@@ -323,9 +323,9 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 	);
 });
 
-test("A2A Task tools use startup authority while replay opens a Task session", async () => {
+test("Task tools use startup authority and source access while replay opens a Task session", async () => {
 	await withEnv(
-		{ OUTFITTER_CHANNELS: "off", A2A_SERVER: "1", OUTFITTER_AGENT_RELAY: undefined },
+		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: "1", OUTFITTER_AGENT_RELAY: undefined },
 		async () => {
 			const { pi, handlers, tools } = fakePi();
 			const loaded = running();
@@ -347,21 +347,36 @@ test("A2A Task tools use startup authority while replay opens a Task session", a
 				sourceForTask: () => "a2a",
 			});
 			let readDuringStartup = false;
+			let sourceSinkDuringStartup: unknown;
 			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({ start: async () => async () => {} }),
+						loadActions: async (_journal, sourceSink) => {
+							sourceSinkDuringStartup = sourceSink;
+							return {
+								read: async (locator: string) => ({ locator, messages: [] }),
+							} as never;
+						},
+					},
+				},
 				createTaskSessionHost: () => ({
 					async run() {},
 					async release() {},
 					async close() {},
 				}),
 				startRuntime: async (_pi, dependencies) => {
-					dependencies.taskPlaneReady?.(loaded.taskPlane, loaded.wakeQueue);
+					dependencies.taskPlaneReady?.(loaded.taskPlane, loaded.wakeQueue, loaded.sourceSink);
 					await tools.get("a2a_read_task")?.execute("call", { taskId: task.id });
+					await tools.get("channel_read")?.execute("call", { locator: "test:v1:item" });
 					readDuringStartup = true;
 					return loaded;
 				},
 			});
 			assert.deepEqual(await fire(handlers, "session_start"), []);
 			assert.equal(readDuringStartup, true);
+			assert.equal(sourceSinkDuringStartup, loaded.sourceSink);
 			await fire(handlers, "session_shutdown");
 		},
 	);

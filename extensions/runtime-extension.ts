@@ -13,6 +13,7 @@ import {
 	type TaskSessionHostOptions,
 	type TaskTurnRunner,
 } from "./task-plane/task-sessions.ts";
+import type { SourceTaskActivationSink } from "./task-plane/types.ts";
 
 type TaskSessionOwner = TaskTurnRunner & { close(): Promise<void> };
 
@@ -43,6 +44,7 @@ export default function channelsRuntimeExtension(
 	let taskSessions: TaskSessionOwner | undefined;
 	let startingTaskPlane: TaskPlane | undefined;
 	let startingWakeQueue: RunningChannelsRuntime["wakeQueue"] | undefined;
+	let startingSourceSink: SourceTaskActivationSink | undefined;
 	const taskTools: ToolDefinition[] = [];
 	const taskToolPi = captureTools(pi, taskTools);
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
@@ -101,6 +103,7 @@ export default function channelsRuntimeExtension(
 		taskSessions = undefined;
 		startingTaskPlane = undefined;
 		startingWakeQueue = undefined;
+		startingSourceSink = undefined;
 		try {
 			await loaded?.close();
 		} finally {
@@ -151,9 +154,10 @@ export default function channelsRuntimeExtension(
 						// Channel sources receive the guarded sink from this runtime after it opens.
 						sources: [],
 						taskTurnRunner: sessionOwner,
-						taskPlaneReady: (taskPlane, wakeQueue) => {
+						taskPlaneReady: (taskPlane, wakeQueue, sourceSink) => {
 							startingTaskPlane = taskPlane;
 							startingWakeQueue = wakeQueue;
+							startingSourceSink = sourceSink;
 						},
 						...(listener ? { listener } : {}),
 						log,
@@ -163,12 +167,14 @@ export default function channelsRuntimeExtension(
 						runtime = loaded;
 						startingTaskPlane = undefined;
 						startingWakeQueue = undefined;
+						startingSourceSink = undefined;
 						taskPlaneHealthy = loaded.healthy;
 					}
 				} catch (error) {
 					if (taskSessions === sessionOwner) taskSessions = undefined;
 					startingTaskPlane = undefined;
 					startingWakeQueue = undefined;
+					startingSourceSink = undefined;
 					await sessionOwner.close().catch(() => {});
 					throw error;
 				}
@@ -184,8 +190,9 @@ export default function channelsRuntimeExtension(
 	const channels = channelEventsExtension(
 		taskToolPi,
 		() => {
-			if (!runtime) throw new Error("task plane is not running");
-			return runtime.sourceSink;
+			const sourceSink = runtime?.sourceSink ?? startingSourceSink;
+			if (!sourceSink) throw new Error("task plane is not running");
+			return sourceSink;
 		},
 		dependencies.sources,
 		async () => {
