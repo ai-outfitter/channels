@@ -142,10 +142,10 @@ agent, a tool set, or a workflow topology.
   status, history, artifacts — is the record. A reconnecting client reads
   the Task, then opens a new subscription; nothing replays.
 - **Wake authority begins at delivery.** The queue grants authority, transitions
-  the Task to `WORKING`, and records `WOKEN` immediately before delivering the
-  body-free follow-up. Authority lasts through the end of the turn that consumes
-  that wake, whether or not Pi fires `before_agent_start` for the follow-up.
-  `agent_end` clears it before the queue offers another Task.
+  the Task to `WORKING`, and records `WOKEN` immediately before prompting that
+  Task's Pi session. Authority lasts through that session's turn. The queue
+  clears it before offering another Task; an interrupted Task waits for a newly
+  accepted continuation rather than being offered again immediately.
 - **Wake recovery follows terminal Task state.** `WOKEN` records that Pi was
   offered a turn, not that the turn completed. On startup, every accepted activation
   whose Task is still non-terminal is offered once to the new runtime, including
@@ -209,11 +209,16 @@ An inbound work message first enters the trusted task-plane sink. Acceptance
 writes the journal claim, creates or continues the Task, appends the authorized
 history, projects evidence, and queues a **body-free wake** before returning the
 Task. Explicit continuation is authorized before its caller message is
-persisted. The wake queue changes the
-Task to `WORKING` and grants it as the turn's sole authority. The A2A listener
-never wakes Pi directly. The agent then drives the task with three tools:
+persisted. The wake queue changes the Task to `WORKING`, grants it as the turn's
+sole authority, and creates or reopens the durable Pi session derived from its
+Task ID. The coordinator owns sources and stores but performs no inference.
+Task sessions receive the resident's non-Channels extensions plus the shared
+Task-authorized channel tools; they do not start another listener or source
+runtime. The agent then drives the task with three tools:
 
-- `a2a_read_task` — read the task's history inside untrusted-content markers.
+- `a2a_read_task` — read the newest task history that fits inside a 64 KiB
+  model-facing result, with UTF-8-safe excerpting when the newest message alone
+  is too large. Tool metadata never contains the complete Task.
 - `a2a_complete_task` — record the response as an artifact and complete, or
   reject with a reason.
 - `a2a_require_input` — pause the task on the caller with a question; the

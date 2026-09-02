@@ -324,13 +324,23 @@ test("real wake-queue source wiring denies continuation for a native Task", asyn
 		async () => {
 			const { pi, handlers, tools } = fakePi();
 			const prompts: string[] = [];
+			let finishTurn: (() => void) | undefined;
 			Object.assign(pi, {
-				sendUserMessage(prompt: string) {
-					prompts.push(prompt);
-				},
+				sendUserMessage: () => assert.fail("coordinator must not run inference"),
 			});
 			let runtime: RunningChannelsRuntime | undefined;
 			channelsRuntimeExtension(pi, {
+				createTaskSessionHost: () => ({
+					async run(_taskId, prompt) {
+						prompts.push(prompt);
+						await new Promise<void>((resolve) => {
+							finishTurn = resolve;
+						});
+					},
+					async close() {
+						finishTurn?.();
+					},
+				}),
 				startRuntime: async (runtimePi, dependencies) => {
 					const { listener: _listener, ...withoutListener } = dependencies;
 					runtime = await startChannelsRuntime(runtimePi, {
@@ -353,17 +363,18 @@ test("real wake-queue source wiring denies continuation for a native Task", asyn
 				contentDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			});
 			await waitFor(() => prompts.length === 1);
-			const before = handlers.get("before_agent_start")?.[0];
-			assert.ok(before && prompts[0]);
-			await (before as unknown as (event: { prompt: string }) => Promise<void>)({
-				prompt: prompts[0],
-			});
 			const requireInput = tools.get("a2a_require_input");
 			assert.ok(requireInput);
 			await assert.rejects(
 				requireInput.execute("call", { taskId: accepted.taskId, question: "more?" }),
 				/source has no continuation method/,
 			);
+			await tools.get("a2a_complete_task")?.execute("call", {
+				taskId: accepted.taskId,
+				response: "done",
+				outcome: "completed",
+			});
+			finishTurn?.();
 			await fire(handlers, "session_shutdown");
 		},
 	);
@@ -381,9 +392,23 @@ test("native-only deployment registers task tools and settles a Task end to end"
 		async () => {
 			const { pi, handlers, tools } = fakePi();
 			const prompts: string[] = [];
-			Object.assign(pi, { sendUserMessage: (prompt: string) => prompts.push(prompt) });
+			let finishTurn: (() => void) | undefined;
+			Object.assign(pi, {
+				sendUserMessage: () => assert.fail("coordinator must not run inference"),
+			});
 			let runtime: RunningChannelsRuntime | undefined;
 			channelsRuntimeExtension(pi, {
+				createTaskSessionHost: () => ({
+					async run(_taskId, prompt) {
+						prompts.push(prompt);
+						await new Promise<void>((resolve) => {
+							finishTurn = resolve;
+						});
+					},
+					async close() {
+						finishTurn?.();
+					},
+				}),
 				startRuntime: async (runtimePi, dependencies) => {
 					runtime = await startChannelsRuntime(runtimePi, dependencies);
 					return runtime;
@@ -420,6 +445,7 @@ test("native-only deployment registers task tools and settles a Task end to end"
 				(await runtime.taskPlane.taskStore.lookup(accepted.taskId))?.task.status.state,
 				"TASK_STATE_COMPLETED",
 			);
+			finishTurn?.();
 			const journal = await readFile(join(root, "activation-journal.v1.jsonl"), "utf8");
 			assert.equal(journal.match(/"kind":"WOKEN"/g)?.length, 1);
 			await fire(handlers, "session_shutdown");

@@ -1998,6 +1998,48 @@ it("keeps sources running when the optional A2A listener cannot start", async ()
 	assert.equal(sourceStopped, 1);
 });
 
+it("routes each wake through its Task turn runner without prompting the coordinator", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turns-"));
+	const coordinatorPrompts: string[] = [];
+	const turns: Array<{ taskId: string; prompt: string }> = [];
+	let runtime: Awaited<ReturnType<typeof startChannelsRuntime>>;
+	runtime = await startChannelsRuntime(
+		{ sendUserMessage: async (prompt: string) => coordinatorPrompts.push(prompt) },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+			taskTurnRunner: {
+				async run(taskId, prompt) {
+					turns.push({ taskId, prompt });
+					const stored = await runtime.taskPlane.taskStore.lookup(taskId);
+					assert.ok(stored);
+					await runtime.taskPlane.taskStore.updateStatus(stored.principal, taskId, {
+						state: "TASK_STATE_COMPLETED",
+					});
+				},
+			},
+		},
+	);
+	try {
+		const first = await runtime.sourceSink.accept(
+			activation("task-turn-one", { conversationKey: "task-turn-one" }),
+		);
+		const second = await runtime.sourceSink.accept(
+			activation("task-turn-two", { conversationKey: "task-turn-two" }),
+		);
+		await waitFor(() => turns.length === 2);
+		assert.notEqual(first.taskId, second.taskId);
+		assert.deepEqual(turns, [
+			{ taskId: first.taskId, prompt: taskWakePrompt(first.taskId) },
+			{ taskId: second.taskId, prompt: taskWakePrompt(second.taskId) },
+		]);
+		assert.deepEqual(coordinatorPrompts, []);
+	} finally {
+		await runtime.close();
+	}
+});
+
 it("claims A2A inbound work before the queue wakes and grants Task authority", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-a2a-claim-"));
 	const prompts: string[] = [];
