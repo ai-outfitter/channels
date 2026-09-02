@@ -120,6 +120,7 @@ export async function startChannelsRuntime(
 	let intakeOpen = false;
 	let listenerHealthy = true;
 	const deliveryOperations = new Map<string, Promise<string | undefined>>();
+	let deliveryOpen = true;
 	const drainDeliveries = async (): Promise<void> => {
 		while (deliveryOperations.size > 0) {
 			await Promise.allSettled([...deliveryOperations.values()]);
@@ -175,6 +176,7 @@ export async function startChannelsRuntime(
 		},
 		recordEvidence: (input) => evidence.appendSource(input),
 		async deliver(input, send, reconcile) {
+			if (!deliveryOpen) throw new Error("runtime delivery is closed");
 			const deliveryId = derivedId(
 				"delivery",
 				input.payloadPolicy === "fixed"
@@ -336,6 +338,7 @@ export async function startChannelsRuntime(
 		intakeOpen = false;
 		await wakeQueue.stop();
 		for (const stop of stops.reverse()) await stop().catch(() => {});
+		deliveryOpen = false;
 		await drainDeliveries();
 		log({ event: "channels_unhealthy", error: errorMessage(error) });
 		throw error;
@@ -353,6 +356,7 @@ export async function startChannelsRuntime(
 			for (const stop of stops.reverse()) await stop().catch(() => {});
 			intakeOpen = false;
 			await wakeQueue.stop();
+			deliveryOpen = false;
 			await drainDeliveries();
 		},
 	};
