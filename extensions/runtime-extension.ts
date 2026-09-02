@@ -45,6 +45,7 @@ export default function channelsRuntimeExtension(
 	let startingTaskPlane: TaskPlane | undefined;
 	let startingWakeQueue: RunningChannelsRuntime["wakeQueue"] | undefined;
 	let startingSourceSink: SourceTaskActivationSink | undefined;
+	let closing: Promise<void> | undefined;
 	const taskTools: ToolDefinition[] = [];
 	const taskToolPi = captureTools(pi, taskTools);
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
@@ -96,7 +97,8 @@ export default function channelsRuntimeExtension(
 			},
 		);
 	}
-	const closeTaskPlane = async (): Promise<void> => {
+	const closeTaskPlane = (): Promise<void> => {
+		if (closing) return closing;
 		const loaded = runtime;
 		const sessions = taskSessions;
 		runtime = undefined;
@@ -104,11 +106,23 @@ export default function channelsRuntimeExtension(
 		startingTaskPlane = undefined;
 		startingWakeQueue = undefined;
 		startingSourceSink = undefined;
-		try {
-			await loaded?.close();
-		} finally {
-			await sessions?.close();
-		}
+		const operation = (async () => {
+			try {
+				await loaded?.close();
+			} finally {
+				await sessions?.close();
+			}
+		})();
+		closing = operation;
+		void operation.then(
+			() => {
+				if (closing === operation) closing = undefined;
+			},
+			() => {
+				if (closing === operation) closing = undefined;
+			},
+		);
+		return operation;
 	};
 
 	// Register the task plane first. Pi dispatches lifecycle hooks in

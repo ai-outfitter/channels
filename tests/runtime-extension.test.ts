@@ -181,6 +181,49 @@ test("reports ready only when both task-plane and channel startup succeed", asyn
 	);
 });
 
+test("concurrent runtime shutdowns share the active cleanup barrier", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: "", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers } = fakePi();
+			let closeStarted = (): void => {};
+			const closing = new Promise<void>((resolve) => {
+				closeStarted = resolve;
+			});
+			let finishClose = (): void => {};
+			const closeBlocked = new Promise<void>((resolve) => {
+				finishClose = resolve;
+			});
+			channelsRuntimeExtension(pi, {
+				startRuntime: async () =>
+					running(async () => {
+						closeStarted();
+						await closeBlocked;
+					}),
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {},
+				}),
+			});
+			await fire(handlers, "session_start");
+			const shutdown = handlers.get("session_shutdown")?.at(-1);
+			assert.ok(shutdown);
+			const first = Promise.resolve(shutdown());
+			await closing;
+			let secondResolved = false;
+			const second = Promise.resolve(shutdown()).then(() => {
+				secondResolved = true;
+			});
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(secondResolved, false);
+			finishClose();
+			await Promise.all([first, second]);
+			assert.equal(secondResolved, true);
+		},
+	);
+});
+
 test("disables task-plane startup when channels are off and never uses A2A_STORE_PATH", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-runtime-root-"));
 	const a2aPath = join(root, "a2a", "tasks.json");
