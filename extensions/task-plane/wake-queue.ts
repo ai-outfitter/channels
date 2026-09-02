@@ -10,6 +10,7 @@ interface PendingWake {
 	readonly prompt: string;
 	attempts: number;
 	turnComplete: boolean;
+	deliveryPending: boolean;
 }
 
 const MAX_WAKE_ATTEMPTS = 3;
@@ -124,6 +125,7 @@ export class DurableWakeQueue {
 			prompt: taskWakePrompt(claim.taskId),
 			attempts: 0,
 			turnComplete: false,
+			deliveryPending: false,
 		});
 		this.#schedulePump();
 	}
@@ -207,14 +209,18 @@ export class DurableWakeQueue {
 			if (!wake) return;
 			const stored = await this.#tasks.lookup(wake.claim.taskId);
 			if (this.#stopped) return;
+			if (wake.turnComplete) {
+				if (wake.deliveryPending) {
+					await this.#markDelivered(wake.claim);
+					wake.deliveryPending = false;
+				}
+				await this.#finishTaskTurn(wake);
+				this.#pumpFailures = 0;
+				return;
+			}
 			if (!stored || isTerminal(stored.task.status.state)) {
 				// The finally block below re-pumps, so consume without recursing.
 				await this.#consumeSettled(wake.claim);
-				return;
-			}
-			if (wake.turnComplete) {
-				await this.#finishTaskTurn(wake);
-				this.#pumpFailures = 0;
 				return;
 			}
 			const deliveries = this.#journal.wakeDeliveries(wake.claim.activationId);
@@ -236,8 +242,10 @@ export class DurableWakeQueue {
 				}
 				if (this.#stopped) return;
 				wake.turnComplete = true;
+				wake.deliveryPending = true;
 				wake.attempts = 0;
 				await this.#markDelivered(wake.claim);
+				wake.deliveryPending = false;
 				await this.#finishTaskTurn(wake);
 				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });

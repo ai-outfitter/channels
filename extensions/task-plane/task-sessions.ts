@@ -48,6 +48,7 @@ export interface TaskSessionHostOptions {
 export class TaskSessionHost implements TaskTurnRunner {
 	readonly #options: TaskSessionHostOptions;
 	readonly #sessions = new Map<string, Promise<TaskSession>>();
+	readonly #releases = new Set<Promise<void>>();
 	readonly #sessionPaths: Promise<Map<string, string[]>>;
 	#closed = false;
 	#closePromise: Promise<void> | undefined;
@@ -77,21 +78,31 @@ export class TaskSessionHost implements TaskTurnRunner {
 		const pending = this.#sessions.get(taskId);
 		if (!pending) return;
 		this.#sessions.delete(taskId);
-		const session = await pending.catch(() => undefined);
-		await session?.close().catch(() => {});
+		const release = (async () => {
+			const session = await pending.catch(() => undefined);
+			await session?.close().catch(() => {});
+		})();
+		this.#releases.add(release);
+		try {
+			await release;
+		} finally {
+			this.#releases.delete(release);
+		}
 	}
 
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#closed = true;
 		const sessions = [...this.#sessions.values()];
+		const releases = [...this.#releases];
 		this.#sessions.clear();
-		this.#closePromise = Promise.all(
-			sessions.map(async (pending) => {
+		this.#closePromise = Promise.all([
+			...releases,
+			...sessions.map(async (pending) => {
 				const session = await pending.catch(() => undefined);
 				await session?.close().catch(() => {});
 			}),
-		).then(() => {});
+		]).then(() => {});
 		return this.#closePromise;
 	}
 

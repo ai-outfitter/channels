@@ -1427,6 +1427,45 @@ it("pauses a failing Task turn without poisoning restart recovery", async () => 
 	replayed.stop();
 });
 
+it("retries delivery evidence after a successful Task turn without rerunning inference", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-delivery-evidence-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-delivery-evidence"));
+	const append = journal.append.bind(journal);
+	let failDeliveryOnce = true;
+	journal.append = async (record, afterAppend) => {
+		if (record.kind === "WAKE_DELIVERED" && failDeliveryOnce) {
+			failDeliveryOnce = false;
+			throw new Error("delivery evidence unavailable");
+		}
+		return append(record, afterAppend);
+	};
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				turns += 1;
+				await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_COMPLETED" });
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	queue.enqueue(claim);
+	await waitFor(() => journal.wakeDeliveries(claim.activationId) === 1 && releases === 1);
+	assert.equal(turns, 1);
+	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
+	await queue.stop();
+});
+
 it("does not retry a rejected turn that already requested caller input", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-failed-after-input-"));
 	const { plane, tasks, journal } = await fixture(root);
