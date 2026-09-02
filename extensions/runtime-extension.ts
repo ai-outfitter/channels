@@ -254,7 +254,9 @@ export default function channelsRuntimeExtension(
 				taskPlaneHealthy = runtime.healthy;
 				return;
 			}
-			if (starting && (await joinStartingGeneration())) return;
+			while (starting) {
+				if (await joinStartingGeneration()) return;
+			}
 			await beginTaskPlaneGeneration(context);
 		});
 		// Mark shutdown before channel-source cleanup begins so a concurrently

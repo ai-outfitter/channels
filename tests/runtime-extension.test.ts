@@ -376,6 +376,74 @@ test("a restart replaces a canceled startup while its runtime is closing", async
 	);
 });
 
+test("concurrent restart generations do not orphan a task-plane runtime", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers } = fakePi();
+			let runtimeStarts = 0;
+			let runtimeCloses = 0;
+			let sessionCloses = 0;
+			let finishRuntimeStart = (): void => {};
+			const runtimeStartBlocked = new Promise<void>((resolve) => {
+				finishRuntimeStart = resolve;
+			});
+			let firstCloseStarted = (): void => {};
+			const firstClosing = new Promise<void>((resolve) => {
+				firstCloseStarted = resolve;
+			});
+			let finishFirstClose = (): void => {};
+			const firstCloseBlocked = new Promise<void>((resolve) => {
+				finishFirstClose = resolve;
+			});
+			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({ start: async () => async () => {} }),
+					},
+				},
+				startRuntime: async () => {
+					runtimeStarts += 1;
+					if (runtimeStarts === 1) await runtimeStartBlocked;
+					return running(async () => {
+						runtimeCloses += 1;
+						if (runtimeCloses === 1) {
+							firstCloseStarted();
+							await firstCloseBlocked;
+						}
+					});
+				},
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {
+						sessionCloses += 1;
+					},
+				}),
+			});
+
+			const firstStart = fire(handlers, "session_start");
+			await new Promise((resolve) => setImmediate(resolve));
+			const firstShutdown = fire(handlers, "session_shutdown");
+			finishRuntimeStart();
+			await firstClosing;
+			const firstRestart = fire(handlers, "session_start");
+			const secondShutdown = fire(handlers, "session_shutdown");
+			const secondRestart = fire(handlers, "session_start");
+			finishFirstClose();
+			await Promise.all([firstStart, firstShutdown, firstRestart, secondShutdown, secondRestart]);
+			assert.equal(runtimeStarts, 2, "the restarts must share one replacement generation");
+			assert.equal(runtimeCloses, 1);
+			assert.equal(sessionCloses, 1);
+
+			await fire(handlers, "session_shutdown");
+			assert.equal(runtimeCloses, 2, "the final shutdown must close every started runtime");
+			assert.equal(sessionCloses, 2, "the final shutdown must close every session host");
+		},
+	);
+});
+
 test("channel restart joins a source startup canceled by shutdown", async () => {
 	await withEnv(
 		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
