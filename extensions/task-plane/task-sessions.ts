@@ -158,8 +158,16 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		resourceLoader,
 		customTools: [...input.customTools],
 	});
-	await session.bindExtensions({ mode: "print" });
-	return wrapSession(session);
+	const wrapped = wrapSession(session);
+	try {
+		await session.bindExtensions({ mode: "print" });
+		return wrapped;
+	} catch (error) {
+		await wrapped.close().catch((closeError) => {
+			if (error instanceof Error) error.cause = closeError;
+		});
+		throw error;
+	}
 }
 
 function wrapSession(session: AgentSession): TaskSession {

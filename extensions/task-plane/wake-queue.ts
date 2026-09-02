@@ -50,25 +50,32 @@ export class DurableWakeQueue {
 	}
 
 	async replay(): Promise<void> {
-		for (const claim of this.#journal.claims()) {
+		const newestClaims: ActivationClaim[] = [];
+		const seenTaskIds = new Set<string>();
+		for (const claim of this.#journal.claims().toReversed()) {
 			if (
-				this.#journal.isAccepted(claim.activationId) &&
-				!this.#journal.isWakeFailed(claim.activationId)
+				seenTaskIds.has(claim.taskId) ||
+				!this.#journal.isAccepted(claim.activationId) ||
+				this.#journal.isWakeFailed(claim.activationId)
 			) {
-				const stored = await this.#tasks.lookup(claim.taskId);
-				if (!stored || isTerminal(stored.task.status.state)) {
-					await this.#consumeSettled(claim);
-					continue;
-				}
-				if (
-					INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
-					this.#journal.isWoken(claim.activationId) &&
-					!this.#hasLaterAcceptedClaim(claim)
-				) {
-					continue;
-				}
-				this.#enqueue(claim, true);
+				continue;
 			}
+			seenTaskIds.add(claim.taskId);
+			newestClaims.unshift(claim);
+		}
+		for (const claim of newestClaims) {
+			const stored = await this.#tasks.lookup(claim.taskId);
+			if (!stored || isTerminal(stored.task.status.state)) {
+				await this.#consumeSettled(claim);
+				continue;
+			}
+			if (
+				INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
+				this.#journal.isWoken(claim.activationId)
+			) {
+				continue;
+			}
+			this.#enqueue(claim, true);
 		}
 	}
 
@@ -128,24 +135,6 @@ export class DurableWakeQueue {
 		// already-running agent loop. Delivery owns the transition and authority;
 		// when the hook does fire it only confirms the correlation.
 		if (!wake || wake.prompt !== prompt || this.#activeTaskId !== wake.claim.taskId) return;
-	}
-
-	#hasLaterAcceptedClaim(claim: ActivationClaim): boolean {
-		let found = false;
-		for (const candidate of this.#journal.claims()) {
-			if (candidate.activationId === claim.activationId) {
-				found = true;
-				continue;
-			}
-			if (
-				found &&
-				candidate.taskId === claim.taskId &&
-				this.#journal.isAccepted(candidate.activationId)
-			) {
-				return true;
-			}
-		}
-		return false;
 	}
 
 	agentEnd(): void {
@@ -363,15 +352,9 @@ export class DurableWakeQueue {
 		stored: NonNullable<Awaited<ReturnType<A2aTaskStore["lookup"]>>>,
 	): Promise<boolean> {
 		try {
-			const preservingInterruptedState =
-				INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never) &&
-				this.#journal.isWoken(wake.claim.activationId) &&
-				!this.#hasLaterAcceptedClaim(wake.claim);
-			if (!preservingInterruptedState) {
-				await this.#tasks.updateStatus(stored.principal, stored.task.id, {
-					state: "TASK_STATE_WORKING",
-				});
-			}
+			await this.#tasks.updateStatus(stored.principal, stored.task.id, {
+				state: "TASK_STATE_WORKING",
+			});
 		} catch {
 			// Cancellation can win between lookup and transition. Re-read before
 			// granting authority; terminal work is consumed without a turn.
