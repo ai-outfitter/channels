@@ -38,6 +38,7 @@ export default function channelsRuntimeExtension(
 ): void {
 	let runtime: RunningChannelsRuntime | undefined;
 	let starting: Promise<void> | undefined;
+	let lifecycleRequest = 0;
 	let stopped = false;
 	let taskPlaneHealthy = false;
 	let a2aServer: RunningA2aServer | undefined;
@@ -46,6 +47,7 @@ export default function channelsRuntimeExtension(
 	let startingWakeQueue: RunningChannelsRuntime["wakeQueue"] | undefined;
 	let startingSourceSink: SourceTaskActivationSink | undefined;
 	let closing: Promise<void> | undefined;
+	let shutdownRequest = 0;
 	const taskTools: ToolDefinition[] = [];
 	const taskToolPi = captureTools(pi, taskTools, async (locator) => {
 		const sourceSink = runtime?.sourceSink ?? startingSourceSink;
@@ -142,7 +144,14 @@ export default function channelsRuntimeExtension(
 				taskPlaneHealthy = runtime.healthy;
 				return;
 			}
-			if (starting) return starting;
+			if (starting) {
+				if (stopped) {
+					lifecycleRequest += 1;
+					stopped = false;
+				}
+				return starting;
+			}
+			lifecycleRequest += 1;
 			stopped = false;
 			taskPlaneHealthy = false;
 			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep coordinator, Task-session host, listener, and shutdown-race startup atomic
@@ -211,6 +220,13 @@ export default function channelsRuntimeExtension(
 				if (!runtime) startingTaskPlane = undefined;
 			}
 		});
+		// Mark shutdown before channel-source cleanup begins so a concurrently
+		// requested restart can supersede this specific stop request.
+		pi.on("session_shutdown", () => {
+			shutdownRequest = ++lifecycleRequest;
+			stopped = true;
+			taskPlaneHealthy = false;
+		});
 	}
 	const channels = channelEventsExtension(
 		taskToolPi,
@@ -230,9 +246,9 @@ export default function channelsRuntimeExtension(
 	// Channel shutdown was registered immediately above. Registering the plane
 	// shutdown afterward guarantees providers stop before intake closes.
 	pi.on("session_shutdown", async () => {
-		stopped = true;
-		taskPlaneHealthy = false;
+		const request = shutdownRequest;
 		await starting?.catch(() => {});
+		if (request !== lifecycleRequest) return;
 		await closeTaskPlane();
 	});
 

@@ -256,6 +256,60 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 	);
 });
 
+test("a restart preserves a task-plane startup that an older shutdown was canceling", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers } = fakePi();
+			let runtimeStarts = 0;
+			let runtimeCloses = 0;
+			let sourceStarts = 0;
+			let finishRuntimeStart = (): void => {};
+			const runtimeStartBlocked = new Promise<void>((resolve) => {
+				finishRuntimeStart = resolve;
+			});
+			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({
+							async start() {
+								sourceStarts += 1;
+								return async () => {};
+							},
+						}),
+					},
+				},
+				startRuntime: async () => {
+					runtimeStarts += 1;
+					await runtimeStartBlocked;
+					return running(() => {
+						runtimeCloses += 1;
+					});
+				},
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {},
+				}),
+			});
+
+			const firstStart = fire(handlers, "session_start");
+			await new Promise((resolve) => setImmediate(resolve));
+			const shutdown = fire(handlers, "session_shutdown");
+			const restart = fire(handlers, "session_start");
+			finishRuntimeStart();
+			await Promise.all([firstStart, shutdown, restart]);
+			assert.equal(runtimeStarts, 1);
+			assert.equal(runtimeCloses, 0, "the stale shutdown must not close the restarted runtime");
+			assert.equal(sourceStarts, 1);
+
+			await fire(handlers, "session_shutdown");
+			assert.equal(runtimeCloses, 1);
+		},
+	);
+});
+
 test("channel restart joins a source startup canceled by shutdown", async () => {
 	await withEnv(
 		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
