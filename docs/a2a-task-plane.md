@@ -218,9 +218,7 @@ Task sessions receive the resident's non-Channels extensions plus the shared
 Task-authorized channel tools; they do not start another listener or source
 runtime. The agent then drives the task with three tools:
 
-- `a2a_read_task` — read the newest task history that fits inside a 64 KiB
-  model-facing result, with UTF-8-safe excerpting when the newest message alone
-  is too large. Tool metadata never contains the complete Task.
+- `a2a_read_task` — read the task's history inside untrusted-content markers.
 - `a2a_complete_task` — record the response as an artifact and complete, or
   reject with a reason.
 - `a2a_require_input` — pause the task on the caller with a question; the
