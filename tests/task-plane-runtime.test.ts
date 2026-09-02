@@ -1859,6 +1859,7 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 	await writeFile(storePath, `${JSON.stringify(deployedTask)}\n`);
 	await writeFile(join(root, "origins.json"), `${JSON.stringify(deployedOrigins)}\n`);
 	let stopped = 0;
+	let startupDeliveryRejected = false;
 	const failedStartupPrompts: string[] = [];
 	let failedStartupPlane: TaskPlane | undefined;
 	await assert.rejects(
@@ -1873,7 +1874,23 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 				sources: [
 					{
 						name: "first",
-						async start() {
+						async start(sink) {
+							assert.ok(sink.deliver);
+							await assert.rejects(
+								sink.deliver(
+									{
+										taskId: "startup-task",
+										source: "test",
+										operationId: "startup-delivery",
+										payloadDigest: digest("startup delivery"),
+										recovery: "lookup",
+									},
+									async () => "must-not-send",
+									async () => undefined,
+								),
+								/delivery is closed/,
+							);
+							startupDeliveryRejected = true;
 							return async () => {
 								stopped += 1;
 							};
@@ -1891,6 +1908,7 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 		/cannot start/,
 	);
 	assert.equal(stopped, 1);
+	assert.equal(startupDeliveryRejected, true);
 	assert.ok(failedStartupPlane);
 	await failedStartupPlane.accept(activation("after-failed-startup"));
 	await new Promise((resolve) => setTimeout(resolve, 25));

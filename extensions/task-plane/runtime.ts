@@ -120,7 +120,7 @@ export async function startChannelsRuntime(
 	let intakeOpen = false;
 	let listenerHealthy = true;
 	const deliveryOperations = new Map<string, Promise<string | undefined>>();
-	let deliveryOpen = true;
+	let deliveryOpen = false;
 	const drainDeliveries = async (): Promise<void> => {
 		while (deliveryOperations.size > 0) {
 			await Promise.allSettled([...deliveryOperations.values()]);
@@ -329,16 +329,17 @@ export async function startChannelsRuntime(
 			}
 		}
 		for (const report of buffered) report();
-		// Pending durable wakes are not offered until the complete runtime has
-		// started and intake is ready. A failed startup therefore offers none.
+		// Release replayed work only after every source and the optional listener
+		// have settled; rollback closes delivery admission and drains admitted work.
+		deliveryOpen = true;
 		await wakeQueue.replay();
 		// 7. Readiness spans the whole composition, so the caller's entrypoint
 		// declares it once every extension it owns has registered.
 	} catch (error) {
+		deliveryOpen = false;
 		intakeOpen = false;
 		await wakeQueue.stop();
 		for (const stop of stops.reverse()) await stop().catch(() => {});
-		deliveryOpen = false;
 		await drainDeliveries();
 		log({ event: "channels_unhealthy", error: errorMessage(error) });
 		throw error;
@@ -351,12 +352,12 @@ export async function startChannelsRuntime(
 		sourceSink,
 		wakeQueue,
 		async close() {
+			deliveryOpen = false;
 			// Preserve startup order at the boundary: sources stop accepting native
 			// events before the plane closes intake underneath an in-flight callback.
 			for (const stop of stops.reverse()) await stop().catch(() => {});
 			intakeOpen = false;
 			await wakeQueue.stop();
-			deliveryOpen = false;
 			await drainDeliveries();
 		},
 	};
