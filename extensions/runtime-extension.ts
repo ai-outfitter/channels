@@ -242,7 +242,7 @@ function captureTools(pi: ExtensionAPI, captured: ToolDefinition[]): ExtensionAP
 		get(target, property) {
 			if (property === "registerTool") {
 				return (tool: ToolDefinition): void => {
-					captured.push(tool);
+					if (isTaskTool(tool.name)) captured.push(tool);
 					target.registerTool(tool);
 				};
 			}
@@ -250,4 +250,8 @@ function captureTools(pi: ExtensionAPI, captured: ToolDefinition[]): ExtensionAP
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	});
+}
+
+function isTaskTool(name: string): boolean {
+	return name.startsWith("a2a_") || name === "channel_read" || name === "channel_respond";
 }
