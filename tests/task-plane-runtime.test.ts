@@ -1394,6 +1394,11 @@ it("pauses a failing Task turn without poisoning restart recovery", async () => 
 	assert.equal(attempts, 3);
 	assert.equal(failedReleases, 1);
 	assert.equal(journal.isWakeFailed(claim.activationId), false);
+	assert.equal(
+		journal.wakeDeliveries(claim.activationId),
+		0,
+		"failed Task-session turns must not consume the durable delivery cap",
+	);
 	assert.deepEqual(unhealthy, ["provider unavailable"]);
 	queue.stop();
 

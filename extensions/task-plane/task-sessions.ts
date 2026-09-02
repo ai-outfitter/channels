@@ -50,6 +50,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 	readonly #sessions = new Map<string, Promise<TaskSession>>();
 	readonly #sessionPaths: Promise<Map<string, string[]>>;
 	#closed = false;
+	#closePromise: Promise<void> | undefined;
 
 	constructor(options: TaskSessionHostOptions) {
 		this.#options = options;
@@ -80,17 +81,18 @@ export class TaskSessionHost implements TaskTurnRunner {
 		await session?.close().catch(() => {});
 	}
 
-	async close(): Promise<void> {
-		if (this.#closed) return;
+	close(): Promise<void> {
+		if (this.#closePromise) return this.#closePromise;
 		this.#closed = true;
 		const sessions = [...this.#sessions.values()];
 		this.#sessions.clear();
-		await Promise.all(
+		this.#closePromise = Promise.all(
 			sessions.map(async (pending) => {
 				const session = await pending.catch(() => undefined);
 				await session?.close().catch(() => {});
 			}),
-		);
+		).then(() => {});
+		return this.#closePromise;
 	}
 
 	#session(taskId: string): Promise<TaskSession> {
