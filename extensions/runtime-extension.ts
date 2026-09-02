@@ -1,7 +1,11 @@
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type { RunningA2aServer } from "./a2a/server.ts";
 import { type A2aToolAccess, createA2aRuntimeListener, registerA2aTools } from "./a2a-extension.ts";
 import channelEventsExtension, { locatorChannel, type SourceRegistration } from "./index.ts";
@@ -134,6 +138,112 @@ export default function channelsRuntimeExtension(
 		);
 		return operation;
 	};
+	const clearStartingReferences = (): void => {
+		startingTaskPlane = undefined;
+		startingWakeQueue = undefined;
+		startingSourceSink = undefined;
+	};
+	const closeStartingGeneration = async (
+		loaded: RunningChannelsRuntime,
+		sessionOwner: TaskSessionOwner,
+	): Promise<void> => {
+		await loaded.close();
+		if (taskSessions === sessionOwner) taskSessions = undefined;
+		clearStartingReferences();
+		await sessionOwner.close().catch(() => {});
+	};
+	const createSessionOwner = (
+		context: ExtensionContext | undefined,
+		taskPlaneRoot: string,
+	): TaskSessionOwner => {
+		const options = {
+			cwd: context?.cwd ?? process.cwd(),
+			sessionDir: join(taskPlaneRoot, "pi-sessions"),
+			projectTrusted: context?.isProjectTrusted() ?? false,
+			customTools: taskTools,
+			excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
+			log,
+		};
+		return dependencies.createTaskSessionHost
+			? dependencies.createTaskSessionHost(options)
+			: new TaskSessionHost(options);
+	};
+	const startTaskRuntime = (
+		taskPlaneRoot: string,
+		sessionOwner: TaskSessionOwner,
+	): Promise<RunningChannelsRuntime> =>
+		startRuntime(pi, {
+			storePath: join(taskPlaneRoot, "tasks.json"),
+			originStorePath: join(taskPlaneRoot, "origins.json"),
+			agentInterface:
+				process.env.A2A_PUBLIC_URL?.trim() ||
+				`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
+			// Channel sources receive the guarded sink from this runtime after it opens.
+			sources: [],
+			taskTurnRunner: sessionOwner,
+			taskPlaneReady: (taskPlane, wakeQueue, sourceSink) => {
+				startingTaskPlane = taskPlane;
+				startingWakeQueue = wakeQueue;
+				startingSourceSink = sourceSink;
+			},
+			...(listener ? { listener } : {}),
+			log,
+		});
+	const launchTaskPlane = async (context: ExtensionContext | undefined): Promise<void> => {
+		await closing;
+		if (stopped) return;
+		const taskPlaneRoot =
+			process.env.CHANNELS_TASK_STORE_PATH?.trim() ||
+			join(
+				process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"),
+				"outfitter",
+				"channels",
+				"task-plane",
+			);
+		const sessionOwner = createSessionOwner(context, taskPlaneRoot);
+		taskSessions = sessionOwner;
+		try {
+			const loaded = await startTaskRuntime(taskPlaneRoot, sessionOwner);
+			if (stopped) {
+				await closeStartingGeneration(loaded, sessionOwner);
+			} else {
+				runtime = loaded;
+				clearStartingReferences();
+				taskPlaneHealthy = loaded.healthy;
+			}
+		} catch (error) {
+			if (taskSessions === sessionOwner) taskSessions = undefined;
+			clearStartingReferences();
+			await sessionOwner.close().catch(() => {});
+			throw error;
+		}
+	};
+	const joinStartingGeneration = async (): Promise<boolean> => {
+		const prior = starting;
+		if (!prior) return false;
+		if (!stopped) {
+			await prior;
+			return true;
+		}
+		lifecycleRequest += 1;
+		stopped = false;
+		await prior.catch(() => {});
+		if (runtime || stopped) return true;
+		if (starting === prior) starting = undefined;
+		return false;
+	};
+	const beginTaskPlaneGeneration = async (context: ExtensionContext | undefined): Promise<void> => {
+		lifecycleRequest += 1;
+		stopped = false;
+		taskPlaneHealthy = false;
+		starting = launchTaskPlane(context);
+		try {
+			await starting;
+		} finally {
+			starting = undefined;
+			if (!runtime) startingTaskPlane = undefined;
+		}
+	};
 
 	// Register the task plane first. Pi dispatches lifecycle hooks in
 	// registration order, so the durable local plane is ready before any
@@ -144,81 +254,8 @@ export default function channelsRuntimeExtension(
 				taskPlaneHealthy = runtime.healthy;
 				return;
 			}
-			if (starting) {
-				if (stopped) {
-					lifecycleRequest += 1;
-					stopped = false;
-				}
-				return starting;
-			}
-			lifecycleRequest += 1;
-			stopped = false;
-			taskPlaneHealthy = false;
-			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep coordinator, Task-session host, listener, and shutdown-race startup atomic
-			starting = (async () => {
-				await closing;
-				if (stopped) return;
-				const taskPlaneRoot =
-					process.env.CHANNELS_TASK_STORE_PATH?.trim() ||
-					join(
-						process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"),
-						"outfitter",
-						"channels",
-						"task-plane",
-					);
-				const taskSessionOptions = {
-					cwd: context?.cwd ?? process.cwd(),
-					sessionDir: join(taskPlaneRoot, "pi-sessions"),
-					projectTrusted: context?.isProjectTrusted() ?? false,
-					customTools: taskTools,
-					excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
-					log,
-				};
-				const sessionOwner = dependencies.createTaskSessionHost
-					? dependencies.createTaskSessionHost(taskSessionOptions)
-					: new TaskSessionHost(taskSessionOptions);
-				taskSessions = sessionOwner;
-				try {
-					const loaded = await startRuntime(pi, {
-						storePath: join(taskPlaneRoot, "tasks.json"),
-						originStorePath: join(taskPlaneRoot, "origins.json"),
-						agentInterface:
-							process.env.A2A_PUBLIC_URL?.trim() ||
-							`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
-						// Channel sources receive the guarded sink from this runtime after it opens.
-						sources: [],
-						taskTurnRunner: sessionOwner,
-						taskPlaneReady: (taskPlane, wakeQueue, sourceSink) => {
-							startingTaskPlane = taskPlane;
-							startingWakeQueue = wakeQueue;
-							startingSourceSink = sourceSink;
-						},
-						...(listener ? { listener } : {}),
-						log,
-					});
-					if (stopped) await loaded.close();
-					else {
-						runtime = loaded;
-						startingTaskPlane = undefined;
-						startingWakeQueue = undefined;
-						startingSourceSink = undefined;
-						taskPlaneHealthy = loaded.healthy;
-					}
-				} catch (error) {
-					if (taskSessions === sessionOwner) taskSessions = undefined;
-					startingTaskPlane = undefined;
-					startingWakeQueue = undefined;
-					startingSourceSink = undefined;
-					await sessionOwner.close().catch(() => {});
-					throw error;
-				}
-			})();
-			try {
-				await starting;
-			} finally {
-				starting = undefined;
-				if (!runtime) startingTaskPlane = undefined;
-			}
+			if (starting && (await joinStartingGeneration())) return;
+			await beginTaskPlaneGeneration(context);
 		});
 		// Mark shutdown before channel-source cleanup begins so a concurrently
 		// requested restart can supersede this specific stop request.
