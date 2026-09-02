@@ -7,6 +7,99 @@ import { type A2aExecutor, configFromEnv } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
 import { createA2aRuntimeListener, registerA2aTools } from "../extensions/a2a-extension.ts";
 
+type ReadResult = {
+	content: [{ type: "text"; text: string }];
+	details: {
+		taskId: string;
+		state: string;
+		totalHistoryCount: number;
+		returnedCount: number;
+		truncated: boolean;
+	};
+};
+
+function taskReadTool(task: {
+	id: string;
+	contextId: string;
+	status: { state: "TASK_STATE_WORKING" };
+	history: Array<{
+		messageId: string;
+		role: "ROLE_USER";
+		parts: Array<{ text: string }>;
+	}>;
+}): { execute(id: string, params: { taskId: string }): Promise<ReadResult> } {
+	let readTool:
+		| { execute(id: string, params: { taskId: string }): Promise<ReadResult> }
+		| undefined;
+	registerA2aTools(
+		{
+			registerTool(tool: typeof readTool & { name: string }) {
+				if (tool.name === "a2a_read_task") readTool = tool;
+			},
+		} as never,
+		() => ({
+			async readTask() {
+				return task;
+			},
+			async controllerForTask() {
+				return undefined;
+			},
+		}),
+		async () => true,
+	);
+	assert.ok(readTool);
+	return readTool;
+}
+
+test("A2A task reads return the newest complete history within 64 KiB", async () => {
+	const read = taskReadTool({
+		id: "task-bounded",
+		contextId: "context-bounded",
+		status: { state: "TASK_STATE_WORKING" },
+		history: [
+			{ messageId: "old", role: "ROLE_USER", parts: [{ text: `old:${"a".repeat(40_000)}` }] },
+			{ messageId: "middle", role: "ROLE_USER", parts: [{ text: `middle:${"b".repeat(20_000)}` }] },
+			{ messageId: "new", role: "ROLE_USER", parts: [{ text: `new:${"c".repeat(20_000)}` }] },
+		],
+	});
+	const result = await read.execute("call", { taskId: "task-bounded" });
+	const text = result.content[0].text;
+	assert.ok(Buffer.byteLength(text, "utf8") <= 64 * 1024);
+	assert.doesNotMatch(text, /old:/);
+	assert.ok(text.indexOf("middle:") < text.indexOf("new:"));
+	assert.deepEqual(result.details, {
+		taskId: "task-bounded",
+		state: "TASK_STATE_WORKING",
+		totalHistoryCount: 3,
+		returnedCount: 2,
+		truncated: true,
+	});
+});
+
+test("A2A task reads excerpt an oversized newest message on a UTF-8 boundary", async () => {
+	const read = taskReadTool({
+		id: "task-unicode",
+		contextId: "context-unicode",
+		status: { state: "TASK_STATE_WORKING" },
+		history: [
+			{ messageId: "older", role: "ROLE_USER", parts: [{ text: "older" }] },
+			{ messageId: "latest", role: "ROLE_USER", parts: [{ text: "🦊".repeat(40_000) }] },
+		],
+	});
+	const result = await read.execute("call", { taskId: "task-unicode" });
+	const text = result.content[0].text;
+	assert.ok(Buffer.byteLength(text, "utf8") <= 64 * 1024);
+	assert.match(text, /latest message excerpted/);
+	assert.doesNotMatch(text, /�/);
+	assert.deepEqual(result.details, {
+		taskId: "task-unicode",
+		state: "TASK_STATE_WORKING",
+		totalHistoryCount: 2,
+		returnedCount: 1,
+		truncated: true,
+	});
+});
+
 test("task-plane tools enforce active authority and reject input-required without continuation", async () => {
 	const tools = new Map<
 		string,
