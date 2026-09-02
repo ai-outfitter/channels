@@ -3,7 +3,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { forwardSourceTaskSink, type SourceRegistration } from "../extensions/index.ts";
 import channelsRuntimeExtension from "../extensions/runtime-extension.ts";
 import type {
@@ -610,6 +610,7 @@ test("Task tools use startup authority and source access while replay opens a Ta
 			const { pi, handlers, tools } = fakePi();
 			const loaded = running();
 			let sessionToolNames: string[] = [];
+			let sessionTools: ToolDefinition[] = [];
 			const task = {
 				id: "replayed",
 				contextId: "context-replayed",
@@ -629,8 +630,16 @@ test("Task tools use startup authority and source access while replay opens a Ta
 			});
 			let readDuringStartup = false;
 			let sourceSinkWorkedDuringStartup = false;
+			let locatorAuthorizations = 0;
 			Object.assign(loaded.sourceSink, {
 				taskIsTerminal: async (taskId: string) => taskId === "during-startup",
+				async taskForLocator(source: string, locator: string) {
+					if (source !== "test" || locator !== "test:v1:item") {
+						throw new Error("channel locator is not authorized for the active Task");
+					}
+					locatorAuthorizations += 1;
+					return task.id;
+				},
 			});
 			channelsRuntimeExtension(pi, {
 				sources: {
@@ -647,7 +656,8 @@ test("Task tools use startup authority and source access while replay opens a Ta
 					},
 				},
 				createTaskSessionHost: (options) => {
-					sessionToolNames = options.customTools.map((tool) => tool.name).sort();
+					sessionTools = [...options.customTools];
+					sessionToolNames = sessionTools.map((tool) => tool.name).sort();
 					assert.equal(options.projectTrusted, false);
 					return {
 						async run() {},
@@ -676,6 +686,26 @@ test("Task tools use startup authority and source access while replay opens a Ta
 			assert.ok(tools.has("channel_publish"), "top-level resident keeps publication tools");
 			assert.ok(tools.has("agent_list"), "top-level resident keeps agent discovery tools");
 			assert.ok(tools.has("agent_send"), "top-level resident keeps outbound agent tools");
+			const taskChannelRead = sessionTools.find((tool) => tool.name === "channel_read");
+			assert.ok(taskChannelRead);
+			await taskChannelRead.execute(
+				"task-read",
+				{ locator: "test:v1:item" },
+				undefined,
+				undefined,
+				{} as never,
+			);
+			assert.equal(locatorAuthorizations, 1);
+			await assert.rejects(
+				taskChannelRead.execute(
+					"foreign-read",
+					{ locator: "test:v1:foreign" },
+					undefined,
+					undefined,
+					{} as never,
+				),
+				/not authorized/,
+			);
 			await fire(handlers, "session_shutdown");
 		},
 	);

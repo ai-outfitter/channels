@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { RunningA2aServer } from "./a2a/server.ts";
 import { type A2aToolAccess, createA2aRuntimeListener, registerA2aTools } from "./a2a-extension.ts";
-import channelEventsExtension, { type SourceRegistration } from "./index.ts";
+import channelEventsExtension, { locatorChannel, type SourceRegistration } from "./index.ts";
 import relayExtension from "./relay-extension.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import { type RunningChannelsRuntime, startChannelsRuntime } from "./task-plane/runtime.ts";
@@ -47,7 +47,11 @@ export default function channelsRuntimeExtension(
 	let startingSourceSink: SourceTaskActivationSink | undefined;
 	let closing: Promise<void> | undefined;
 	const taskTools: ToolDefinition[] = [];
-	const taskToolPi = captureTools(pi, taskTools);
+	const taskToolPi = captureTools(pi, taskTools, async (locator) => {
+		const sourceSink = runtime?.sourceSink ?? startingSourceSink;
+		if (!sourceSink?.taskForLocator) throw new Error("task plane is not running");
+		await sourceSink.taskForLocator(locatorChannel(locator), locator);
+	});
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
 	const taskPlaneEnabled = selection !== "off" && selection !== "none";
 	const startRuntime = dependencies.startRuntime ?? startChannelsRuntime;
@@ -242,12 +246,18 @@ export default function channelsRuntimeExtension(
 	}
 }
 
-function captureTools(pi: ExtensionAPI, captured: ToolDefinition[]): ExtensionAPI {
+function captureTools(
+	pi: ExtensionAPI,
+	captured: ToolDefinition[],
+	authorizeChannelLocator: (locator: string) => Promise<void>,
+): ExtensionAPI {
 	return new Proxy(pi, {
 		get(target, property) {
 			if (property === "registerTool") {
 				return (tool: ToolDefinition): void => {
-					if (isTaskTool(tool.name)) captured.push(tool);
+					if (isTaskTool(tool.name)) {
+						captured.push(scopeTaskTool(tool, authorizeChannelLocator));
+					}
 					target.registerTool(tool);
 				};
 			}
@@ -255,6 +265,22 @@ function captureTools(pi: ExtensionAPI, captured: ToolDefinition[]): ExtensionAP
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	});
+}
+
+function scopeTaskTool(
+	tool: ToolDefinition,
+	authorizeChannelLocator: (locator: string) => Promise<void>,
+): ToolDefinition {
+	if (tool.name !== "channel_read" && tool.name !== "channel_respond") return tool;
+	return {
+		...tool,
+		async execute(toolCallId, params, signal, onUpdate, context) {
+			const locator = (params as { locator?: unknown }).locator;
+			if (typeof locator !== "string") throw new Error("channel locator is required");
+			await authorizeChannelLocator(locator);
+			return tool.execute(toolCallId, params, signal, onUpdate, context);
+		},
+	};
 }
 
 function isTaskTool(name: string): boolean {
