@@ -309,12 +309,14 @@ test("channel restart joins a source startup canceled by shutdown", async () => 
 			const shutdown = fire(handlers, "session_shutdown");
 			await shutdown;
 			const restart = fire(handlers, "session_start");
+			const joinedRestart = fire(handlers, "session_start");
 			await new Promise((resolve) => setImmediate(resolve));
 			assert.equal(runtimeStarts, 2);
 			assert.equal(sourceStarts, 1, "the new channel generation must join the old startup");
 			finishSourceStart();
-			await Promise.all([firstStart, restart]);
+			await Promise.all([firstStart, restart, joinedRestart]);
 			assert.equal(sourceStarts, 2);
+			assert.equal(runtimeStarts, 2, "concurrent restart requests share one new generation");
 			assert.equal(sourceStops, 1, "the canceled generation must stop its staged source");
 			assert.equal(runtimeCloses, 1);
 
