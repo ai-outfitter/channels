@@ -1034,7 +1034,7 @@ it("preserves unanswered input-required state when replaying its original wake",
 	);
 	await replayed.replay();
 	await new Promise((resolve) => setImmediate(resolve));
-	await replayed.beforeAgentStart(replayedPrompts[0] as string);
+	assert.deepEqual(replayedPrompts, []);
 	const waiting = await tasks.getTask("source:user", accepted.taskId);
 	assert.equal(waiting.status.state, "TASK_STATE_INPUT_REQUIRED");
 	assert.deepEqual(waiting.status.message, question);
@@ -1045,6 +1045,10 @@ it("preserves unanswered input-required state when replaying its original wake",
 	});
 	assert.equal(answer.disposition, "continued");
 	assert.equal(answer.taskId, accepted.taskId);
+	const answerClaim = journal.claims().at(-1);
+	assert.ok(answerClaim);
+	replayed.enqueue(answerClaim);
+	await waitFor(() => replayedPrompts.length === 1);
 	replayed.stop();
 });
 
@@ -1215,6 +1219,116 @@ it("pauses a failing Task turn without poisoning restart recovery", async () => 
 	await waitFor(() => recovered === 1);
 	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
 	replayed.stop();
+});
+
+it("does not rerun a completed Task turn when settlement lookup fails", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-settlement-retry-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-settlement-retry"));
+	const lookup = tasks.lookup.bind(tasks);
+	let failSettlementLookup = false;
+	tasks.lookup = async (taskId) => {
+		if (failSettlementLookup) {
+			failSettlementLookup = false;
+			throw new Error("temporary settlement lookup failure");
+		}
+		return lookup(taskId);
+	};
+	let turns = 0;
+	let releases = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run(taskId) {
+				turns += 1;
+				await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_COMPLETED" });
+				failSettlementLookup = true;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	assert.equal(turns, 1);
+	assert.equal((await lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
+	assert.ok(logs.some((record) => record.event === "a2a_wake_pump_failed"));
+	queue.stop();
+});
+
+it("keeps a failed Task turn retired when unhealthy evidence cannot be written", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-evidence-failure-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-evidence-failure"));
+	let turns = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		async () => {
+			throw new Error("evidence store unavailable");
+		},
+		{
+			async run() {
+				turns += 1;
+				throw new Error("provider unavailable");
+			},
+			async release() {},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => logs.some((record) => record.event === "a2a_task_turn_paused"));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(turns, 3);
+	assert.ok(logs.some((record) => record.event === "a2a_task_turn_evidence_failed"));
+	queue.agentEnd();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(turns, 3);
+	queue.stop();
+});
+
+it("releases a retained Task session when cancellation wins before the next turn", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-canceled-requeue-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-canceled-requeue"));
+	const lookup = tasks.lookup.bind(tasks);
+	let lookups = 0;
+	tasks.lookup = async (taskId) => {
+		lookups += 1;
+		if (lookups === 3) {
+			await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_CANCELED" });
+		}
+		return lookup(taskId);
+	};
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	assert.equal(turns, 1);
+	queue.stop();
 });
 
 it("caps unsettled wake deliveries durably and permits a fresh provider event", async () => {
