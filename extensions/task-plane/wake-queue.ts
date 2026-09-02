@@ -263,9 +263,13 @@ export class DurableWakeQueue {
 		const stored = await this.#tasks.lookup(wake.claim.taskId);
 		this.#activeTaskId = undefined;
 		this.#offered = undefined;
-		if (stored && isTerminal(stored.task.status.state)) {
+		if (
+			!stored ||
+			isTerminal(stored.task.status.state) ||
+			INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)
+		) {
 			await this.#taskTurns?.release(wake.claim.taskId);
-		} else if (stored && !INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)) {
+		} else {
 			this.#pending.unshift(wake);
 		}
 	}

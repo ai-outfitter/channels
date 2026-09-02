@@ -1301,6 +1301,39 @@ it("releases a Task session when its wake reaches the delivery cap", async () =>
 	queue.stop();
 });
 
+it("releases a live Task session while waiting for caller input", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-input-required-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-input-required"));
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				const stored = await tasks.lookup(taskId);
+				assert.ok(stored);
+				await tasks.updateStatus(stored.principal, taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+				});
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	assert.equal(
+		(await tasks.lookup(accepted.taskId))?.task.status.state,
+		"TASK_STATE_INPUT_REQUIRED",
+	);
+	queue.stop();
+});
+
 it("bounds the pending wake set and records durable overflow evidence", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-overflow-"));
 	const journal = new ActivationJournal(join(root, "activation.jsonl"));

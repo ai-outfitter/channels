@@ -157,9 +157,11 @@ agent, a tool set, or a workflow topology.
   Task remains unsettled. Reaching that durable cap records `WAKE_FAILED` and
   unhealthy evidence; startup does not resurrect the activation. A new provider
   event or explicit continuation creates a new activation and may enqueue it.
-  A wake transport failure retries three times with timer backoff, then records
-  `WAKE_FAILED` evidence and stops. Transient store or journal failures during
-  pumping schedule a macrotask retry with capped exponential backoff.
+  A Task-session turn failure retries three times, records unhealthy evidence,
+  closes the live session, and leaves the activation replayable after restart.
+  A legacy wake transport failure records `WAKE_FAILED` after the same bounded
+  retries. Transient store or journal failures during pumping schedule a
+  macrotask retry with capped exponential backoff.
 - **Wake admission is bounded.** At most 128 wakes wait behind the offered or
   active turn. Overflow is logged and recorded as durable `WAKE_FAILED`
   evidence, so a duplicate-prone source cannot grow the resident queue without
@@ -227,8 +229,9 @@ runtime. The agent then drives the task with three tools:
   anchors, and make this tool fail for a Task whose source declares no
   continuation method in the conformance matrix — the executor completes or
   rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
-  a new wake for that Task. This tool is the protocol-native structured-question
-surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+  a new wake for that Task and reopens its durable Pi session after the paused
+  turn's live resources close. This tool is the protocol-native structured-question
+  surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
 
 ### Upgrade from the 1.7 standalone A2A store
 
