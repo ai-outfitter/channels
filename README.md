@@ -2,7 +2,7 @@
 
 A [Pi](https://github.com/earendil-works/pi) extension that watches email,
 Signal, GitHub notifications, and mentions in Slack, Chatto, Mattermost, and
-Zulip, then wakes the running session only when a source detects matching work.
+Zulip, then runs one durable Pi session per Task only when a source detects matching work.
 Sources may use push connections, local daemons, or lightweight polling.
 Multiple channels share one durable Task wake queue.
 

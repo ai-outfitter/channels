@@ -178,9 +178,9 @@ needed if install or image-size isolation becomes important.
 
 Every work-producing source commits through the task plane. Provider identity
 deduplicates redelivery before a wake is queued. The durable queue offers one
-body-free Task prompt at a time, marks that Task `WORKING` when Pi starts the
-matching turn, and grants exactly that Task as active authority. No source,
-protocol listener, or channel registry calls `pi.sendUserMessage` directly.
+body-free Task prompt at a time to a durable Pi session dedicated to that Task,
+marks the Task `WORKING` before its turn, and grants exactly that Task as active
+authority. The resident coordinator performs no inference for Task wakes.
 
 ## Slack implementation
 

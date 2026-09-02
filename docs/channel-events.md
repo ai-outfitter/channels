@@ -21,24 +21,24 @@ pi separates side-effect hooks from model-waking injection (see
 | Need | pi primitive | Wakes model? |
 | --- | --- | --- |
 | Open/close the connection on start/stop | `pi.on("session_start" \| "session_shutdown", …)` handlers (plain awaited callbacks) | **No** |
-| Know when the agent settles | `agent_end` / `turn_end` events, `ctx.isIdle()` | No |
 | Stage context without a turn | `pi.sendMessage({…}, { triggerTurn:false })`, `deliverAs:"nextTurn"`, `pi.appendEntry()` | No |
-| Wake the agent on a real event | `pi.sendUserMessage(text, { deliverAs })` | **Yes** |
+| Run an isolated Task on a real event | `createAgentSession(...)`, then `AgentSession.prompt(...)` | **Yes** |
 | External process → session | resident `--mode rpc` stdin: `prompt` / `steer` / `follow_up` | Yes |
 
 This extension uses **inference-free lifecycle hooks** for the connection.
-Sources accept real work through the task plane. Only the durable wake queue
-uses `sendUserMessage`, after acceptance has committed a Task claim.
+Sources accept real work through the task plane. After acceptance commits a
+Task claim, the durable wake queue creates or reopens that Task's Pi session
+and prompts it. The resident coordinator performs no inference for Task wakes.
 
 ## Design
 
 - **`session_start`** (no inference): read config from env, open the source's push
   connection, keep the returned `stop` handle.
-- **On event** (no inference until it wakes): the source sends a content-addressed
+- **On event** (no inference until the Task runs): the source sends a content-addressed
   activation to its required task sink. Acceptance commits the Task, journal
-  claim, dedupe projection, and evidence. The durable queue then sends one
-  body-free `sendUserMessage(..., { deliverAs: "followUp" })` and grants that
-  Task as the turn's authority.
+  claim, dedupe projection, and evidence. The durable queue then creates or
+  reopens the Task's durable Pi session, grants that Task as the session turn's
+  authority, and sends one body-free prompt to that session.
 - **`session_shutdown`** (no inference): call `stop()` — idempotent, closes the
   connection.
 - **Trust boundary:** the wake prompt is trusted and body-free. For located
@@ -53,7 +53,7 @@ uses `sendUserMessage`, after acceptance has committed a Task claim.
 ## Multiple channels at once
 
 The extension runs **every configured channel** simultaneously; accepted work
-feeds one durable Task wake queue. This is what lets one personal agent be
+feeds one durable Task wake queue, which serializes isolated per-Task sessions. This is what lets one personal agent be
 assigned to email *and* Slack *and* Signal without competing wake authorities.
 
 Channel selection:
