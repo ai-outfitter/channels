@@ -110,6 +110,7 @@ test("reports ready only when both task-plane and channel startup succeed", asyn
 		async () => {
 			for (const failure of ["none", "plane", "channel"] as const) {
 				let closes = 0;
+				let sessionCloses = 0;
 				const { pi, handlers } = fakePi();
 				const logs: Array<Readonly<Record<string, unknown>>> = [];
 				const sources: Record<string, SourceRegistration> = {
@@ -126,6 +127,13 @@ test("reports ready only when both task-plane and channel startup succeed", asyn
 				channelsRuntimeExtension(pi, {
 					sources,
 					log: (record) => logs.push(record),
+					createTaskSessionHost: () => ({
+						async run() {},
+						async release() {},
+						async close() {
+							sessionCloses += 1;
+						},
+					}),
 					startRuntime: async () => {
 						if (failure === "plane") throw new Error("plane failed");
 						return running(() => {
@@ -143,6 +151,9 @@ test("reports ready only when both task-plane and channel startup succeed", asyn
 					failure === "channel" ? 1 : 0,
 					"explicit source failure rolls back the task plane",
 				);
+				assert.equal(sessionCloses, failure === "none" ? 0 : 1);
+				await fire(handlers, "session_shutdown");
+				assert.equal(sessionCloses, 1);
 			}
 		},
 	);
@@ -312,6 +323,50 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 	);
 });
 
+test("A2A Task tools use startup authority while replay opens a Task session", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: "off", A2A_SERVER: "1", OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers, tools } = fakePi();
+			const loaded = running();
+			const task = {
+				id: "replayed",
+				contextId: "context-replayed",
+				status: { state: "TASK_STATE_WORKING" as const, timestamp: new Date().toISOString() },
+				history: [],
+			};
+			Object.assign(loaded.taskPlane, {
+				taskStore: {
+					async lookup(taskId: string) {
+						return taskId === task.id ? { principal: "p", task } : undefined;
+					},
+				},
+			});
+			Object.assign(loaded.wakeQueue, {
+				hasAuthority: async (taskId: string) => taskId === task.id,
+				sourceForTask: () => "a2a",
+			});
+			let readDuringStartup = false;
+			channelsRuntimeExtension(pi, {
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {},
+				}),
+				startRuntime: async (_pi, dependencies) => {
+					dependencies.taskPlaneReady?.(loaded.taskPlane, loaded.wakeQueue);
+					await tools.get("a2a_read_task")?.execute("call", { taskId: task.id });
+					readDuringStartup = true;
+					return loaded;
+				},
+			});
+			assert.deepEqual(await fire(handlers, "session_start"), []);
+			assert.equal(readDuringStartup, true);
+			await fire(handlers, "session_shutdown");
+		},
+	);
+});
+
 test("real wake-queue source wiring denies continuation for a native Task", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-real-authority-"));
 	await withEnv(
@@ -337,6 +392,7 @@ test("real wake-queue source wiring denies continuation for a native Task", asyn
 							finishTurn = resolve;
 						});
 					},
+					async release() {},
 					async close() {
 						finishTurn?.();
 					},
@@ -405,6 +461,7 @@ test("native-only deployment registers task tools and settles a Task end to end"
 							finishTurn = resolve;
 						});
 					},
+					async release() {},
 					async close() {
 						finishTurn?.();
 					},
@@ -458,6 +515,7 @@ test("A2A tools fail closed after a channel failure clears the runtime", async (
 		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: "1", OUTFITTER_AGENT_RELAY: undefined },
 		async () => {
 			const { pi, handlers, tools } = fakePi();
+			let sessionCloses = 0;
 			const loaded = running();
 			const task = {
 				id: "never-woken",
@@ -483,6 +541,13 @@ test("A2A tools fail closed after a channel failure clears the runtime", async (
 				sourceForTask: () => "a2a",
 			});
 			channelsRuntimeExtension(pi, {
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {
+						sessionCloses += 1;
+					},
+				}),
 				sources: {
 					test: {
 						configured: () => true,
@@ -496,6 +561,7 @@ test("A2A tools fail closed after a channel failure clears the runtime", async (
 				startRuntime: async () => loaded,
 			});
 			await fire(handlers, "session_start");
+			assert.equal(sessionCloses, 1);
 			const complete = tools.get("a2a_complete_task");
 			assert.ok(complete);
 			await assert.rejects(

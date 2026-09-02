@@ -1157,6 +1157,62 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	queue.stop();
 });
 
+it("pauses a failing Task turn without poisoning restart recovery", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-failure-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-failure"));
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	let attempts = 0;
+	const unhealthy: string[] = [];
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		async (_claim, error) => {
+			unhealthy.push(error);
+		},
+		{
+			async run() {
+				attempts += 1;
+				throw new Error("provider unavailable");
+			},
+			async release() {},
+		},
+	);
+	queue.enqueue(claim);
+	await waitFor(() => logs.some((record) => record.event === "a2a_task_turn_paused"));
+	assert.equal(attempts, 3);
+	assert.equal(journal.isWakeFailed(claim.activationId), false);
+	assert.deepEqual(unhealthy, ["provider unavailable"]);
+	queue.stop();
+
+	let recovered = 0;
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				recovered += 1;
+				const stored = await tasks.lookup(taskId);
+				assert.ok(stored);
+				await tasks.updateStatus(stored.principal, taskId, {
+					state: "TASK_STATE_COMPLETED",
+				});
+			},
+			async release() {},
+		},
+	);
+	await replayed.replay();
+	await waitFor(() => recovered === 1);
+	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
+	replayed.stop();
+});
+
 it("caps unsettled wake deliveries durably and permits a fresh provider event", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-delivery-cap-"));
 	const storePath = join(root, "tasks.json");
@@ -1301,6 +1357,7 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 	const storePath = join(root, "tasks.v1.json");
 	const taskId = randomUUID();
 	const contextId = randomUUID();
+	const deployedAt = new Date().toISOString();
 	const deployedTask = {
 		version: 1,
 		tasks: {
@@ -1308,12 +1365,12 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 				task: {
 					id: taskId,
 					contextId,
-					status: { state: "TASK_STATE_COMPLETED", timestamp: "2026-08-01T00:00:00.000Z" },
+					status: { state: "TASK_STATE_COMPLETED", timestamp: deployedAt },
 					artifacts: [],
 					history: [],
 				},
 				principal: "source:user",
-				updatedAt: "2026-08-01T00:00:00.000Z",
+				updatedAt: deployedAt,
 			},
 		},
 		dedupe: [],
@@ -2002,6 +2059,7 @@ it("routes each wake through its Task turn runner without prompting the coordina
 	const root = await mkdtemp(join(tmpdir(), "channels-task-turns-"));
 	const coordinatorPrompts: string[] = [];
 	const turns: Array<{ taskId: string; prompt: string }> = [];
+	const releases: string[] = [];
 	let runtime: Awaited<ReturnType<typeof startChannelsRuntime>>;
 	runtime = await startChannelsRuntime(
 		{ sendUserMessage: async (prompt: string) => coordinatorPrompts.push(prompt) },
@@ -2018,6 +2076,9 @@ it("routes each wake through its Task turn runner without prompting the coordina
 						state: "TASK_STATE_COMPLETED",
 					});
 				},
+				async release(taskId) {
+					releases.push(taskId);
+				},
 			},
 		},
 	);
@@ -2028,13 +2089,14 @@ it("routes each wake through its Task turn runner without prompting the coordina
 		const second = await runtime.sourceSink.accept(
 			activation("task-turn-two", { conversationKey: "task-turn-two" }),
 		);
-		await waitFor(() => turns.length === 2);
+		await waitFor(() => turns.length === 2 && releases.length === 2);
 		assert.notEqual(first.taskId, second.taskId);
 		assert.deepEqual(turns, [
 			{ taskId: first.taskId, prompt: taskWakePrompt(first.taskId) },
 			{ taskId: second.taskId, prompt: taskWakePrompt(second.taskId) },
 		]);
 		assert.deepEqual(coordinatorPrompts, []);
+		assert.deepEqual(releases, [first.taskId, second.taskId]);
 	} finally {
 		await runtime.close();
 	}
