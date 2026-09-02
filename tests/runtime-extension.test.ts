@@ -325,6 +325,56 @@ test("channel restart joins a source startup canceled by shutdown", async () => 
 	);
 });
 
+test("concurrent starts join one successful zero-source generation", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: undefined, A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers } = fakePi();
+			const logs: Readonly<Record<string, unknown>>[] = [];
+			let finishRuntimeStart = (): void => {};
+			const runtimeStartBlocked = new Promise<void>((resolve) => {
+				finishRuntimeStart = resolve;
+			});
+			let runtimeStarts = 0;
+			let configuredChecks = 0;
+			channelsRuntimeExtension(pi, {
+				log: (record) => logs.push(record),
+				sources: {
+					test: {
+						configured: () => {
+							configuredChecks += 1;
+							return false;
+						},
+						load: async () => assert.fail("unconfigured source must not load"),
+					},
+				},
+				startRuntime: async () => {
+					runtimeStarts += 1;
+					if (runtimeStarts === 1) await runtimeStartBlocked;
+					return running();
+				},
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {},
+				}),
+			});
+			const first = fire(handlers, "session_start");
+			const second = fire(handlers, "session_start");
+			finishRuntimeStart();
+			await Promise.all([first, second]);
+			assert.equal(runtimeStarts, 1);
+			assert.equal(configuredChecks, 1, "the successful zero-source generation runs once");
+			assert.equal(
+				logs.filter((record) => record.event === "channels_ready").length,
+				2,
+				"both lifecycle events observe the one successful generation",
+			);
+			await fire(handlers, "session_shutdown");
+		},
+	);
+});
+
 test("disables task-plane startup when channels are off and never uses A2A_STORE_PATH", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-runtime-root-"));
 	const a2aPath = join(root, "a2a", "tasks.json");
