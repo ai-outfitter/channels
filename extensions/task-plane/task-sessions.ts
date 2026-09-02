@@ -164,9 +164,15 @@ function wrapSession(session: AgentSession): TaskSession {
 			await session.waitForIdle();
 		},
 		async close() {
-			if (!session.isIdle) await session.abort();
-			await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-			session.dispose();
+			try {
+				try {
+					if (!session.isIdle) await session.abort();
+				} finally {
+					await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+				}
+			} finally {
+				session.dispose();
+			}
 		},
 	};
 }
