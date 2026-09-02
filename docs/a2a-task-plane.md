@@ -146,13 +146,13 @@ agent, a tool set, or a workflow topology.
   Task's Pi session. Authority lasts through that session's turn. The queue
   clears it before offering another Task; an interrupted Task waits for a newly
   accepted continuation rather than being offered again immediately.
-- **Wake recovery follows terminal Task state.** `WOKEN` records that Pi was
-  offered a turn, not that the turn completed. On startup, every accepted activation
-  whose Task is still non-terminal is offered once to the new runtime, including
-  activations already marked `WOKEN`. Terminal claims are filtered before queue
-  admission and do not count toward the bound. Replaying a historical wake does
-  not replace an unanswered `INPUT_REQUIRED` or `AUTH_REQUIRED` status message
-  with bare `WORKING`; a newly accepted continuation still starts normally. A
+- **Wake recovery follows durable Task state.** `WOKEN` records that Pi was
+  offered a turn, not that the turn completed. On startup, only the newest
+  accepted activation for each non-terminal Task is eligible for the new
+  runtime, including one already marked `WOKEN`. An unanswered `INPUT_REQUIRED`
+  or `AUTH_REQUIRED` Task is not offered again until a newer continuation is
+  accepted. Terminal claims are filtered before queue admission and do not
+  count toward the bound. A newly accepted continuation starts normally. A
   successful delivery is re-offered at most five consecutive times while its
   Task remains unsettled. Reaching that durable cap records `WAKE_FAILED` and
   unhealthy evidence; startup does not resurrect the activation. A new provider

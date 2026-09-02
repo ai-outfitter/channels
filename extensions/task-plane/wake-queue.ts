@@ -53,14 +53,11 @@ export class DurableWakeQueue {
 		const newestClaims: ActivationClaim[] = [];
 		const seenTaskIds = new Set<string>();
 		for (const claim of this.#journal.claims().toReversed()) {
-			if (
-				seenTaskIds.has(claim.taskId) ||
-				!this.#journal.isAccepted(claim.activationId) ||
-				this.#journal.isWakeFailed(claim.activationId)
-			) {
+			if (seenTaskIds.has(claim.taskId) || !this.#journal.isAccepted(claim.activationId)) {
 				continue;
 			}
 			seenTaskIds.add(claim.taskId);
+			if (this.#journal.isWakeFailed(claim.activationId)) continue;
 			newestClaims.unshift(claim);
 		}
 		for (const claim of newestClaims) {
@@ -294,8 +291,6 @@ export class DurableWakeQueue {
 	}
 
 	async #handleTaskTurnFailure(wake: PendingWake, error: unknown): Promise<void> {
-		this.#offered = undefined;
-		this.#activeTaskId = undefined;
 		wake.attempts += 1;
 		const message = errorMessage(error);
 		this.#log({
@@ -304,6 +299,35 @@ export class DurableWakeQueue {
 			attempt: wake.attempts,
 			error: message,
 		});
+		let stored: Awaited<ReturnType<A2aTaskStore["lookup"]>>;
+		try {
+			stored = await this.#tasks.lookup(wake.claim.taskId);
+		} catch (lookupError) {
+			// The turn may have changed durable Task state before rejecting. Reconcile
+			// that state before deciding whether another inference attempt is safe.
+			wake.turnComplete = true;
+			this.#offered = undefined;
+			this.#activeTaskId = undefined;
+			throw lookupError;
+		}
+		if (
+			!stored ||
+			isTerminal(stored.task.status.state) ||
+			INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)
+		) {
+			this.#offered = undefined;
+			this.#activeTaskId = undefined;
+			await this.#taskTurns?.release(wake.claim.taskId);
+			this.#log({
+				event: "a2a_task_turn_settled_after_failure",
+				taskId: wake.claim.taskId,
+				state: stored?.task.status.state,
+				error: message,
+			});
+			return;
+		}
+		this.#offered = undefined;
+		this.#activeTaskId = undefined;
 		if (wake.attempts < MAX_WAKE_ATTEMPTS) {
 			this.#pending.unshift(wake);
 			const retryDelayMs = WAKE_RETRY_BASE_MS * 2 ** (wake.attempts - 1);

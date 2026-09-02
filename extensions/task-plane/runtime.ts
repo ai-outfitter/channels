@@ -35,7 +35,11 @@ export interface RuntimeDependencies {
 	/** External A2A is provider configuration: absent means not selected. */
 	readonly listener?: RuntimeListener;
 	readonly taskTurnRunner?: TaskTurnRunner;
-	readonly taskPlaneReady?: (taskPlane: TaskPlane, wakeQueue: DurableWakeQueue) => void;
+	readonly taskPlaneReady?: (
+		taskPlane: TaskPlane,
+		wakeQueue: DurableWakeQueue,
+		sourceSink: SourceTaskActivationSink,
+	) => void;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -100,7 +104,6 @@ export async function startChannelsRuntime(
 	});
 	// 2. Repair projections before the sink is exposed to any source.
 	await taskPlane.replayIncomplete();
-	dependencies.taskPlaneReady?.(taskPlane, wakeQueue);
 	const retainedTaskIds = await tasks.retainedTaskIds();
 	await Promise.all([
 		journal.compact(Date.now(), retainedTaskIds),
@@ -281,6 +284,7 @@ export async function startChannelsRuntime(
 			}
 		},
 	};
+	dependencies.taskPlaneReady?.(taskPlane, wakeQueue, sourceSink);
 	try {
 		// 5. Sources start with a closed intake gate. Even if one source invokes
 		// its sink during start, no activation can enter until every start wins.

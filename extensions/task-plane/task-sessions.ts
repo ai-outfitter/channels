@@ -53,13 +53,17 @@ export class TaskSessionHost implements TaskTurnRunner {
 
 	constructor(options: TaskSessionHostOptions) {
 		this.#options = options;
-		this.#sessionPaths = SessionManager.listAll(options.sessionDir).then((sessions) => {
+		const sessionPaths = SessionManager.listAll(options.sessionDir).then((sessions) => {
 			const paths = new Map<string, string[]>();
 			for (const session of sessions) {
 				paths.set(session.id, [...(paths.get(session.id) ?? []), session.path]);
 			}
 			return paths;
 		});
+		// Retain the failure for the first Task turn while preventing an idle host
+		// from surfacing the eager scan as an unhandled rejection.
+		void sessionPaths.catch(() => {});
+		this.#sessionPaths = sessionPaths;
 	}
 
 	async run(taskId: string, prompt: string): Promise<void> {
@@ -117,14 +121,22 @@ export class TaskSessionHost implements TaskTurnRunner {
 			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
 			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
 		const createSession = this.#options.createSession ?? createPiTaskSession;
-		const session = await createSession({
-			taskId,
-			cwd: this.#options.cwd,
-			agentDir: this.#options.agentDir ?? getAgentDir(),
-			sessionManager,
-			customTools: this.#options.customTools,
-			excludedExtensionRoot: this.#options.excludedExtensionRoot,
-		});
+		let session: TaskSession;
+		try {
+			session = await createSession({
+				taskId,
+				cwd: this.#options.cwd,
+				agentDir: this.#options.agentDir ?? getAgentDir(),
+				sessionManager,
+				customTools: this.#options.customTools,
+				excludedExtensionRoot: this.#options.excludedExtensionRoot,
+			});
+		} catch (error) {
+			const partialFile = sessionManager.getSessionFile();
+			if (partialFile && existsSync(partialFile))
+				sessionPaths.set(sessionId, [resolve(partialFile)]);
+			throw error;
+		}
 		const sessionFile = sessionManager.getSessionFile();
 		if (sessionFile) sessionPaths.set(sessionId, [sessionFile]);
 		this.#options.log?.({
