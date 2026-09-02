@@ -428,7 +428,9 @@ export async function startA2aServer(
 			const canceled = await store.updateStatus(principal, task.id, {
 				state: "TASK_STATE_CANCELED",
 			});
-			await onTaskCanceled(task.id);
+			await Promise.resolve()
+				.then(() => onTaskCanceled(task.id))
+				.catch(() => {});
 			emit(task.id, {
 				statusUpdate: { taskId: task.id, contextId: task.contextId, status: canceled.status },
 			});
