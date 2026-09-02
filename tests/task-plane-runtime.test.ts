@@ -883,7 +883,7 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 
 	const activeRoot = await mkdtemp(join(tmpdir(), "channels-wake-stop-active-"));
 	const active = await fixture(activeRoot);
-	await active.plane.accept(activation("wake-stop-active"));
+	const activeAccepted = await active.plane.accept(activation("wake-stop-active"));
 	let turnStarted = (): void => {};
 	const running = new Promise<void>((resolve) => {
 		turnStarted = resolve;
@@ -921,6 +921,10 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 		active.journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number],
 	);
 	await running;
+	await active.tasks.updateStatus("source:user", activeAccepted.taskId, {
+		state: "TASK_STATE_COMPLETED",
+	});
+	assert.equal(await activeQueue.hasAuthority(activeAccepted.taskId), false);
 	const firstStop = activeQueue.stop();
 	const secondStop = activeQueue.stop();
 	assert.equal(firstStop, secondStop, "concurrent stop callers must share one barrier");

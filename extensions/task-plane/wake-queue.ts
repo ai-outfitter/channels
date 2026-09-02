@@ -168,7 +168,7 @@ export class DurableWakeQueue {
 		if (this.#retryTimer) clearTimeout(this.#retryTimer);
 		this.#retryTimer = undefined;
 		this.#pending = [];
-		const activeTaskId = this.#activeTaskId;
+		const activeTaskId = this.#activeTaskId ?? this.#offered?.claim.taskId;
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
 		this.#retired.clear();
