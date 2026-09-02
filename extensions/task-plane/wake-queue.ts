@@ -30,6 +30,7 @@ export class DurableWakeQueue {
 	#activeTaskId: string | undefined;
 	#pumping = false;
 	#pumpPromise: Promise<void> | undefined;
+	#currentWake: PendingWake | undefined;
 	#stopPromise: Promise<void> | undefined;
 	#pumpFailures = 0;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -166,19 +167,27 @@ export class DurableWakeQueue {
 	}
 
 	async cancelTask(taskId: string): Promise<void> {
-		this.#canceledTaskIds.add(taskId);
-		for (const wake of this.#pending) {
-			if (wake.claim.taskId === taskId) this.#retired.add(wake.claim.activationId);
-		}
 		this.#pending = this.#pending.filter((wake) => wake.claim.taskId !== taskId);
+		const currentWake = this.#currentWake?.claim.taskId === taskId ? this.#currentWake : undefined;
+		const canceledActivationIds = new Set<string>();
+		if (currentWake) {
+			this.#canceledTaskIds.add(taskId);
+			this.#retired.add(currentWake.claim.activationId);
+			canceledActivationIds.add(currentWake.claim.activationId);
+		}
 		if (this.#offered?.claim.taskId === taskId) {
 			this.#retired.add(this.#offered.claim.activationId);
+			canceledActivationIds.add(this.#offered.claim.activationId);
 			this.#offered = undefined;
 		}
 		if (this.#activeTaskId === taskId) this.#activeTaskId = undefined;
+		const pump = currentWake ? this.#pumpPromise : undefined;
 		await this.#releaseTask(taskId).catch((error) => {
 			this.#log({ event: "a2a_task_cancel_release_failed", taskId, error: errorMessage(error) });
 		});
+		await pump?.catch(() => {});
+		this.#canceledTaskIds.delete(taskId);
+		for (const activationId of canceledActivationIds) this.#retired.delete(activationId);
 		this.#schedulePump();
 	}
 
@@ -228,6 +237,7 @@ export class DurableWakeQueue {
 		try {
 			wake = this.#pending.shift();
 			if (!wake) return;
+			this.#currentWake = wake;
 			const stored = await this.#tasks.lookup(wake.claim.taskId);
 			if (this.#stopped) return;
 			if (wake.turnComplete) {
@@ -334,6 +344,7 @@ export class DurableWakeQueue {
 				}, retryDelayMs);
 			}
 		} finally {
+			if (this.#currentWake === wake) this.#currentWake = undefined;
 			this.#pumping = false;
 			if (!failed) this.#pumpFailures = 0;
 		}

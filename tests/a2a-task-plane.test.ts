@@ -406,6 +406,7 @@ describe("a2a task plane", () => {
 		const canceledTaskIds: string[] = [];
 		const server = await launch(parkingExecutor, {}, (taskId) => {
 			canceledTaskIds.push(taskId);
+			throw new Error("local cancellation cleanup failed");
 		});
 		const created = await send(server, "token-a", {
 			message: userMessage("m-19", "cancel me"),
