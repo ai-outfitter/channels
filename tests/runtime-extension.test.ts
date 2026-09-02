@@ -377,6 +377,68 @@ test("concurrent starts join one successful zero-source generation", async () =>
 	);
 });
 
+test("a canceled source-start rejection does not close its replacement task plane", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers } = fakePi();
+			let runtimeStarts = 0;
+			let runtimeCloses = 0;
+			let sourceStarts = 0;
+			let sourceStartEntered = (): void => {};
+			const sourceStarting = new Promise<void>((resolve) => {
+				sourceStartEntered = resolve;
+			});
+			let rejectSourceStart = (): void => {};
+			const sourceStartBlocked = new Promise<void>((_resolve, reject) => {
+				rejectSourceStart = () => reject(new Error("canceled source failed"));
+			});
+			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({
+							async start() {
+								sourceStarts += 1;
+								if (sourceStarts === 1) {
+									sourceStartEntered();
+									await sourceStartBlocked;
+								}
+								return async () => {};
+							},
+						}),
+					},
+				},
+				startRuntime: async () => {
+					runtimeStarts += 1;
+					return running(() => {
+						runtimeCloses += 1;
+					});
+				},
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {},
+				}),
+			});
+
+			const firstStart = fire(handlers, "session_start");
+			await sourceStarting;
+			await fire(handlers, "session_shutdown");
+			const restart = fire(handlers, "session_start");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(runtimeStarts, 2);
+			rejectSourceStart();
+			await Promise.all([firstStart, restart]);
+			assert.equal(sourceStarts, 2);
+			assert.equal(runtimeCloses, 1, "the canceled generation must not close runtime two");
+
+			await fire(handlers, "session_shutdown");
+			assert.equal(runtimeCloses, 2);
+		},
+	);
+});
+
 test("disables task-plane startup when channels are off and never uses A2A_STORE_PATH", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-runtime-root-"));
 	const a2aPath = join(root, "a2a", "tasks.json");

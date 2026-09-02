@@ -422,6 +422,7 @@ export default function channelEventsExtension(
 				if (stops.length === 0) log("no channels started");
 			} catch (error) {
 				for (const { stop } of started.reverse()) await stop().catch(() => {});
+				if (stopped) return;
 				await onTransactionalFailure();
 				log(`channels unhealthy: ${(error as Error).message}`);
 				throw error;
