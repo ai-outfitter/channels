@@ -440,6 +440,10 @@ export class DurableWakeQueue {
 			attempts: wake.attempts,
 			error: message,
 		});
+		// The wake is fully out of the queue now. Keep this tombstone only while
+		// failure handling can still unwind into #restore; otherwise every failed
+		// activation would remain resident until shutdown.
+		this.#retired.delete(wake.claim.activationId);
 	}
 
 	#restore(wake: PendingWake): void {
@@ -527,6 +531,9 @@ export class DurableWakeQueue {
 			attempts: deliveries,
 			error,
 		});
+		// Durable WAKE_FAILED state rejects future admission, so the in-memory
+		// tombstone is redundant once this pump has finished handling the wake.
+		this.#retired.delete(claim.activationId);
 	}
 
 	/** Retire a wake whose Task is gone or terminal, then look for the next one. */
