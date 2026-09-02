@@ -1767,7 +1767,9 @@ it("backs off and automatically retries a transient wake-path I/O failure", asyn
 		return lookup(taskId);
 	};
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	await waitFor(
+		() => prompts.length === 1 && logs.some((record) => record.event === "a2a_wake_pump_failed"),
+	);
 	assert.equal(prompts.length, 1);
 	assert.equal(
 		logs.some((record) => record.event === "a2a_wake_pump_failed"),
