@@ -329,6 +329,7 @@ export async function startChannelsRuntime(
 		// declares it once every extension it owns has registered.
 	} catch (error) {
 		intakeOpen = false;
+		wakeQueue.stop();
 		for (const stop of stops.reverse()) await stop().catch(() => {});
 		log({ event: "channels_unhealthy", error: errorMessage(error) });
 		throw error;

@@ -1704,12 +1704,17 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 	await writeFile(storePath, `${JSON.stringify(deployedTask)}\n`);
 	await writeFile(join(root, "origins.json"), `${JSON.stringify(deployedOrigins)}\n`);
 	let stopped = 0;
+	const failedStartupPrompts: string[] = [];
+	let failedStartupPlane: TaskPlane | undefined;
 	await assert.rejects(
 		startChannelsRuntime(
-			{ sendUserMessage() {} },
+			{ sendUserMessage: async (prompt: string) => failedStartupPrompts.push(prompt) },
 			{
 				storePath,
 				agentInterface: "https://agent.example.test",
+				taskPlaneReady(taskPlane) {
+					failedStartupPlane = taskPlane;
+				},
 				sources: [
 					{
 						name: "first",
@@ -1731,6 +1736,10 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 		/cannot start/,
 	);
 	assert.equal(stopped, 1);
+	assert.ok(failedStartupPlane);
+	await failedStartupPlane.accept(activation("after-failed-startup"));
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.deepEqual(failedStartupPrompts, [], "startup rollback must stop its wake queue");
 	const afterTasks = JSON.parse(await readFile(storePath, "utf8"));
 	const afterOrigins = JSON.parse(await readFile(join(root, "origins.json"), "utf8"));
 	assert.deepEqual(afterTasks.tasks[taskId], deployedTask.tasks[taskId]);

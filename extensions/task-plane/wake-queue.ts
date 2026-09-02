@@ -178,6 +178,7 @@ export class DurableWakeQueue {
 			wake = this.#pending.shift();
 			if (!wake) return;
 			const stored = await this.#tasks.lookup(wake.claim.taskId);
+			if (this.#stopped) return;
 			if (!stored || isTerminal(stored.task.status.state)) {
 				// The finally block below re-pumps, so consume without recursing.
 				await this.#consumeSettled(wake.claim);
