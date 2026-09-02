@@ -832,6 +832,91 @@ it("re-offers an unclaimed wake after an unrelated agent turn ends", async () =>
 	assert.equal(await queue.hasAuthority(accepted.taskId), true);
 });
 
+it("stops an in-flight wake before delivery and releases an active Task turn", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-stop-race-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("wake-stop-race"));
+	let grantStarted = (): void => {};
+	const granting = new Promise<void>((resolve) => {
+		grantStarted = resolve;
+	});
+	let resumeGrant = (): void => {};
+	const grantBlocked = new Promise<void>((resolve) => {
+		resumeGrant = resolve;
+	});
+	const updateStatus = tasks.updateStatus.bind(tasks);
+	tasks.updateStatus = async (...args) => {
+		grantStarted();
+		await grantBlocked;
+		return updateStatus(...args);
+	};
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await granting;
+	const stopped = queue.stop();
+	resumeGrant();
+	await stopped;
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(turns, 0, "a stopped grant must not start its Task session");
+	assert.equal(releases, 0, "no Task session existed to release before delivery");
+
+	const activeRoot = await mkdtemp(join(tmpdir(), "channels-wake-stop-active-"));
+	const active = await fixture(activeRoot);
+	await active.plane.accept(activation("wake-stop-active"));
+	let turnStarted = (): void => {};
+	const running = new Promise<void>((resolve) => {
+		turnStarted = resolve;
+	});
+	let finishTurn = (): void => {};
+	const turnBlocked = new Promise<void>((resolve) => {
+		finishTurn = resolve;
+	});
+	let activeTurns = 0;
+	let activeReleases = 0;
+	const activeQueue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		active.tasks,
+		active.journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				activeTurns += 1;
+				turnStarted();
+				await turnBlocked;
+			},
+			async release() {
+				activeReleases += 1;
+				finishTurn();
+			},
+		},
+	);
+	activeQueue.enqueue(
+		active.journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number],
+	);
+	await running;
+	await activeQueue.stop();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(activeTurns, 1);
+	assert.equal(activeReleases, 1, "stop must release the active Task session");
+});
+
 it("retries when the delivery-time Task transition fails", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-start-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
