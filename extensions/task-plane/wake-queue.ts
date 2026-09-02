@@ -3,6 +3,7 @@ import type { A2aTaskStore } from "../a2a/store.ts";
 import { INTERRUPTED_TASK_STATES, isTerminal } from "../a2a/types.ts";
 import { errorMessage } from "../sources/util.ts";
 import type { ActivationClaim, ActivationJournal } from "./journal.ts";
+import type { TaskTurnRunner } from "./task-sessions.ts";
 
 interface PendingWake {
 	readonly claim: ActivationClaim;
@@ -21,6 +22,7 @@ export class DurableWakeQueue {
 	readonly #journal: ActivationJournal;
 	readonly #log: (record: Readonly<Record<string, unknown>>) => void;
 	readonly #recordUnhealthy: (claim: ActivationClaim, error: string) => Promise<void>;
+	readonly #taskTurns: TaskTurnRunner | undefined;
 	#pending: PendingWake[] = [];
 	#offered: PendingWake | undefined;
 	#activeTaskId: string | undefined;
@@ -35,12 +37,14 @@ export class DurableWakeQueue {
 		journal: ActivationJournal,
 		log: (record: Readonly<Record<string, unknown>>) => void = () => {},
 		recordUnhealthy: (claim: ActivationClaim, error: string) => Promise<void> = async () => {},
+		taskTurns?: TaskTurnRunner,
 	) {
 		this.#pi = pi;
 		this.#tasks = tasks;
 		this.#journal = journal;
 		this.#log = log;
 		this.#recordUnhealthy = recordUnhealthy;
+		this.#taskTurns = taskTurns;
 	}
 
 	async replay(): Promise<void> {
@@ -186,7 +190,12 @@ export class DurableWakeQueue {
 			this.#offered = wake;
 			this.#activeTaskId = wake.claim.taskId;
 			try {
-				await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
+				if (this.#taskTurns) {
+					await this.#taskTurns.run(wake.claim.taskId, wake.prompt);
+					await this.#finishTaskTurn(wake);
+				} else {
+					await Promise.resolve(this.#pi.sendUserMessage(wake.prompt, { deliverAs: "followUp" }));
+				}
 				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
 			} catch (error) {
@@ -242,6 +251,19 @@ export class DurableWakeQueue {
 				this.#pumpFailures = 0;
 				void this.#pump();
 			}
+		}
+	}
+
+	async #finishTaskTurn(wake: PendingWake): Promise<void> {
+		const stored = await this.#tasks.lookup(wake.claim.taskId);
+		this.#activeTaskId = undefined;
+		this.#offered = undefined;
+		if (
+			stored &&
+			!isTerminal(stored.task.status.state) &&
+			!INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)
+		) {
+			this.#pending.unshift(wake);
 		}
 	}
 

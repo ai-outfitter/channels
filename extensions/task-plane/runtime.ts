@@ -14,6 +14,7 @@ import {
 	ReplyAnchorStore,
 	SourceCheckpointStore,
 } from "./stores.ts";
+import type { TaskTurnRunner } from "./task-sessions.ts";
 import type { SourceTaskActivationSink, TaskActivationSink } from "./types.ts";
 import { DurableWakeQueue } from "./wake-queue.ts";
 
@@ -33,6 +34,8 @@ export interface RuntimeDependencies {
 	readonly sources: readonly RuntimeSource[];
 	/** External A2A is provider configuration: absent means not selected. */
 	readonly listener?: RuntimeListener;
+	readonly taskTurnRunner?: TaskTurnRunner;
+	readonly taskPlaneReady?: (taskPlane: TaskPlane) => void;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -76,8 +79,14 @@ export async function startChannelsRuntime(
 		deliveries.initialize(),
 		journal.initialize(),
 	]);
-	const wakeQueue = new DurableWakeQueue(pi, tasks, journal, log, (claim, error) =>
-		evidence.appendUnhealthy(claim.activationId, claim.taskId, claim.input.source, error),
+	const wakeQueue = new DurableWakeQueue(
+		pi,
+		tasks,
+		journal,
+		log,
+		(claim, error) =>
+			evidence.appendUnhealthy(claim.activationId, claim.taskId, claim.input.source, error),
+		dependencies.taskTurnRunner,
 	);
 	const taskPlane = createTaskPlane({
 		tasks,
@@ -91,6 +100,7 @@ export async function startChannelsRuntime(
 	});
 	// 2. Repair projections before the sink is exposed to any source.
 	await taskPlane.replayIncomplete();
+	dependencies.taskPlaneReady?.(taskPlane);
 	const retainedTaskIds = await tasks.retainedTaskIds();
 	await Promise.all([
 		journal.compact(Date.now(), retainedTaskIds),
