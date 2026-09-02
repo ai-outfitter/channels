@@ -378,6 +378,7 @@ export default function channelEventsExtension(
 	pi.on("session_start", async (_event, ctx) => {
 		const prior = starting;
 		if (prior) await prior.catch(() => {});
+		if (prior && startupSucceeded) return;
 		if (!canStart()) return;
 		if (stops.length > 0) return; // idempotent across reload / concurrent fires
 		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
