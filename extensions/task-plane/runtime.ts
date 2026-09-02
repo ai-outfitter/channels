@@ -120,6 +120,11 @@ export async function startChannelsRuntime(
 	let intakeOpen = false;
 	let listenerHealthy = true;
 	const deliveryOperations = new Map<string, Promise<string | undefined>>();
+	const drainDeliveries = async (): Promise<void> => {
+		while (deliveryOperations.size > 0) {
+			await Promise.allSettled([...deliveryOperations.values()]);
+		}
+	};
 	const guardedSink: TaskActivationSink = {
 		accept: async (input) => {
 			if (!intakeOpen) throw new Error("channels intake is not ready");
@@ -331,6 +336,7 @@ export async function startChannelsRuntime(
 		intakeOpen = false;
 		await wakeQueue.stop();
 		for (const stop of stops.reverse()) await stop().catch(() => {});
+		await drainDeliveries();
 		log({ event: "channels_unhealthy", error: errorMessage(error) });
 		throw error;
 	}
@@ -347,6 +353,7 @@ export async function startChannelsRuntime(
 			for (const stop of stops.reverse()) await stop().catch(() => {});
 			intakeOpen = false;
 			await wakeQueue.stop();
+			await drainDeliveries();
 		},
 	};
 }

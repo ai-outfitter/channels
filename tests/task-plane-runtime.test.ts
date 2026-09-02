@@ -2276,6 +2276,53 @@ it("serializes identical concurrent deliveries by delivery id", async () => {
 	await runtime.close();
 });
 
+it("runtime close joins an in-flight outbound delivery", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-delivery-close-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.deliver);
+	let sendStarted = (): void => {};
+	const sending = new Promise<void>((resolve) => {
+		sendStarted = resolve;
+	});
+	let finishSend = (): void => {};
+	const sendBlocked = new Promise<void>((resolve) => {
+		finishSend = resolve;
+	});
+	const delivery = runtime.sourceSink.deliver(
+		{
+			taskId: "task-close",
+			source: "slack",
+			operationId: "reply:close",
+			payloadDigest: digest("close reply"),
+			recovery: "lookup",
+		},
+		async () => {
+			sendStarted();
+			await sendBlocked;
+			return "provider-close";
+		},
+		async () => undefined,
+	);
+	await sending;
+	let closeResolved = false;
+	const close = runtime.close().then(() => {
+		closeResolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(closeResolved, false);
+	finishSend();
+	assert.equal(await delivery, "provider-close");
+	await close;
+	assert.equal(closeResolved, true);
+});
+
 it("fails closed when lookup recovery has no reconciler and records one-prefix evidence", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-delivery-lookup-"));
 	const input = {
