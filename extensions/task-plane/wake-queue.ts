@@ -34,6 +34,8 @@ export class DurableWakeQueue {
 	#pumpFailures = 0;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	readonly #retired = new Set<string>();
+	readonly #retainedTaskIds = new Set<string>();
+	readonly #taskReleases = new Map<string, Promise<void>>();
 	#stopped = false;
 
 	constructor(
@@ -168,13 +170,13 @@ export class DurableWakeQueue {
 		if (this.#retryTimer) clearTimeout(this.#retryTimer);
 		this.#retryTimer = undefined;
 		this.#pending = [];
-		const activeTaskId = this.#activeTaskId ?? this.#offered?.claim.taskId;
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
 		this.#retired.clear();
 		const pump = this.#pumpPromise;
+		const retainedTaskIds = [...this.#retainedTaskIds];
 		this.#stopPromise = (async () => {
-			if (activeTaskId) await this.#taskTurns?.release(activeTaskId).catch(() => {});
+			await Promise.all(retainedTaskIds.map((taskId) => this.#releaseTask(taskId).catch(() => {})));
 			await pump?.catch(() => {});
 		})();
 		return this.#stopPromise;
@@ -233,6 +235,7 @@ export class DurableWakeQueue {
 			this.#offered = wake;
 			this.#activeTaskId = wake.claim.taskId;
 			if (this.#taskTurns) {
+				this.#retainedTaskIds.add(wake.claim.taskId);
 				try {
 					await this.#taskTurns.run(wake.claim.taskId, wake.prompt);
 				} catch (error) {
@@ -323,7 +326,7 @@ export class DurableWakeQueue {
 			isTerminal(stored.task.status.state) ||
 			INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)
 		) {
-			await this.#taskTurns?.release(wake.claim.taskId);
+			await this.#releaseTask(wake.claim.taskId);
 		} else {
 			wake.turnComplete = false;
 			this.#pending.unshift(wake);
@@ -362,7 +365,7 @@ export class DurableWakeQueue {
 		) {
 			this.#offered = undefined;
 			this.#activeTaskId = undefined;
-			await this.#taskTurns?.release(wake.claim.taskId);
+			await this.#releaseTask(wake.claim.taskId);
 			this.#log({
 				event: "a2a_task_turn_settled_after_failure",
 				taskId: wake.claim.taskId,
@@ -381,7 +384,7 @@ export class DurableWakeQueue {
 		}
 
 		this.#retired.add(wake.claim.activationId);
-		await this.#taskTurns?.release(wake.claim.taskId).catch((releaseError) => {
+		await this.#releaseTask(wake.claim.taskId).catch((releaseError) => {
 			this.#log({
 				event: "a2a_task_turn_release_failed",
 				taskId: wake.claim.taskId,
@@ -452,7 +455,7 @@ export class DurableWakeQueue {
 	async #failDeliveryCap(claim: ActivationClaim, deliveries: number): Promise<void> {
 		const error = `wake delivery cap ${MAX_WAKE_DELIVERIES} reached without Task settlement`;
 		this.#retired.add(claim.activationId);
-		await this.#taskTurns?.release(claim.taskId).catch((releaseError) => {
+		await this.#releaseTask(claim.taskId).catch((releaseError) => {
 			this.#log({
 				event: "a2a_task_turn_release_failed",
 				taskId: claim.taskId,
@@ -492,9 +495,26 @@ export class DurableWakeQueue {
 
 	/** Retire a wake whose Task is gone or terminal, then look for the next one. */
 	async #consumeSettled(claim: ActivationClaim): Promise<void> {
-		await this.#taskTurns?.release(claim.taskId);
+		await this.#releaseTask(claim.taskId);
 		await this.#markConsumed(claim);
 		this.#schedulePump();
+	}
+
+	async #releaseTask(taskId: string): Promise<void> {
+		if (!this.#retainedTaskIds.has(taskId)) return;
+		let release = this.#taskReleases.get(taskId);
+		if (!release) {
+			release = (async () => {
+				await this.#taskTurns?.release(taskId);
+				this.#retainedTaskIds.delete(taskId);
+			})();
+			this.#taskReleases.set(taskId, release);
+		}
+		try {
+			await release;
+		} finally {
+			if (this.#taskReleases.get(taskId) === release) this.#taskReleases.delete(taskId);
+		}
 	}
 
 	async #markConsumed(claim: ActivationClaim): Promise<void> {

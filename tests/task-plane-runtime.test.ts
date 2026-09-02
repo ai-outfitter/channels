@@ -941,6 +941,59 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 	assert.equal(activeReleases, 1, "stop must release the active Task session");
 });
 
+it("stop releases a retained Task session while its next wake is being prepared", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-stop-retained-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("wake-stop-retained"));
+
+	const lookup = tasks.lookup.bind(tasks);
+	let lookups = 0;
+	let nextLookupStarted = (): void => {};
+	const preparingNextWake = new Promise<void>((resolve) => {
+		nextLookupStarted = resolve;
+	});
+	let resumeLookup = (): void => {};
+	const lookupBlocked = new Promise<void>((resolve) => {
+		resumeLookup = resolve;
+	});
+	tasks.lookup = async (...args) => {
+		lookups += 1;
+		if (lookups === 3) {
+			nextLookupStarted();
+			await lookupBlocked;
+		}
+		return lookup(...args);
+	};
+
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await preparingNextWake;
+
+	const stopping = queue.stop();
+	await waitFor(() => releases === 1);
+	resumeLookup();
+	await stopping;
+
+	assert.equal(turns, 1);
+	assert.equal(releases, 1, "stop must release the retained Task session");
+});
+
 it("retries when the delivery-time Task transition fails", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-start-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
