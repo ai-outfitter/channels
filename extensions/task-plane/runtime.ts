@@ -35,7 +35,7 @@ export interface RuntimeDependencies {
 	/** External A2A is provider configuration: absent means not selected. */
 	readonly listener?: RuntimeListener;
 	readonly taskTurnRunner?: TaskTurnRunner;
-	readonly taskPlaneReady?: (taskPlane: TaskPlane) => void;
+	readonly taskPlaneReady?: (taskPlane: TaskPlane, wakeQueue: DurableWakeQueue) => void;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -100,7 +100,7 @@ export async function startChannelsRuntime(
 	});
 	// 2. Repair projections before the sink is exposed to any source.
 	await taskPlane.replayIncomplete();
-	dependencies.taskPlaneReady?.(taskPlane);
+	dependencies.taskPlaneReady?.(taskPlane, wakeQueue);
 	const retainedTaskIds = await tasks.retainedTaskIds();
 	await Promise.all([
 		journal.compact(Date.now(), retainedTaskIds),

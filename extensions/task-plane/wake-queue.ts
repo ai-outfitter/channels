@@ -210,15 +210,18 @@ export class DurableWakeQueue {
 					error: message,
 				});
 				if (wake.attempts >= MAX_WAKE_ATTEMPTS) {
-					await this.#journal.append({
-						kind: "WAKE_FAILED",
-						activationId: wake.claim.activationId,
-						attempts: wake.attempts,
-						error: message,
-						failedAt: new Date().toISOString(),
-					});
+					if (this.#taskTurns) await this.#recordUnhealthy(wake.claim, message);
+					else {
+						await this.#journal.append({
+							kind: "WAKE_FAILED",
+							activationId: wake.claim.activationId,
+							attempts: wake.attempts,
+							error: message,
+							failedAt: new Date().toISOString(),
+						});
+					}
 					this.#log({
-						event: "a2a_wake_abandoned",
+						event: this.#taskTurns ? "a2a_task_turn_paused" : "a2a_wake_abandoned",
 						taskId: wake.claim.taskId,
 						attempts: wake.attempts,
 						error: message,
@@ -258,11 +261,9 @@ export class DurableWakeQueue {
 		const stored = await this.#tasks.lookup(wake.claim.taskId);
 		this.#activeTaskId = undefined;
 		this.#offered = undefined;
-		if (
-			stored &&
-			!isTerminal(stored.task.status.state) &&
-			!INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)
-		) {
+		if (stored && isTerminal(stored.task.status.state)) {
+			await this.#taskTurns?.release(wake.claim.taskId);
+		} else if (stored && !INTERRUPTED_TASK_STATES.includes(stored.task.status.state as never)) {
 			this.#pending.unshift(wake);
 		}
 	}

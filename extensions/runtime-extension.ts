@@ -42,6 +42,7 @@ export default function channelsRuntimeExtension(
 	let a2aServer: RunningA2aServer | undefined;
 	let taskSessions: TaskSessionOwner | undefined;
 	let startingTaskPlane: TaskPlane | undefined;
+	let startingWakeQueue: RunningChannelsRuntime["wakeQueue"] | undefined;
 	const taskTools: ToolDefinition[] = [];
 	const taskToolPi = captureTools(pi, taskTools);
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
@@ -86,13 +87,26 @@ export default function channelsRuntimeExtension(
 		registerA2aTools(
 			taskToolPi,
 			taskAccess,
-			async (taskId) => runtime?.wakeQueue.hasAuthority(taskId) ?? false,
+			async (taskId) => (runtime?.wakeQueue ?? startingWakeQueue)?.hasAuthority(taskId) ?? false,
 			(taskId) => {
-				const queue = runtime?.wakeQueue;
+				const queue = runtime?.wakeQueue ?? startingWakeQueue;
 				return queue !== undefined && queue.sourceForTask(taskId) === "a2a";
 			},
 		);
 	}
+	const closeTaskPlane = async (): Promise<void> => {
+		const loaded = runtime;
+		const sessions = taskSessions;
+		runtime = undefined;
+		taskSessions = undefined;
+		startingTaskPlane = undefined;
+		startingWakeQueue = undefined;
+		try {
+			await loaded?.close();
+		} finally {
+			await sessions?.close();
+		}
+	};
 
 	// Register the task plane first. Pi dispatches lifecycle hooks in
 	// registration order, so the durable local plane is ready before any
@@ -123,29 +137,40 @@ export default function channelsRuntimeExtension(
 					excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 					log,
 				};
-				taskSessions = dependencies.createTaskSessionHost
+				const sessionOwner = dependencies.createTaskSessionHost
 					? dependencies.createTaskSessionHost(taskSessionOptions)
 					: new TaskSessionHost(taskSessionOptions);
-				const loaded = await startRuntime(pi, {
-					storePath: join(taskPlaneRoot, "tasks.json"),
-					originStorePath: join(taskPlaneRoot, "origins.json"),
-					agentInterface:
-						process.env.A2A_PUBLIC_URL?.trim() ||
-						`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
-					// Channel sources receive the guarded sink from this runtime after it opens.
-					sources: [],
-					taskTurnRunner: taskSessions,
-					taskPlaneReady: (taskPlane) => {
-						startingTaskPlane = taskPlane;
-					},
-					...(listener ? { listener } : {}),
-					log,
-				});
-				if (stopped) await loaded.close();
-				else {
-					runtime = loaded;
+				taskSessions = sessionOwner;
+				try {
+					const loaded = await startRuntime(pi, {
+						storePath: join(taskPlaneRoot, "tasks.json"),
+						originStorePath: join(taskPlaneRoot, "origins.json"),
+						agentInterface:
+							process.env.A2A_PUBLIC_URL?.trim() ||
+							`http://${process.env.A2A_HOST?.trim() || "127.0.0.1"}:${process.env.A2A_PORT?.trim() || "8788"}`,
+						// Channel sources receive the guarded sink from this runtime after it opens.
+						sources: [],
+						taskTurnRunner: sessionOwner,
+						taskPlaneReady: (taskPlane, wakeQueue) => {
+							startingTaskPlane = taskPlane;
+							startingWakeQueue = wakeQueue;
+						},
+						...(listener ? { listener } : {}),
+						log,
+					});
+					if (stopped) await loaded.close();
+					else {
+						runtime = loaded;
+						startingTaskPlane = undefined;
+						startingWakeQueue = undefined;
+						taskPlaneHealthy = loaded.healthy;
+					}
+				} catch (error) {
+					if (taskSessions === sessionOwner) taskSessions = undefined;
 					startingTaskPlane = undefined;
-					taskPlaneHealthy = loaded.healthy;
+					startingWakeQueue = undefined;
+					await sessionOwner.close().catch(() => {});
+					throw error;
 				}
 			})();
 			try {
@@ -165,9 +190,7 @@ export default function channelsRuntimeExtension(
 		dependencies.sources,
 		async () => {
 			taskPlaneHealthy = false;
-			const loaded = runtime;
-			runtime = undefined;
-			await loaded?.close();
+			await closeTaskPlane();
 		},
 	);
 
@@ -177,12 +200,7 @@ export default function channelsRuntimeExtension(
 		stopped = true;
 		taskPlaneHealthy = false;
 		await starting?.catch(() => {});
-		const loaded = runtime;
-		runtime = undefined;
-		startingTaskPlane = undefined;
-		await loaded?.close();
-		await taskSessions?.close();
-		taskSessions = undefined;
+		await closeTaskPlane();
 	});
 
 	relayExtension(pi);

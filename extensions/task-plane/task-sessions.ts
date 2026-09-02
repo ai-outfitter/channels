@@ -12,6 +12,7 @@ import { derivedId } from "./serialize.ts";
 
 export interface TaskTurnRunner {
 	run(taskId: string, prompt: string): Promise<void>;
+	release(taskId: string): Promise<void>;
 }
 
 export interface TaskSession {
@@ -58,6 +59,14 @@ export class TaskSessionHost implements TaskTurnRunner {
 		await session.prompt(prompt);
 	}
 
+	async release(taskId: string): Promise<void> {
+		const pending = this.#sessions.get(taskId);
+		if (!pending) return;
+		this.#sessions.delete(taskId);
+		const session = await pending.catch(() => undefined);
+		await session?.close().catch(() => {});
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -84,9 +93,9 @@ export class TaskSessionHost implements TaskTurnRunner {
 
 	async #create(taskId: string): Promise<TaskSession> {
 		const sessionId = derivedId("task", taskId);
-		const existing = (
-			await SessionManager.list(this.#options.cwd, this.#options.sessionDir)
-		).filter((session) => session.id === sessionId);
+		const existing = (await SessionManager.listAll(this.#options.sessionDir)).filter(
+			(session) => session.id === sessionId,
+		);
 		if (existing.length > 1) {
 			throw new Error(`multiple Pi sessions exist for task "${taskId}"`);
 		}
@@ -120,7 +129,7 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		extensionsOverride: (loaded) => ({
 			...loaded,
 			extensions: loaded.extensions.filter(
-				(extension) => !inside(extension.resolvedPath, input.excludedExtensionRoot),
+				(extension) => !isPathInside(extension.resolvedPath, input.excludedExtensionRoot),
 			),
 		}),
 	});
@@ -153,7 +162,7 @@ function wrapSession(session: AgentSession): TaskSession {
 	};
 }
 
-function inside(path: string, root: string): boolean {
+export function isPathInside(path: string, root: string): boolean {
 	const fromRoot = relative(resolve(root), resolve(path));
 	return (
 		fromRoot === "" ||

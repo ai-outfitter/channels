@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	isPathInside,
 	type TaskSessionFactory,
 	TaskSessionHost,
 } from "../extensions/task-plane/task-sessions.ts";
@@ -57,7 +58,7 @@ test("Task session host isolates Tasks, reuses a session, and reopens it after r
 	assert.notEqual(created[0]?.sessionId, created[1]?.sessionId);
 	assert.deepEqual(created[0]?.prompts, ["first", "second"]);
 
-	const secondHost = new TaskSessionHost(options);
+	const secondHost = new TaskSessionHost({ ...options, cwd: join(root, "different-cwd") });
 	await secondHost.run("task-one", "after restart");
 	await secondHost.close();
 
@@ -65,4 +66,41 @@ test("Task session host isolates Tasks, reuses a session, and reopens it after r
 	assert.equal(created[2]?.sessionId, created[0]?.sessionId);
 	assert.ok((created[2]?.existingEntries ?? 0) >= 2);
 	assert.deepEqual(created[2]?.prompts, ["after restart"]);
+});
+
+test("Task session host releases terminal sessions without deleting durable history", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-release-"));
+	let created = 0;
+	let closed = 0;
+	const host = new TaskSessionHost({
+		cwd: root,
+		sessionDir: join(root, "sessions"),
+		customTools: [],
+		excludedExtensionRoot: root,
+		createSession: async ({ sessionManager }) => {
+			created += 1;
+			return {
+				sessionId: sessionManager.getSessionId(),
+				sessionFile: sessionManager.getSessionFile(),
+				async prompt() {},
+				async close() {
+					closed += 1;
+				},
+			};
+		},
+	});
+	await host.run("task", "first");
+	await host.release("task");
+	await host.run("task", "second");
+	await host.close();
+	assert.equal(created, 2);
+	assert.equal(closed, 2);
+});
+
+test("extension containment uses path boundaries", () => {
+	const root = join(tmpdir(), "channels-package");
+	assert.equal(isPathInside(root, root), true);
+	assert.equal(isPathInside(join(root, "extensions", "index.ts"), root), true);
+	assert.equal(isPathInside(`${root}-extra`, root), false);
+	assert.equal(isPathInside("relative/extension.ts", "relative"), true);
 });
