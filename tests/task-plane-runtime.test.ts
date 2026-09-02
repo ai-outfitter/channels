@@ -832,6 +832,208 @@ it("re-offers an unclaimed wake after an unrelated agent turn ends", async () =>
 	assert.equal(await queue.hasAuthority(accepted.taskId), true);
 });
 
+it("stops an in-flight wake before delivery and releases an active Task turn", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-stop-race-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("wake-stop-race"));
+	let grantStarted = (): void => {};
+	const granting = new Promise<void>((resolve) => {
+		grantStarted = resolve;
+	});
+	let resumeGrant = (): void => {};
+	const grantBlocked = new Promise<void>((resolve) => {
+		resumeGrant = resolve;
+	});
+	const updateStatus = tasks.updateStatus.bind(tasks);
+	tasks.updateStatus = async (...args) => {
+		grantStarted();
+		await grantBlocked;
+		return updateStatus(...args);
+	};
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await granting;
+	let stoppedResolved = false;
+	const stopped = queue.stop().then(() => {
+		stoppedResolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(stoppedResolved, false, "stop must join the in-flight grant");
+	resumeGrant();
+	await stopped;
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(turns, 0, "a stopped grant must not start its Task session");
+	assert.equal(releases, 0, "no Task session existed to release before delivery");
+
+	const activeRoot = await mkdtemp(join(tmpdir(), "channels-wake-stop-active-"));
+	const active = await fixture(activeRoot);
+	const activeAccepted = await active.plane.accept(activation("wake-stop-active"));
+	let turnStarted = (): void => {};
+	const running = new Promise<void>((resolve) => {
+		turnStarted = resolve;
+	});
+	let finishTurn = (): void => {};
+	const turnBlocked = new Promise<void>((resolve) => {
+		finishTurn = resolve;
+	});
+	let activeTurns = 0;
+	let activeReleases = 0;
+	let finishRelease = (): void => {};
+	const releaseBlocked = new Promise<void>((resolve) => {
+		finishRelease = resolve;
+	});
+	const activeQueue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		active.tasks,
+		active.journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				activeTurns += 1;
+				turnStarted();
+				await turnBlocked;
+			},
+			async release() {
+				activeReleases += 1;
+				finishTurn();
+				await releaseBlocked;
+			},
+		},
+	);
+	activeQueue.enqueue(
+		active.journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number],
+	);
+	await running;
+	await active.tasks.updateStatus("source:user", activeAccepted.taskId, {
+		state: "TASK_STATE_COMPLETED",
+	});
+	assert.equal(await activeQueue.hasAuthority(activeAccepted.taskId), false);
+	const firstStop = activeQueue.stop();
+	const secondStop = activeQueue.stop();
+	assert.equal(firstStop, secondStop, "concurrent stop callers must share one barrier");
+	let activeStopResolved = false;
+	void firstStop.then(() => {
+		activeStopResolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(activeStopResolved, false, "stop must join active Task-session release");
+	finishRelease();
+	await firstStop;
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(activeTurns, 1);
+	assert.equal(activeReleases, 1, "stop must release the active Task session");
+});
+
+it("stop releases a retained Task session while its next wake is being prepared", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-stop-retained-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("wake-stop-retained"));
+
+	const lookup = tasks.lookup.bind(tasks);
+	let lookups = 0;
+	let nextLookupStarted = (): void => {};
+	const preparingNextWake = new Promise<void>((resolve) => {
+		nextLookupStarted = resolve;
+	});
+	let resumeLookup = (): void => {};
+	const lookupBlocked = new Promise<void>((resolve) => {
+		resumeLookup = resolve;
+	});
+	tasks.lookup = async (...args) => {
+		lookups += 1;
+		if (lookups === 3) {
+			nextLookupStarted();
+			await lookupBlocked;
+		}
+		return lookup(...args);
+	};
+
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await preparingNextWake;
+
+	const stopping = queue.stop();
+	await waitFor(() => releases === 1);
+	resumeLookup();
+	await stopping;
+
+	assert.equal(turns, 1);
+	assert.equal(releases, 1, "stop must release the retained Task session");
+});
+
+it("external Task cancellation aborts and releases its active session", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-cancel-active-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("wake-cancel-active"));
+	let turnStarted = (): void => {};
+	const running = new Promise<void>((resolve) => {
+		turnStarted = resolve;
+	});
+	let abortTurn = (): void => {};
+	const blocked = new Promise<void>((resolve) => {
+		abortTurn = resolve;
+	});
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turnStarted();
+				await blocked;
+				throw new Error("Task session aborted");
+			},
+			async release() {
+				releases += 1;
+				abortTurn();
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await running;
+	await tasks.updateStatus("source:user", accepted.taskId, { state: "TASK_STATE_CANCELED" });
+	await queue.cancelTask(accepted.taskId);
+	await waitFor(() => releases === 1);
+	assert.equal(await queue.hasAuthority(accepted.taskId), false);
+	await queue.stop();
+});
+
 it("retries when the delivery-time Task transition fails", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-start-failure-"));
 	const { plane, tasks, journal } = await fixture(root);
@@ -1034,7 +1236,7 @@ it("preserves unanswered input-required state when replaying its original wake",
 	);
 	await replayed.replay();
 	await new Promise((resolve) => setImmediate(resolve));
-	await replayed.beforeAgentStart(replayedPrompts[0] as string);
+	assert.deepEqual(replayedPrompts, []);
 	const waiting = await tasks.getTask("source:user", accepted.taskId);
 	assert.equal(waiting.status.state, "TASK_STATE_INPUT_REQUIRED");
 	assert.deepEqual(waiting.status.message, question);
@@ -1045,6 +1247,105 @@ it("preserves unanswered input-required state when replaying its original wake",
 	});
 	assert.equal(answer.disposition, "continued");
 	assert.equal(answer.taskId, accepted.taskId);
+	const answerClaim = journal.claims().at(-1);
+	assert.ok(answerClaim);
+	replayed.enqueue(answerClaim);
+	await waitFor(() => replayedPrompts.length === 1);
+	replayed.stop();
+});
+
+it("replays only the newest continuation claim for an interrupted Task", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-newest-continuation-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("first-question"));
+	let firstRelease = 0;
+	const firstQueue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				await tasks.updateStatus("source:user", taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+					message: {
+						messageId: "first-question",
+						role: "ROLE_AGENT",
+						parts: [{ text: "Which environment?" }],
+					},
+				});
+			},
+			async release() {
+				firstRelease += 1;
+			},
+		},
+	);
+	firstQueue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => firstRelease === 1);
+	firstQueue.stop();
+
+	await plane.continue({ ...activation("accepted-answer"), taskId: accepted.taskId });
+	assert.equal(journal.claims().length, 2);
+	let recoveredTurns = 0;
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				recoveredTurns += 1;
+				await tasks.updateStatus("source:user", taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+				});
+			},
+			async release() {},
+		},
+	);
+	await replayed.replay();
+	await waitFor(() => recoveredTurns === 1);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(recoveredTurns, 1);
+	assert.equal(
+		(await tasks.lookup(accepted.taskId))?.task.status.state,
+		"TASK_STATE_INPUT_REQUIRED",
+	);
+	replayed.stop();
+});
+
+it("does not fall back to an older claim when the newest Task activation failed", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-newest-failed-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("older-activation"));
+	await tasks.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_INPUT_REQUIRED",
+		message: {
+			messageId: "question-before-failed-continuation",
+			role: "ROLE_AGENT",
+			parts: [{ text: "Continue?" }],
+		},
+	});
+	await plane.continue({ ...activation("failed-continuation"), taskId: accepted.taskId });
+	const newestClaim = journal.claims().at(-1);
+	assert.ok(newestClaim);
+	await journal.append({
+		kind: "WAKE_FAILED",
+		activationId: newestClaim.activationId,
+		attempts: MAX_WAKE_DELIVERIES,
+		error: "delivery cap",
+		failedAt: new Date().toISOString(),
+	});
+	const prompts: string[] = [];
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: async (prompt: string) => prompts.push(prompt) },
+		tasks,
+		journal,
+	);
+	await replayed.replay();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(prompts, []);
 	replayed.stop();
 });
 
@@ -1142,11 +1443,12 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	setTimeout(() => {
 		timerFired = true;
 	}, 5);
-	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setTimeout(resolve, 100));
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	queue.enqueue(claim);
+	await waitFor(() => timerFired && journal.isWakeFailed(claim.activationId));
 	assert.equal(timerFired, true);
 	assert.equal(attempts, 3);
-	assert.equal(journal.isWakeFailed(journal.claims()[0]?.activationId ?? ""), true);
+	assert.equal(journal.isWakeFailed(claim.activationId), true);
 	assert.equal(
 		logs.some((record) => record.event === "a2a_wake_abandoned"),
 		true,
@@ -1154,6 +1456,263 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	queue.agentEnd();
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	assert.equal(attempts, 3);
+	queue.stop();
+});
+
+it("pauses a failing Task turn without poisoning restart recovery", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-failure-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-failure"));
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	let attempts = 0;
+	let failedReleases = 0;
+	const unhealthy: string[] = [];
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		async (_claim, error) => {
+			unhealthy.push(error);
+		},
+		{
+			async run() {
+				attempts += 1;
+				throw new Error("provider unavailable");
+			},
+			async release() {
+				failedReleases += 1;
+			},
+		},
+	);
+	queue.enqueue(claim);
+	await waitFor(() => logs.some((record) => record.event === "a2a_task_turn_paused"));
+	assert.equal(attempts, 3);
+	assert.equal(failedReleases, 1);
+	assert.equal(journal.isWakeFailed(claim.activationId), false);
+	assert.equal(
+		journal.wakeDeliveries(claim.activationId),
+		0,
+		"failed Task-session turns must not consume the durable delivery cap",
+	);
+	assert.deepEqual(unhealthy, ["provider unavailable"]);
+	queue.stop();
+
+	let recovered = 0;
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				recovered += 1;
+				const stored = await tasks.lookup(taskId);
+				assert.ok(stored);
+				await tasks.updateStatus(stored.principal, taskId, {
+					state: "TASK_STATE_COMPLETED",
+				});
+			},
+			async release() {},
+		},
+	);
+	await replayed.replay();
+	await waitFor(() => recovered === 1);
+	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
+	replayed.stop();
+});
+
+it("retries delivery evidence after a successful Task turn without rerunning inference", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-delivery-evidence-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-delivery-evidence"));
+	const append = journal.append.bind(journal);
+	let failDeliveryOnce = true;
+	journal.append = async (record, afterAppend) => {
+		if (record.kind === "WAKE_DELIVERED" && failDeliveryOnce) {
+			failDeliveryOnce = false;
+			throw new Error("delivery evidence unavailable");
+		}
+		return append(record, afterAppend);
+	};
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				turns += 1;
+				await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_COMPLETED" });
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	queue.enqueue(claim);
+	await waitFor(() => journal.wakeDeliveries(claim.activationId) === 1 && releases === 1);
+	assert.equal(turns, 1);
+	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
+	await queue.stop();
+});
+
+it("does not retry a rejected turn that already requested caller input", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-failed-after-input-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-failed-after-input"));
+	let turns = 0;
+	let releases = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run(taskId) {
+				turns += 1;
+				await tasks.updateStatus("source:user", taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+					message: {
+						messageId: "question-after-failure",
+						role: "ROLE_AGENT",
+						parts: [{ text: "Need input" }],
+					},
+				});
+				throw new Error("provider failed after tool completion");
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(turns, 1);
+	assert.equal(
+		(await tasks.lookup(accepted.taskId))?.task.status.state,
+		"TASK_STATE_INPUT_REQUIRED",
+	);
+	assert.ok(logs.some((record) => record.event === "a2a_task_turn_settled_after_failure"));
+	queue.stop();
+});
+
+it("does not rerun a completed Task turn when settlement lookup fails", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-settlement-retry-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-settlement-retry"));
+	const lookup = tasks.lookup.bind(tasks);
+	let failSettlementLookup = false;
+	tasks.lookup = async (taskId) => {
+		if (failSettlementLookup) {
+			failSettlementLookup = false;
+			throw new Error("temporary settlement lookup failure");
+		}
+		return lookup(taskId);
+	};
+	let turns = 0;
+	let releases = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run(taskId) {
+				turns += 1;
+				await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_COMPLETED" });
+				failSettlementLookup = true;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	assert.equal(turns, 1);
+	assert.equal((await lookup(accepted.taskId))?.task.status.state, "TASK_STATE_COMPLETED");
+	assert.ok(logs.some((record) => record.event === "a2a_wake_pump_failed"));
+	queue.stop();
+});
+
+it("keeps a failed Task turn retired when unhealthy evidence cannot be written", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-evidence-failure-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-evidence-failure"));
+	let turns = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		async () => {
+			throw new Error("evidence store unavailable");
+		},
+		{
+			async run() {
+				turns += 1;
+				throw new Error("provider unavailable");
+			},
+			async release() {},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => logs.some((record) => record.event === "a2a_task_turn_paused"));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(turns, 3);
+	assert.ok(logs.some((record) => record.event === "a2a_task_turn_evidence_failed"));
+	queue.agentEnd();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.equal(turns, 3);
+	queue.stop();
+});
+
+it("releases a retained Task session when cancellation wins before the next turn", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-canceled-requeue-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-canceled-requeue"));
+	const lookup = tasks.lookup.bind(tasks);
+	let lookups = 0;
+	tasks.lookup = async (taskId) => {
+		lookups += 1;
+		if (lookups === 3) {
+			await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_CANCELED" });
+		}
+		return lookup(taskId);
+	};
+	let turns = 0;
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	assert.equal(turns, 1);
 	queue.stop();
 });
 
@@ -1210,6 +1769,114 @@ it("caps unsettled wake deliveries durably and permits a fresh provider event", 
 	assert.notEqual(fresh.taskId, accepted.taskId);
 	assert.equal(await runtime.wakeQueue.hasAuthority(fresh.taskId), true);
 	await runtime.close();
+});
+
+it("releases a Task session when its wake reaches the delivery cap", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-delivery-cap-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-delivery-cap"));
+	let turns = 0;
+	let releases = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => logs.some((record) => record.event === "a2a_wake_abandoned"));
+	assert.equal(turns, MAX_WAKE_DELIVERIES);
+	assert.equal(releases, 1);
+	queue.stop();
+});
+
+it("retries delivery-cap finalization when durable failure evidence cannot be written", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-delivery-cap-evidence-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-delivery-cap-evidence"));
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	for (let delivery = 1; delivery <= MAX_WAKE_DELIVERIES; delivery += 1) {
+		await journal.append({
+			kind: "WAKE_DELIVERED",
+			activationId: claim.activationId,
+			delivery,
+			deliveredAt: new Date().toISOString(),
+		});
+	}
+	const append = journal.append.bind(journal);
+	let failOnce = true;
+	journal.append = async (record, afterAppend) => {
+		if (record.kind === "WAKE_FAILED" && failOnce) {
+			failOnce = false;
+			throw new Error("failure evidence unavailable");
+		}
+		return append(record, afterAppend);
+	};
+	let turns = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {},
+		},
+	);
+	queue.enqueue(claim);
+	await waitFor(() => journal.isWakeFailed(claim.activationId));
+	assert.equal(turns, 0);
+	assert.equal(failOnce, false);
+	assert.ok(logs.some((record) => record.event === "a2a_wake_failure_evidence_failed"));
+	assert.ok(logs.some((record) => record.event === "a2a_wake_abandoned"));
+	await queue.stop();
+});
+
+it("releases a live Task session while waiting for caller input", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-input-required-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("task-turn-input-required"));
+	let releases = 0;
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				const stored = await tasks.lookup(taskId);
+				assert.ok(stored);
+				await tasks.updateStatus(stored.principal, taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+				});
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => releases === 1);
+	assert.equal(
+		(await tasks.lookup(accepted.taskId))?.task.status.state,
+		"TASK_STATE_INPUT_REQUIRED",
+	);
+	queue.stop();
 });
 
 it("bounds the pending wake set and records durable overflow evidence", async () => {
@@ -1287,7 +1954,9 @@ it("backs off and automatically retries a transient wake-path I/O failure", asyn
 		return lookup(taskId);
 	};
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	await waitFor(
+		() => prompts.length === 1 && logs.some((record) => record.event === "a2a_wake_pump_failed"),
+	);
 	assert.equal(prompts.length, 1);
 	assert.equal(
 		logs.some((record) => record.event === "a2a_wake_pump_failed"),
@@ -1301,6 +1970,7 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 	const storePath = join(root, "tasks.v1.json");
 	const taskId = randomUUID();
 	const contextId = randomUUID();
+	const deployedAt = new Date().toISOString();
 	const deployedTask = {
 		version: 1,
 		tasks: {
@@ -1308,12 +1978,12 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 				task: {
 					id: taskId,
 					contextId,
-					status: { state: "TASK_STATE_COMPLETED", timestamp: "2026-08-01T00:00:00.000Z" },
+					status: { state: "TASK_STATE_COMPLETED", timestamp: deployedAt },
 					artifacts: [],
 					history: [],
 				},
 				principal: "source:user",
-				updatedAt: "2026-08-01T00:00:00.000Z",
+				updatedAt: deployedAt,
 			},
 		},
 		dedupe: [],
@@ -1328,16 +1998,38 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 	await writeFile(storePath, `${JSON.stringify(deployedTask)}\n`);
 	await writeFile(join(root, "origins.json"), `${JSON.stringify(deployedOrigins)}\n`);
 	let stopped = 0;
+	let startupDeliveryRejected = false;
+	const failedStartupPrompts: string[] = [];
+	let failedStartupPlane: TaskPlane | undefined;
 	await assert.rejects(
 		startChannelsRuntime(
-			{ sendUserMessage() {} },
+			{ sendUserMessage: async (prompt: string) => failedStartupPrompts.push(prompt) },
 			{
 				storePath,
 				agentInterface: "https://agent.example.test",
+				taskPlaneReady(taskPlane) {
+					failedStartupPlane = taskPlane;
+				},
 				sources: [
 					{
 						name: "first",
-						async start() {
+						async start(sink) {
+							assert.ok(sink.deliver);
+							await assert.rejects(
+								sink.deliver(
+									{
+										taskId: "startup-task",
+										source: "test",
+										operationId: "startup-delivery",
+										payloadDigest: digest("startup delivery"),
+										recovery: "lookup",
+									},
+									async () => "must-not-send",
+									async () => undefined,
+								),
+								/delivery is closed/,
+							);
+							startupDeliveryRejected = true;
 							return async () => {
 								stopped += 1;
 							};
@@ -1355,6 +2047,11 @@ it("runtime startup is all-or-nothing and store upgrade preserves Tasks and orig
 		/cannot start/,
 	);
 	assert.equal(stopped, 1);
+	assert.equal(startupDeliveryRejected, true);
+	assert.ok(failedStartupPlane);
+	await failedStartupPlane.accept(activation("after-failed-startup"));
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.deepEqual(failedStartupPrompts, [], "startup rollback must stop its wake queue");
 	const afterTasks = JSON.parse(await readFile(storePath, "utf8"));
 	const afterOrigins = JSON.parse(await readFile(join(root, "origins.json"), "utf8"));
 	assert.deepEqual(afterTasks.tasks[taskId], deployedTask.tasks[taskId]);
@@ -1736,6 +2433,81 @@ it("serializes identical concurrent deliveries by delivery id", async () => {
 	await runtime.close();
 });
 
+it("runtime close joins an in-flight outbound delivery", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-delivery-close-"));
+	const runtime = await startChannelsRuntime(
+		{ sendUserMessage() {} },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+		},
+	);
+	assert.ok(runtime.sourceSink.deliver);
+	let sendStarted = (): void => {};
+	const sending = new Promise<void>((resolve) => {
+		sendStarted = resolve;
+	});
+	let finishSend = (): void => {};
+	const sendBlocked = new Promise<void>((resolve) => {
+		finishSend = resolve;
+	});
+	const delivery = runtime.sourceSink.deliver(
+		{
+			taskId: "task-close",
+			source: "slack",
+			operationId: "reply:close",
+			payloadDigest: digest("close reply"),
+			recovery: "lookup",
+		},
+		async () => {
+			sendStarted();
+			await sendBlocked;
+			return "provider-close";
+		},
+		async () => undefined,
+	);
+	await sending;
+	let closeResolved = false;
+	const close = runtime.close().then(() => {
+		closeResolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(closeResolved, false);
+	await assert.rejects(
+		runtime.sourceSink.deliver(
+			{
+				taskId: "task-too-late",
+				source: "slack",
+				operationId: "reply:too-late",
+				payloadDigest: digest("too late"),
+				recovery: "lookup",
+			},
+			async () => "must-not-send",
+			async () => undefined,
+		),
+		/delivery is closed/,
+	);
+	finishSend();
+	assert.equal(await delivery, "provider-close");
+	await close;
+	assert.equal(closeResolved, true);
+	await assert.rejects(
+		runtime.sourceSink.deliver(
+			{
+				taskId: "task-after-close",
+				source: "slack",
+				operationId: "reply:after-close",
+				payloadDigest: digest("after close"),
+				recovery: "lookup",
+			},
+			async () => "must-not-send",
+			async () => undefined,
+		),
+		/delivery is closed/,
+	);
+});
+
 it("fails closed when lookup recovery has no reconciler and records one-prefix evidence", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-delivery-lookup-"));
 	const input = {
@@ -1996,6 +2768,53 @@ it("keeps sources running when the optional A2A listener cannot start", async ()
 	assert.ok(logs.some((record) => record.event === "listener_start_failed"));
 	await runtime.close();
 	assert.equal(sourceStopped, 1);
+});
+
+it("routes each wake through its Task turn runner without prompting the coordinator", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turns-"));
+	const coordinatorPrompts: string[] = [];
+	const turns: Array<{ taskId: string; prompt: string }> = [];
+	const releases: string[] = [];
+	let runtime: Awaited<ReturnType<typeof startChannelsRuntime>>;
+	runtime = await startChannelsRuntime(
+		{ sendUserMessage: async (prompt: string) => coordinatorPrompts.push(prompt) },
+		{
+			storePath: join(root, "tasks.json"),
+			agentInterface: "https://agent.example.test",
+			sources: [],
+			taskTurnRunner: {
+				async run(taskId, prompt) {
+					turns.push({ taskId, prompt });
+					const stored = await runtime.taskPlane.taskStore.lookup(taskId);
+					assert.ok(stored);
+					await runtime.taskPlane.taskStore.updateStatus(stored.principal, taskId, {
+						state: "TASK_STATE_COMPLETED",
+					});
+				},
+				async release(taskId) {
+					releases.push(taskId);
+				},
+			},
+		},
+	);
+	try {
+		const first = await runtime.sourceSink.accept(
+			activation("task-turn-one", { conversationKey: "task-turn-one" }),
+		);
+		const second = await runtime.sourceSink.accept(
+			activation("task-turn-two", { conversationKey: "task-turn-two" }),
+		);
+		await waitFor(() => turns.length === 2 && releases.length === 2);
+		assert.notEqual(first.taskId, second.taskId);
+		assert.deepEqual(turns, [
+			{ taskId: first.taskId, prompt: taskWakePrompt(first.taskId) },
+			{ taskId: second.taskId, prompt: taskWakePrompt(second.taskId) },
+		]);
+		assert.deepEqual(coordinatorPrompts, []);
+		assert.deepEqual(releases, [first.taskId, second.taskId]);
+	} finally {
+		await runtime.close();
+	}
 });
 
 it("claims A2A inbound work before the queue wakes and grants Task authority", async () => {

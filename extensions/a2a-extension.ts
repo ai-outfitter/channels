@@ -20,6 +20,7 @@ export interface A2aExtensionDependencies {
 		config: A2aServerConfig,
 		executor: A2aExecutor,
 		sharedStore?: TaskPlane["taskStore"],
+		onTaskCanceled?: (taskId: string) => void | Promise<void>,
 	) => Promise<RunningA2aServer>;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -33,6 +34,7 @@ export interface A2aToolAccess {
 export function createA2aRuntimeListener(
 	dependencies: A2aExtensionDependencies = {},
 	onRunning: (server: RunningA2aServer | undefined) => void = () => {},
+	onTaskCanceled: (taskId: string) => void | Promise<void> = () => {},
 ): RuntimeListener | undefined {
 	const enabled = dependencies.enabled ?? enabledFromEnv;
 	if (!enabled()) return undefined;
@@ -66,7 +68,7 @@ export function createA2aRuntimeListener(
 						: await sink.accept(activation);
 				return { kind: "task", taskId: accepted.taskId };
 			};
-			const server = await start(await loadConfig(), executor, taskPlane.taskStore);
+			const server = await start(await loadConfig(), executor, taskPlane.taskStore, onTaskCanceled);
 			onRunning(server);
 			log({ event: "a2a_server_started", url: server.url });
 			return async () => {

@@ -142,24 +142,26 @@ agent, a tool set, or a workflow topology.
   status, history, artifacts — is the record. A reconnecting client reads
   the Task, then opens a new subscription; nothing replays.
 - **Wake authority begins at delivery.** The queue grants authority, transitions
-  the Task to `WORKING`, and records `WOKEN` immediately before delivering the
-  body-free follow-up. Authority lasts through the end of the turn that consumes
-  that wake, whether or not Pi fires `before_agent_start` for the follow-up.
-  `agent_end` clears it before the queue offers another Task.
-- **Wake recovery follows terminal Task state.** `WOKEN` records that Pi was
-  offered a turn, not that the turn completed. On startup, every accepted activation
-  whose Task is still non-terminal is offered once to the new runtime, including
-  activations already marked `WOKEN`. Terminal claims are filtered before queue
-  admission and do not count toward the bound. Replaying a historical wake does
-  not replace an unanswered `INPUT_REQUIRED` or `AUTH_REQUIRED` status message
-  with bare `WORKING`; a newly accepted continuation still starts normally. A
+  the Task to `WORKING`, and records `WOKEN` immediately before prompting that
+  Task's Pi session. Authority lasts through that session's turn. The queue
+  clears it before offering another Task; an interrupted Task waits for a newly
+  accepted continuation rather than being offered again immediately.
+- **Wake recovery follows durable Task state.** `WOKEN` records that Pi was
+  offered a turn, not that the turn completed. On startup, only the newest
+  accepted activation for each non-terminal Task is eligible for the new
+  runtime, including one already marked `WOKEN`. An unanswered `INPUT_REQUIRED`
+  or `AUTH_REQUIRED` Task is not offered again until a newer continuation is
+  accepted. Terminal claims are filtered before queue admission and do not
+  count toward the bound. A newly accepted continuation starts normally. A
   successful delivery is re-offered at most five consecutive times while its
   Task remains unsettled. Reaching that durable cap records `WAKE_FAILED` and
   unhealthy evidence; startup does not resurrect the activation. A new provider
   event or explicit continuation creates a new activation and may enqueue it.
-  A wake transport failure retries three times with timer backoff, then records
-  `WAKE_FAILED` evidence and stops. Transient store or journal failures during
-  pumping schedule a macrotask retry with capped exponential backoff.
+  A Task-session turn failure retries three times, records unhealthy evidence,
+  closes the live session, and leaves the activation replayable after restart.
+  A legacy wake transport failure records `WAKE_FAILED` after the same bounded
+  retries. Transient store or journal failures during pumping schedule a
+  macrotask retry with capped exponential backoff.
 - **Wake admission is bounded.** At most 128 wakes wait behind the offered or
   active turn. Overflow is logged and recorded as durable `WAKE_FAILED`
   evidence, so a duplicate-prone source cannot grow the resident queue without
@@ -209,9 +211,12 @@ An inbound work message first enters the trusted task-plane sink. Acceptance
 writes the journal claim, creates or continues the Task, appends the authorized
 history, projects evidence, and queues a **body-free wake** before returning the
 Task. Explicit continuation is authorized before its caller message is
-persisted. The wake queue changes the
-Task to `WORKING` and grants it as the turn's sole authority. The A2A listener
-never wakes Pi directly. The agent then drives the task with three tools:
+persisted. The wake queue changes the Task to `WORKING`, grants it as the turn's
+sole authority, and creates or reopens the durable Pi session derived from its
+Task ID. The coordinator owns sources and stores but performs no inference.
+Task sessions receive the resident's non-Channels extensions plus the shared
+Task-authorized channel tools; they do not start another listener or source
+runtime. The agent then drives the task with three tools:
 
 - `a2a_read_task` — read the task's history inside untrusted-content markers.
 - `a2a_complete_task` — record the response as an artifact and complete, or
@@ -222,8 +227,9 @@ never wakes Pi directly. The agent then drives the task with three tools:
   anchors, and make this tool fail for a Task whose source declares no
   continuation method in the conformance matrix — the executor completes or
   rejects instead, so no Task strands in `INPUT_REQUIRED`. The answer causes
-  a new wake for that Task. This tool is the protocol-native structured-question
-surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+  a new wake for that Task and reopens its durable Pi session after the paused
+  turn's live resources close. This tool is the protocol-native structured-question
+  surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
 
 ### Upgrade from the 1.7 standalone A2A store
 

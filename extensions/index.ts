@@ -245,6 +245,7 @@ export default function channelEventsExtension(
 	taskSink: () => SourceTaskActivationSink,
 	sources: Readonly<Record<string, SourceRegistration>> = createSourceRegistry(),
 	onTransactionalFailure: () => void | Promise<void> = () => {},
+	canStart: () => boolean = () => true,
 ): ChannelEventsLifecycle | undefined {
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
 	if (selection === "off" || selection === "none") return undefined;
@@ -255,6 +256,7 @@ export default function channelEventsExtension(
 		selection === undefined ? Object.keys(sources) : [...new Set(parseList(selection))];
 	const actionCache = new Map<string, Promise<ChannelActions>>();
 	const publisherCache = new Map<string, Promise<ChannelPublisher>>();
+	const forwardingSink = forwardSourceTaskSink(taskSink);
 	let agentActions: Promise<AgentChannelActions> | undefined;
 	const agentJournal = new AgentSessionJournal((customType, data) => {
 		pi.appendEntry(customType, data);
@@ -278,7 +280,7 @@ export default function channelEventsExtension(
 		let actions = actionCache.get(channel);
 		if (!actions) {
 			actions = registration
-				.loadActions(channel === "agent" ? agentJournal : undefined, taskSink())
+				.loadActions(channel === "agent" ? agentJournal : undefined, forwardingSink)
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" actions are not configured`);
 					return loaded;
@@ -301,7 +303,7 @@ export default function channelEventsExtension(
 		let publisher = publisherCache.get(channel);
 		if (!publisher) {
 			publisher = registration
-				.loadPublisher(taskSink())
+				.loadPublisher(forwardingSink)
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" publication is not configured`);
 					return loaded;
@@ -336,7 +338,7 @@ export default function channelEventsExtension(
 	});
 
 	const stops: Array<() => Promise<void>> = [];
-	let starting = false;
+	let starting: Promise<void> | undefined;
 	let stopped = false;
 	let startupSucceeded = false;
 
@@ -360,7 +362,7 @@ export default function channelEventsExtension(
 			}
 			const source = await registration.load(
 				kind === "agent" ? agentJournal : undefined,
-				taskSink(),
+				forwardingSink,
 			);
 			if (!source) throw new Error(`channel "${kind}" configuration is incomplete`);
 			return await source.start(() => {
@@ -373,45 +375,64 @@ export default function channelEventsExtension(
 		}
 	};
 
-	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup deliberately keeps staging, rollback, shutdown races, and readiness in one lifecycle transaction
+	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: join prior lifecycle generations before starting the transactional channel batch
 	pi.on("session_start", async (_event, ctx) => {
-		if (stops.length > 0 || starting) return; // idempotent across reload / concurrent fires
-		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
-		starting = true;
-		stopped = false;
-		startupSucceeded = false;
-		const started: Array<{ kind: string; stop: () => Promise<void> }> = [];
-		try {
-			const results = await Promise.allSettled(
-				wanted.map(async (kind) => ({ kind, stop: await startChannel(kind) })),
-			);
-			for (const [index, result] of results.entries()) {
-				if (result.status === "fulfilled") {
-					const { kind, stop } = result.value;
-					if (stop) started.push({ kind, stop });
-				} else {
-					log(`channel "${wanted[index]}" startup failed: ${errorMessage(result.reason)}`);
-				}
-			}
-			const failed = results.find((result) => result.status === "rejected");
-			if (failed?.status === "rejected") throw failed.reason;
-			if (stopped) {
-				for (const { stop } of started.reverse()) await stop().catch(() => {});
+		const prior = starting;
+		if (prior) {
+			await prior.catch(() => {});
+			const replacement = starting;
+			if (replacement && replacement !== prior) {
+				await replacement;
 				return;
 			}
-			for (const { kind, stop } of started) {
-				stops.push(stop);
-				log(`started channel "${kind}"`);
+			if (starting === prior) starting = undefined;
+			if (startupSucceeded) return;
+		}
+		if (!canStart()) return;
+		if (stops.length > 0) return; // idempotent across reload / concurrent fires
+		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
+		stopped = false;
+		startupSucceeded = false;
+		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup deliberately keeps staging, rollback, shutdown races, and readiness in one lifecycle transaction
+		const operation = (async () => {
+			const started: Array<{ kind: string; stop: () => Promise<void> }> = [];
+			try {
+				const results = await Promise.allSettled(
+					wanted.map(async (kind) => ({ kind, stop: await startChannel(kind) })),
+				);
+				for (const [index, result] of results.entries()) {
+					if (result.status === "fulfilled") {
+						const { kind, stop } = result.value;
+						if (stop) started.push({ kind, stop });
+					} else {
+						log(`channel "${wanted[index]}" startup failed: ${errorMessage(result.reason)}`);
+					}
+				}
+				const failed = results.find((result) => result.status === "rejected");
+				if (failed?.status === "rejected") throw failed.reason;
+				if (stopped) {
+					for (const { stop } of started.reverse()) await stop().catch(() => {});
+					return;
+				}
+				for (const { kind, stop } of started) {
+					stops.push(stop);
+					log(`started channel "${kind}"`);
+				}
+				startupSucceeded = true;
+				if (stops.length === 0) log("no channels started");
+			} catch (error) {
+				for (const { stop } of started.reverse()) await stop().catch(() => {});
+				if (stopped) return;
+				await onTransactionalFailure();
+				log(`channels unhealthy: ${(error as Error).message}`);
+				throw error;
 			}
-			startupSucceeded = true;
-			if (stops.length === 0) log("no channels started");
-		} catch (error) {
-			for (const { stop } of started.reverse()) await stop().catch(() => {});
-			await onTransactionalFailure();
-			log(`channels unhealthy: ${(error as Error).message}`);
-			throw error;
+		})();
+		starting = operation;
+		try {
+			await operation;
 		} finally {
-			starting = false;
+			if (starting === operation) starting = undefined;
 		}
 	});
 
@@ -462,6 +483,27 @@ export default function channelEventsExtension(
 	});
 
 	return lifecycle;
+}
+
+/** Keep cached channel adapters bound to whichever task plane is currently live. */
+export function forwardSourceTaskSink(
+	resolve: () => SourceTaskActivationSink,
+): SourceTaskActivationSink {
+	return new Proxy({} as SourceTaskActivationSink, {
+		get(_target, property) {
+			const current = resolve();
+			const value = Reflect.get(current, property, current);
+			if (typeof value !== "function") return value;
+			return (...args: unknown[]): unknown => {
+				const latest = resolve();
+				const method = Reflect.get(latest, property, latest);
+				if (typeof method !== "function") {
+					throw new Error(`current task sink does not implement ${String(property)}`);
+				}
+				return Reflect.apply(method, latest, args);
+			};
+		},
+	});
 }
 
 export interface ChannelEventsLifecycle {

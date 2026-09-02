@@ -103,6 +103,6 @@ code against them.
 4. The external protocol surface grows consumer by consumer. The listener
    implements only the operations a real consumer uses. The conformance
    matrix discipline applies to consumers as well as sources.
-5. A source or protocol binding never calls Pi directly. It commits through
-   the task-plane sink; only the durable wake queue may call
-   `pi.sendUserMessage` for agent work.
+5. A source or protocol binding never prompts Pi directly. It commits through
+   the task-plane sink; the durable wake queue creates or reopens the Task's
+   isolated Pi session and prompts it.
