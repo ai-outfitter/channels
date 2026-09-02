@@ -193,6 +193,47 @@ test("Task session host retains an eager index failure for the first Task turn",
 	}
 });
 
+test("concurrent Task session host closes share one quiescence barrier", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-close-"));
+	let closeStarted = (): void => {};
+	const closing = new Promise<void>((resolve) => {
+		closeStarted = resolve;
+	});
+	let finishClose = (): void => {};
+	const closeBlocked = new Promise<void>((resolve) => {
+		finishClose = resolve;
+	});
+	const host = new TaskSessionHost({
+		cwd: root,
+		sessionDir: join(root, "sessions"),
+		customTools: [],
+		excludedExtensionRoot: root,
+		createSession: async ({ sessionManager }) => ({
+			sessionId: sessionManager.getSessionId(),
+			sessionFile: sessionManager.getSessionFile(),
+			async prompt() {},
+			async close() {
+				closeStarted();
+				await closeBlocked;
+			},
+		}),
+	});
+	await host.run("task", "prompt");
+	const first = host.close();
+	await closing;
+	const second = host.close();
+	assert.equal(first, second);
+	let resolved = false;
+	void second.then(() => {
+		resolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(resolved, false);
+	finishClose();
+	await first;
+	assert.equal(resolved, true);
+});
+
 test("extension containment uses path boundaries", () => {
 	const root = join(tmpdir(), "channels-package");
 	assert.equal(isPathInside(root, root), true);

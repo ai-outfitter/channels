@@ -237,6 +237,7 @@ export class DurableWakeQueue {
 				if (this.#stopped) return;
 				wake.turnComplete = true;
 				wake.attempts = 0;
+				await this.#markDelivered(wake.claim);
 				await this.#finishTaskTurn(wake);
 				this.#pumpFailures = 0;
 				this.#log({ event: "agent_woken", taskId: wake.claim.taskId });
@@ -426,14 +427,18 @@ export class DurableWakeQueue {
 			throw new Error(`task "${wake.claim.taskId}" could not start`);
 		}
 		await this.#markConsumed(wake.claim);
-		const delivery = this.#journal.wakeDeliveries(wake.claim.activationId) + 1;
+		if (!this.#taskTurns) await this.#markDelivered(wake.claim);
+		return true;
+	}
+
+	async #markDelivered(claim: ActivationClaim): Promise<void> {
+		const delivery = this.#journal.wakeDeliveries(claim.activationId) + 1;
 		await this.#journal.append({
 			kind: "WAKE_DELIVERED",
-			activationId: wake.claim.activationId,
+			activationId: claim.activationId,
 			delivery,
 			deliveredAt: new Date().toISOString(),
 		});
-		return true;
 	}
 
 	async #failDeliveryCap(claim: ActivationClaim, deliveries: number): Promise<void> {
