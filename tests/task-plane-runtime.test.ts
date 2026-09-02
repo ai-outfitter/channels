@@ -1163,6 +1163,7 @@ it("pauses a failing Task turn without poisoning restart recovery", async () => 
 	const accepted = await plane.accept(activation("task-turn-failure"));
 	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
 	let attempts = 0;
+	let failedReleases = 0;
 	const unhealthy: string[] = [];
 	const logs: Readonly<Record<string, unknown>>[] = [];
 	const queue = new DurableWakeQueue(
@@ -1178,12 +1179,15 @@ it("pauses a failing Task turn without poisoning restart recovery", async () => 
 				attempts += 1;
 				throw new Error("provider unavailable");
 			},
-			async release() {},
+			async release() {
+				failedReleases += 1;
+			},
 		},
 	);
 	queue.enqueue(claim);
 	await waitFor(() => logs.some((record) => record.event === "a2a_task_turn_paused"));
 	assert.equal(attempts, 3);
+	assert.equal(failedReleases, 1);
 	assert.equal(journal.isWakeFailed(claim.activationId), false);
 	assert.deepEqual(unhealthy, ["provider unavailable"]);
 	queue.stop();

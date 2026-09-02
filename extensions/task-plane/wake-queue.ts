@@ -210,8 +210,10 @@ export class DurableWakeQueue {
 					error: message,
 				});
 				if (wake.attempts >= MAX_WAKE_ATTEMPTS) {
-					if (this.#taskTurns) await this.#recordUnhealthy(wake.claim, message);
-					else {
+					if (this.#taskTurns) {
+						await this.#taskTurns.release(wake.claim.taskId);
+						await this.#recordUnhealthy(wake.claim, message);
+					} else {
 						await this.#journal.append({
 							kind: "WAKE_FAILED",
 							activationId: wake.claim.activationId,
