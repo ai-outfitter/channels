@@ -193,12 +193,13 @@ credential auto-detection select the available channels.
 
 1. Stand up the Stalwart demo and run the agent with `OUTFITTER_CHANNELS=jmap`
    and the loop tick raised to a long heartbeat.
-2. Idle agent + send a test email via `xin`: a wake should fire within seconds
-   (not on the next tick); the model runs the `mail` skill and processes it.
-3. Send several while streaming: they coalesce into one follow-up sweep.
+2. Send a test email via `xin`: a Task session should run within seconds (not
+   on the next tick), read the exact message through `channel_read`, and process it.
+3. Send several while one Task is running: each accepted message becomes its
+   own Task, and the durable queue runs their isolated sessions serially.
 4. Create a calendar event a minute or two out with an alarm on it: when the
    alarm fires, a wake naming `calendar alert: <uid>` should arrive within
    seconds. (A server that refuses the `CalendarAlert` push type logs the
    downgrade instead and keeps waking on mail.)
-5. No mail arriving → no turns fire between heartbeats.
+5. No mail arriving → no Task-session turns run between heartbeats.
 6. Quit/reload → the EventSource is closed by `session_shutdown` (no orphan).
