@@ -1052,6 +1052,67 @@ it("preserves unanswered input-required state when replaying its original wake",
 	replayed.stop();
 });
 
+it("replays only the newest continuation claim for an interrupted Task", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-wake-newest-continuation-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("first-question"));
+	let firstRelease = 0;
+	const firstQueue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				await tasks.updateStatus("source:user", taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+					message: {
+						messageId: "first-question",
+						role: "ROLE_AGENT",
+						parts: [{ text: "Which environment?" }],
+					},
+				});
+			},
+			async release() {
+				firstRelease += 1;
+			},
+		},
+	);
+	firstQueue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => firstRelease === 1);
+	firstQueue.stop();
+
+	await plane.continue({ ...activation("accepted-answer"), taskId: accepted.taskId });
+	assert.equal(journal.claims().length, 2);
+	let recoveredTurns = 0;
+	const replayed = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		undefined,
+		undefined,
+		{
+			async run(taskId) {
+				recoveredTurns += 1;
+				await tasks.updateStatus("source:user", taskId, {
+					state: "TASK_STATE_INPUT_REQUIRED",
+				});
+			},
+			async release() {},
+		},
+	);
+	await replayed.replay();
+	await waitFor(() => recoveredTurns === 1);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(recoveredTurns, 1);
+	assert.equal(
+		(await tasks.lookup(accepted.taskId))?.task.status.state,
+		"TASK_STATE_INPUT_REQUIRED",
+	);
+	replayed.stop();
+});
+
 it("terminal replay claims do not consume the pending-wake bound", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-terminal-replay-"));
 	const journal = new ActivationJournal(join(root, "activation.jsonl"));
@@ -1147,7 +1208,7 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 		timerFired = true;
 	}, 5);
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
-	await new Promise((resolve) => setTimeout(resolve, 100));
+	await waitFor(() => timerFired && attempts === 3);
 	assert.equal(timerFired, true);
 	assert.equal(attempts, 3);
 	assert.equal(journal.isWakeFailed(journal.claims()[0]?.activationId ?? ""), true);
