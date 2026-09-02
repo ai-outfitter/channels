@@ -58,6 +58,52 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.10.0](https://github.com/ai-outfitter/channels/compare/v1.9.0...v1.10.0) (2026-09-02)
+
+
+### Features
+
+* **runtime:** isolate each Task in a Pi session ([3650791](https://github.com/ai-outfitter/channels/commit/3650791862a9f48432de08452bf36f8241c6e496))
+
+
+### Bug Fixes
+
+* **channels:** forward cached adapters to live task plane ([a628a9b](https://github.com/ai-outfitter/channels/commit/a628a9b5eda32f909f283b43dcf09a25d6f8067e))
+* **channels:** join canceled source startup ([2fae05f](https://github.com/ai-outfitter/channels/commit/2fae05fad9593dd3d582954e8b64366918d051e1))
+* **channels:** preserve zero-source start idempotence ([7ea70c2](https://github.com/ai-outfitter/channels/commit/7ea70c2d5154d78815f7535814f51f66da96ed4d))
+* **channels:** serialize replacement generations ([d123702](https://github.com/ai-outfitter/channels/commit/d1237026dc08cce099b314c296cfb266bc1ae2a0))
+* **runtime:** bound delivery admission lifecycle ([ddcd1a7](https://github.com/ai-outfitter/channels/commit/ddcd1a766ef89022c4054e31f461a6d900848e6d))
+* **runtime:** cancel channel restart with task plane ([02fd458](https://github.com/ai-outfitter/channels/commit/02fd458dd10bd87f8705a3a14f7cc5b7e92b9b00))
+* **runtime:** close outbound delivery admission ([2a0fb7e](https://github.com/ai-outfitter/channels/commit/2a0fb7e6123d7d2517f748a1fb140adae387bcd3))
+* **runtime:** drain outbound delivery on close ([ac40979](https://github.com/ai-outfitter/channels/commit/ac40979264d1d41b418fcfb7f0c2cb686aa0a407))
+* **runtime:** isolate canceled lifecycle cleanup ([495ed20](https://github.com/ai-outfitter/channels/commit/495ed20f8028ee9a01fe98d92d2e5a04b18b135a))
+* **runtime:** isolate each A2A Task in a Pi session ([c2864ee](https://github.com/ai-outfitter/channels/commit/c2864eec360f81d38c90efa379dde8bbd2e53dd7))
+* **runtime:** join overlapping task-plane cleanup ([2287834](https://github.com/ai-outfitter/channels/commit/22878346751b4baa6e928a7cf2cfc1e841738211))
+* **runtime:** preserve restart during startup ([2db6e8c](https://github.com/ai-outfitter/channels/commit/2db6e8c2a0bd2e0b73e15ac9633c4c7597667a90))
+* **runtime:** replace canceled startup generation ([e861fa3](https://github.com/ai-outfitter/channels/commit/e861fa3ff365e656dcd303bcce45301ce5a13fe3))
+* **runtime:** serialize replacement generations ([42af439](https://github.com/ai-outfitter/channels/commit/42af4394afeb36343c65171dd8a082398fc50dbb))
+* **runtime:** serialize restart with cleanup ([bb95803](https://github.com/ai-outfitter/channels/commit/bb958036a6e8e822527c78ccc58c06c12c51e4be))
+* **task-plane:** await wake queue quiescence ([7e96644](https://github.com/ai-outfitter/channels/commit/7e96644e81e4453f91bd4f27b26c9b59877062db))
+* **task-plane:** close isolated session lifecycle gaps ([42a7a2a](https://github.com/ai-outfitter/channels/commit/42a7a2ae9dffb05d579bca62403f341fea194b93))
+* **task-plane:** close wake stop races ([637f22b](https://github.com/ai-outfitter/channels/commit/637f22bd9d24840f8e2600e602ddeb7e82e37a3a))
+* **task-plane:** retry delivery-cap finalization ([b58f50e](https://github.com/ai-outfitter/channels/commit/b58f50efdd6d29e33e0f1573e0da3a9f5626e3a5))
+* **task-plane:** stop wake queue on startup rollback ([cebc61e](https://github.com/ai-outfitter/channels/commit/cebc61e4a2edf7b03e430925b02ec178dbf2bfd1))
+* **task-sessions:** authorize channel locators ([117bc6c](https://github.com/ai-outfitter/channels/commit/117bc6cc9cb67158334749d86b53a99163938cd3))
+* **task-sessions:** close remaining recovery races ([0afab39](https://github.com/ai-outfitter/channels/commit/0afab390da31efe20e0f219e04472bf4965d66dc))
+* **task-sessions:** close replay and retry races ([9d6c558](https://github.com/ai-outfitter/channels/commit/9d6c558b3a281028769039715bf008e4754fde07))
+* **task-sessions:** dispose every terminal path ([6612b4e](https://github.com/ai-outfitter/channels/commit/6612b4e79212df07de80cb21e02d42d4b3236d65))
+* **task-sessions:** harden startup and replay recovery ([bfe8120](https://github.com/ai-outfitter/channels/commit/bfe8120b2a981f352584bde2667f1b5e638f5cfe))
+* **task-sessions:** honor cancellation and trust ([952fc0d](https://github.com/ai-outfitter/channels/commit/952fc0d787d4d8cdbebaeb224455322933abe3e2))
+* **task-sessions:** index durable sessions once ([531de4e](https://github.com/ai-outfitter/channels/commit/531de4e0cfd68d72e57a67f5e7007a6213d6c151))
+* **task-sessions:** preserve derived id before first flush ([fd68c3b](https://github.com/ai-outfitter/channels/commit/fd68c3b4f0d7ba22574204feaff30a9a8e9c1cbb))
+* **task-sessions:** preserve recovery and close barriers ([b593706](https://github.com/ai-outfitter/channels/commit/b5937064aa356b940af04817b167f2f4d3b78530))
+* **task-sessions:** quiesce cancellation cleanup ([0247657](https://github.com/ai-outfitter/channels/commit/024765791ca5e33f313a9ad5e0fd75ea460a5102))
+* **task-sessions:** release every retained session ([33a790a](https://github.com/ai-outfitter/channels/commit/33a790a8bead545af6c8acd65daa18fabf1415d7))
+* **task-sessions:** release failure tombstones ([fdf3e9a](https://github.com/ai-outfitter/channels/commit/fdf3e9a79a256a08d96d57537321ac3456089158))
+* **task-sessions:** release paused task resources ([b6c44e2](https://github.com/ai-outfitter/channels/commit/b6c44e2d761d7a618a4c8c3f9fa71b8a5c18acce))
+* **task-sessions:** replay only newest continuation ([67ca829](https://github.com/ai-outfitter/channels/commit/67ca829fb8bd8e9a6cfe89159b3d593f4fa7982b))
+* **task-sessions:** restrict task tool authority ([e5811f9](https://github.com/ai-outfitter/channels/commit/e5811f95edd2c87c5a21f8d0f9c61fc72a9af9ad))
+
 ## [1.9.0](https://github.com/ai-outfitter/channels/compare/v1.8.0...v1.9.0) (2026-08-20)
 
 
