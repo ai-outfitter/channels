@@ -256,6 +256,75 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 	);
 });
 
+test("channel restart joins a source startup canceled by shutdown", async () => {
+	await withEnv(
+		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
+		async () => {
+			const { pi, handlers } = fakePi();
+			let runtimeStarts = 0;
+			let runtimeCloses = 0;
+			let sourceStarts = 0;
+			let sourceStops = 0;
+			let sourceStartEntered = (): void => {};
+			const sourceStarting = new Promise<void>((resolve) => {
+				sourceStartEntered = resolve;
+			});
+			let finishSourceStart = (): void => {};
+			const sourceStartBlocked = new Promise<void>((resolve) => {
+				finishSourceStart = resolve;
+			});
+			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({
+							async start() {
+								sourceStarts += 1;
+								if (sourceStarts === 1) {
+									sourceStartEntered();
+									await sourceStartBlocked;
+								}
+								return async () => {
+									sourceStops += 1;
+								};
+							},
+						}),
+					},
+				},
+				startRuntime: async () => {
+					runtimeStarts += 1;
+					return running(() => {
+						runtimeCloses += 1;
+					});
+				},
+				createTaskSessionHost: () => ({
+					async run() {},
+					async release() {},
+					async close() {},
+				}),
+			});
+
+			const firstStart = fire(handlers, "session_start");
+			await sourceStarting;
+			const shutdown = fire(handlers, "session_shutdown");
+			await shutdown;
+			const restart = fire(handlers, "session_start");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(runtimeStarts, 2);
+			assert.equal(sourceStarts, 1, "the new channel generation must join the old startup");
+			finishSourceStart();
+			await Promise.all([firstStart, restart]);
+			assert.equal(sourceStarts, 2);
+			assert.equal(sourceStops, 1, "the canceled generation must stop its staged source");
+			assert.equal(runtimeCloses, 1);
+
+			await fire(handlers, "session_shutdown");
+			assert.equal(sourceStops, 2);
+			assert.equal(runtimeCloses, 2);
+		},
+	);
+});
+
 test("disables task-plane startup when channels are off and never uses A2A_STORE_PATH", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-runtime-root-"));
 	const a2aPath = join(root, "a2a", "tasks.json");

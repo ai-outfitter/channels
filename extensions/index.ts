@@ -338,7 +338,7 @@ export default function channelEventsExtension(
 	});
 
 	const stops: Array<() => Promise<void>> = [];
-	let starting = false;
+	let starting: Promise<void> | undefined;
 	let stopped = false;
 	let startupSucceeded = false;
 
@@ -375,46 +375,53 @@ export default function channelEventsExtension(
 		}
 	};
 
-	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup deliberately keeps staging, rollback, shutdown races, and readiness in one lifecycle transaction
 	pi.on("session_start", async (_event, ctx) => {
+		const prior = starting;
+		if (prior) await prior.catch(() => {});
 		if (!canStart()) return;
-		if (stops.length > 0 || starting) return; // idempotent across reload / concurrent fires
+		if (stops.length > 0) return; // idempotent across reload / concurrent fires
 		agentJournal.restore(ctx?.sessionManager.getEntries() ?? []);
-		starting = true;
 		stopped = false;
 		startupSucceeded = false;
-		const started: Array<{ kind: string; stop: () => Promise<void> }> = [];
-		try {
-			const results = await Promise.allSettled(
-				wanted.map(async (kind) => ({ kind, stop: await startChannel(kind) })),
-			);
-			for (const [index, result] of results.entries()) {
-				if (result.status === "fulfilled") {
-					const { kind, stop } = result.value;
-					if (stop) started.push({ kind, stop });
-				} else {
-					log(`channel "${wanted[index]}" startup failed: ${errorMessage(result.reason)}`);
+		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: startup deliberately keeps staging, rollback, shutdown races, and readiness in one lifecycle transaction
+		const operation = (async () => {
+			const started: Array<{ kind: string; stop: () => Promise<void> }> = [];
+			try {
+				const results = await Promise.allSettled(
+					wanted.map(async (kind) => ({ kind, stop: await startChannel(kind) })),
+				);
+				for (const [index, result] of results.entries()) {
+					if (result.status === "fulfilled") {
+						const { kind, stop } = result.value;
+						if (stop) started.push({ kind, stop });
+					} else {
+						log(`channel "${wanted[index]}" startup failed: ${errorMessage(result.reason)}`);
+					}
 				}
-			}
-			const failed = results.find((result) => result.status === "rejected");
-			if (failed?.status === "rejected") throw failed.reason;
-			if (stopped) {
+				const failed = results.find((result) => result.status === "rejected");
+				if (failed?.status === "rejected") throw failed.reason;
+				if (stopped) {
+					for (const { stop } of started.reverse()) await stop().catch(() => {});
+					return;
+				}
+				for (const { kind, stop } of started) {
+					stops.push(stop);
+					log(`started channel "${kind}"`);
+				}
+				startupSucceeded = true;
+				if (stops.length === 0) log("no channels started");
+			} catch (error) {
 				for (const { stop } of started.reverse()) await stop().catch(() => {});
-				return;
+				await onTransactionalFailure();
+				log(`channels unhealthy: ${(error as Error).message}`);
+				throw error;
 			}
-			for (const { kind, stop } of started) {
-				stops.push(stop);
-				log(`started channel "${kind}"`);
-			}
-			startupSucceeded = true;
-			if (stops.length === 0) log("no channels started");
-		} catch (error) {
-			for (const { stop } of started.reverse()) await stop().catch(() => {});
-			await onTransactionalFailure();
-			log(`channels unhealthy: ${(error as Error).message}`);
-			throw error;
+		})();
+		starting = operation;
+		try {
+			await operation;
 		} finally {
-			starting = false;
+			if (starting === operation) starting = undefined;
 		}
 	});
 
