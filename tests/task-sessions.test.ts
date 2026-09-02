@@ -72,6 +72,7 @@ test("Task session host releases terminal sessions without deleting durable hist
 	const root = await mkdtemp(join(tmpdir(), "channels-task-session-release-"));
 	let created = 0;
 	let closed = 0;
+	const sessionIds: string[] = [];
 	const host = new TaskSessionHost({
 		cwd: root,
 		sessionDir: join(root, "sessions"),
@@ -79,6 +80,7 @@ test("Task session host releases terminal sessions without deleting durable hist
 		excludedExtensionRoot: root,
 		createSession: async ({ sessionManager }) => {
 			created += 1;
+			sessionIds.push(sessionManager.getSessionId());
 			return {
 				sessionId: sessionManager.getSessionId(),
 				sessionFile: sessionManager.getSessionFile(),
@@ -95,6 +97,7 @@ test("Task session host releases terminal sessions without deleting durable hist
 	await host.close();
 	assert.equal(created, 2);
 	assert.equal(closed, 2);
+	assert.equal(sessionIds[1], sessionIds[0]);
 });
 
 test("extension containment uses path boundaries", () => {

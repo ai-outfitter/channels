@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	type AgentSession,
@@ -106,8 +107,10 @@ export class TaskSessionHost implements TaskTurnRunner {
 		if (existingPaths.length > 1) {
 			throw new Error(`multiple Pi sessions exist for task "${taskId}"`);
 		}
-		const sessionManager = existingPaths[0]
-			? SessionManager.open(existingPaths[0], this.#options.sessionDir, this.#options.cwd)
+		const existingPath =
+			existingPaths[0] && existsSync(existingPaths[0]) ? existingPaths[0] : undefined;
+		const sessionManager = existingPath
+			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
 			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
 		const createSession = this.#options.createSession ?? createPiTaskSession;
 		const session = await createSession({
@@ -121,7 +124,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 		const sessionFile = sessionManager.getSessionFile();
 		if (sessionFile) sessionPaths.set(sessionId, [sessionFile]);
 		this.#options.log?.({
-			event: existingPaths[0] ? "task_session_reopened" : "task_session_created",
+			event: existingPath ? "task_session_reopened" : "task_session_created",
 			taskId,
 			sessionId: session.sessionId,
 		});
