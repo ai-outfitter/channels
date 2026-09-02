@@ -255,6 +255,7 @@ export default function channelEventsExtension(
 		selection === undefined ? Object.keys(sources) : [...new Set(parseList(selection))];
 	const actionCache = new Map<string, Promise<ChannelActions>>();
 	const publisherCache = new Map<string, Promise<ChannelPublisher>>();
+	const forwardingSink = forwardSourceTaskSink(taskSink);
 	let agentActions: Promise<AgentChannelActions> | undefined;
 	const agentJournal = new AgentSessionJournal((customType, data) => {
 		pi.appendEntry(customType, data);
@@ -278,7 +279,7 @@ export default function channelEventsExtension(
 		let actions = actionCache.get(channel);
 		if (!actions) {
 			actions = registration
-				.loadActions(channel === "agent" ? agentJournal : undefined, taskSink())
+				.loadActions(channel === "agent" ? agentJournal : undefined, forwardingSink)
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" actions are not configured`);
 					return loaded;
@@ -301,7 +302,7 @@ export default function channelEventsExtension(
 		let publisher = publisherCache.get(channel);
 		if (!publisher) {
 			publisher = registration
-				.loadPublisher(taskSink())
+				.loadPublisher(forwardingSink)
 				.then((loaded) => {
 					if (!loaded) throw new Error(`channel "${channel}" publication is not configured`);
 					return loaded;
@@ -360,7 +361,7 @@ export default function channelEventsExtension(
 			}
 			const source = await registration.load(
 				kind === "agent" ? agentJournal : undefined,
-				taskSink(),
+				forwardingSink,
 			);
 			if (!source) throw new Error(`channel "${kind}" configuration is incomplete`);
 			return await source.start(() => {
@@ -462,6 +463,27 @@ export default function channelEventsExtension(
 	});
 
 	return lifecycle;
+}
+
+/** Keep cached channel adapters bound to whichever task plane is currently live. */
+export function forwardSourceTaskSink(
+	resolve: () => SourceTaskActivationSink,
+): SourceTaskActivationSink {
+	return new Proxy({} as SourceTaskActivationSink, {
+		get(_target, property) {
+			const current = resolve();
+			const value = Reflect.get(current, property, current);
+			if (typeof value !== "function") return value;
+			return (...args: unknown[]): unknown => {
+				const latest = resolve();
+				const method = Reflect.get(latest, property, latest);
+				if (typeof method !== "function") {
+					throw new Error(`current task sink does not implement ${String(property)}`);
+				}
+				return Reflect.apply(method, latest, args);
+			};
+		},
+	});
 }
 
 export interface ChannelEventsLifecycle {

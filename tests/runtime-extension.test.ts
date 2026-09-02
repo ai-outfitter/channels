@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { SourceRegistration } from "../extensions/index.ts";
+import { forwardSourceTaskSink, type SourceRegistration } from "../extensions/index.ts";
 import channelsRuntimeExtension from "../extensions/runtime-extension.ts";
 import type {
 	RunningChannelsRuntime,
@@ -84,6 +84,28 @@ function running(onClose: () => Promise<void> | void = () => {}): RunningChannel
 		close: async () => onClose(),
 	};
 }
+
+test("cached channel adapters resolve the current task sink on every call", async () => {
+	let generation = "first";
+	let current = {
+		async accept() {
+			throw new Error("unused");
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async taskIsTerminal() {
+			return generation === "first";
+		},
+	};
+	const forwarding = forwardSourceTaskSink(() => current);
+	const cachedMethod = forwarding.taskIsTerminal;
+	assert.ok(cachedMethod);
+	assert.equal(await cachedMethod("task"), true);
+	generation = "second";
+	current = { ...current, taskIsTerminal: async () => false };
+	assert.equal(await cachedMethod("task"), false);
+});
 
 async function withEnv(
 	values: Readonly<Record<string, string | undefined>>,
@@ -347,14 +369,18 @@ test("Task tools use startup authority and source access while replay opens a Ta
 				sourceForTask: () => "a2a",
 			});
 			let readDuringStartup = false;
-			let sourceSinkDuringStartup: unknown;
+			let sourceSinkWorkedDuringStartup = false;
+			Object.assign(loaded.sourceSink, {
+				taskIsTerminal: async (taskId: string) => taskId === "during-startup",
+			});
 			channelsRuntimeExtension(pi, {
 				sources: {
 					test: {
 						configured: () => true,
 						load: async () => ({ start: async () => async () => {} }),
 						loadActions: async (_journal, sourceSink) => {
-							sourceSinkDuringStartup = sourceSink;
+							sourceSinkWorkedDuringStartup =
+								(await sourceSink.taskIsTerminal?.("during-startup")) === true;
 							return {
 								read: async (locator: string) => ({ locator, messages: [] }),
 							} as never;
@@ -376,7 +402,7 @@ test("Task tools use startup authority and source access while replay opens a Ta
 			});
 			assert.deepEqual(await fire(handlers, "session_start"), []);
 			assert.equal(readDuringStartup, true);
-			assert.equal(sourceSinkDuringStartup, loaded.sourceSink);
+			assert.equal(sourceSinkWorkedDuringStartup, true);
 			await fire(handlers, "session_shutdown");
 		},
 	);
