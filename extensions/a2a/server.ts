@@ -96,6 +96,7 @@ export async function startA2aServer(
 	config: A2aServerConfig,
 	executor: A2aExecutor,
 	sharedStore?: A2aTaskStore,
+	onTaskCanceled: (taskId: string) => void | Promise<void> = () => {},
 ): Promise<RunningA2aServer> {
 	const store = sharedStore ?? new A2aTaskStore(config.storePath);
 	await store.initialize();
@@ -427,6 +428,9 @@ export async function startA2aServer(
 			const canceled = await store.updateStatus(principal, task.id, {
 				state: "TASK_STATE_CANCELED",
 			});
+			await Promise.resolve()
+				.then(() => onTaskCanceled(task.id))
+				.catch(() => {});
 			emit(task.id, {
 				statusUpdate: { taskId: task.id, contextId: task.contextId, status: canceled.status },
 			});

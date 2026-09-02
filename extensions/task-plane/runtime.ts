@@ -14,6 +14,7 @@ import {
 	ReplyAnchorStore,
 	SourceCheckpointStore,
 } from "./stores.ts";
+import type { TaskTurnRunner } from "./task-sessions.ts";
 import type { SourceTaskActivationSink, TaskActivationSink } from "./types.ts";
 import { DurableWakeQueue } from "./wake-queue.ts";
 
@@ -33,6 +34,12 @@ export interface RuntimeDependencies {
 	readonly sources: readonly RuntimeSource[];
 	/** External A2A is provider configuration: absent means not selected. */
 	readonly listener?: RuntimeListener;
+	readonly taskTurnRunner?: TaskTurnRunner;
+	readonly taskPlaneReady?: (
+		taskPlane: TaskPlane,
+		wakeQueue: DurableWakeQueue,
+		sourceSink: SourceTaskActivationSink,
+	) => void;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -76,8 +83,14 @@ export async function startChannelsRuntime(
 		deliveries.initialize(),
 		journal.initialize(),
 	]);
-	const wakeQueue = new DurableWakeQueue(pi, tasks, journal, log, (claim, error) =>
-		evidence.appendUnhealthy(claim.activationId, claim.taskId, claim.input.source, error),
+	const wakeQueue = new DurableWakeQueue(
+		pi,
+		tasks,
+		journal,
+		log,
+		(claim, error) =>
+			evidence.appendUnhealthy(claim.activationId, claim.taskId, claim.input.source, error),
+		dependencies.taskTurnRunner,
 	);
 	const taskPlane = createTaskPlane({
 		tasks,
@@ -107,6 +120,12 @@ export async function startChannelsRuntime(
 	let intakeOpen = false;
 	let listenerHealthy = true;
 	const deliveryOperations = new Map<string, Promise<string | undefined>>();
+	let deliveryOpen = false;
+	const drainDeliveries = async (): Promise<void> => {
+		while (deliveryOperations.size > 0) {
+			await Promise.allSettled([...deliveryOperations.values()]);
+		}
+	};
 	const guardedSink: TaskActivationSink = {
 		accept: async (input) => {
 			if (!intakeOpen) throw new Error("channels intake is not ready");
@@ -157,6 +176,7 @@ export async function startChannelsRuntime(
 		},
 		recordEvidence: (input) => evidence.appendSource(input),
 		async deliver(input, send, reconcile) {
+			if (!deliveryOpen) throw new Error("runtime delivery is closed");
 			const deliveryId = derivedId(
 				"delivery",
 				input.payloadPolicy === "fixed"
@@ -271,6 +291,7 @@ export async function startChannelsRuntime(
 			}
 		},
 	};
+	dependencies.taskPlaneReady?.(taskPlane, wakeQueue, sourceSink);
 	try {
 		// 5. Sources start with a closed intake gate. Even if one source invokes
 		// its sink during start, no activation can enter until every start wins.
@@ -308,14 +329,18 @@ export async function startChannelsRuntime(
 			}
 		}
 		for (const report of buffered) report();
-		// Pending durable wakes are not offered until the complete runtime has
-		// started and intake is ready. A failed startup therefore offers none.
+		// Release replayed work only after every source and the optional listener
+		// have settled; rollback closes delivery admission and drains admitted work.
+		deliveryOpen = true;
 		await wakeQueue.replay();
 		// 7. Readiness spans the whole composition, so the caller's entrypoint
 		// declares it once every extension it owns has registered.
 	} catch (error) {
+		deliveryOpen = false;
 		intakeOpen = false;
+		await wakeQueue.stop();
 		for (const stop of stops.reverse()) await stop().catch(() => {});
+		await drainDeliveries();
 		log({ event: "channels_unhealthy", error: errorMessage(error) });
 		throw error;
 	}
@@ -327,11 +352,13 @@ export async function startChannelsRuntime(
 		sourceSink,
 		wakeQueue,
 		async close() {
+			deliveryOpen = false;
 			// Preserve startup order at the boundary: sources stop accepting native
 			// events before the plane closes intake underneath an in-flight callback.
 			for (const stop of stops.reverse()) await stop().catch(() => {});
 			intakeOpen = false;
-			wakeQueue.stop();
+			await wakeQueue.stop();
+			await drainDeliveries();
 		},
 	};
 }
