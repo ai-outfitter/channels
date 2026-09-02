@@ -28,6 +28,8 @@ export class DurableWakeQueue {
 	#offered: PendingWake | undefined;
 	#activeTaskId: string | undefined;
 	#pumping = false;
+	#pumpPromise: Promise<void> | undefined;
+	#stopPromise: Promise<void> | undefined;
 	#pumpFailures = 0;
 	#retryTimer: ReturnType<typeof setTimeout> | undefined;
 	readonly #retired = new Set<string>();
@@ -123,7 +125,7 @@ export class DurableWakeQueue {
 			attempts: 0,
 			turnComplete: false,
 		});
-		void this.#pump();
+		this.#schedulePump();
 	}
 
 	async beforeAgentStart(prompt: string): Promise<void> {
@@ -141,7 +143,7 @@ export class DurableWakeQueue {
 		// A delivered wake whose turn did not settle the Task is eligible for a
 		// bounded re-offer. The pump checks terminal state before enforcing the cap.
 		if (wake) this.#pending.unshift(wake);
-		void this.#pump();
+		this.#schedulePump();
 	}
 
 	async hasAuthority(taskId: string): Promise<boolean> {
@@ -158,8 +160,8 @@ export class DurableWakeQueue {
 		return this.#journal.claims().find((claim) => claim.taskId === taskId)?.input.source;
 	}
 
-	async stop(): Promise<void> {
-		if (this.#stopped) return;
+	stop(): Promise<void> {
+		if (this.#stopPromise) return this.#stopPromise;
 		this.#stopped = true;
 		if (this.#retryTimer) clearTimeout(this.#retryTimer);
 		this.#retryTimer = undefined;
@@ -168,7 +170,30 @@ export class DurableWakeQueue {
 		this.#offered = undefined;
 		this.#activeTaskId = undefined;
 		this.#retired.clear();
-		if (activeTaskId) await this.#taskTurns?.release(activeTaskId).catch(() => {});
+		const pump = this.#pumpPromise;
+		this.#stopPromise = (async () => {
+			if (activeTaskId) await this.#taskTurns?.release(activeTaskId).catch(() => {});
+			await pump?.catch(() => {});
+		})();
+		return this.#stopPromise;
+	}
+
+	#schedulePump(): void {
+		if (this.#pumpPromise) return;
+		const pump = this.#pump();
+		this.#pumpPromise = pump;
+		void pump.finally(() => {
+			if (this.#pumpPromise === pump) this.#pumpPromise = undefined;
+			if (
+				!this.#stopped &&
+				!this.#retryTimer &&
+				!this.#offered &&
+				!this.#activeTaskId &&
+				this.#pending.length > 0
+			) {
+				this.#schedulePump();
+			}
+		});
 	}
 
 	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: wake delivery and durable retry transitions remain one state machine
@@ -270,15 +295,12 @@ export class DurableWakeQueue {
 			if (!this.#stopped && !this.#retryTimer) {
 				this.#retryTimer = setTimeout(() => {
 					this.#retryTimer = undefined;
-					void this.#pump();
+					this.#schedulePump();
 				}, retryDelayMs);
 			}
 		} finally {
 			this.#pumping = false;
-			if (!failed && !this.#offered && !this.#activeTaskId && this.#pending.length > 0) {
-				this.#pumpFailures = 0;
-				void this.#pump();
-			}
+			if (!failed) this.#pumpFailures = 0;
 		}
 	}
 
@@ -459,7 +481,7 @@ export class DurableWakeQueue {
 	async #consumeSettled(claim: ActivationClaim): Promise<void> {
 		await this.#taskTurns?.release(claim.taskId);
 		await this.#markConsumed(claim);
-		void this.#pump();
+		this.#schedulePump();
 	}
 
 	async #markConsumed(claim: ActivationClaim): Promise<void> {

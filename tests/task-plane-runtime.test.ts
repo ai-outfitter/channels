@@ -869,7 +869,12 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 	);
 	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
 	await granting;
-	const stopped = queue.stop();
+	let stoppedResolved = false;
+	const stopped = queue.stop().then(() => {
+		stoppedResolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(stoppedResolved, false, "stop must join the in-flight grant");
 	resumeGrant();
 	await stopped;
 	await new Promise((resolve) => setTimeout(resolve, 25));
@@ -889,6 +894,10 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 	});
 	let activeTurns = 0;
 	let activeReleases = 0;
+	let finishRelease = (): void => {};
+	const releaseBlocked = new Promise<void>((resolve) => {
+		finishRelease = resolve;
+	});
 	const activeQueue = new DurableWakeQueue(
 		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
 		active.tasks,
@@ -904,6 +913,7 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 			async release() {
 				activeReleases += 1;
 				finishTurn();
+				await releaseBlocked;
 			},
 		},
 	);
@@ -911,7 +921,17 @@ it("stops an in-flight wake before delivery and releases an active Task turn", a
 		active.journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number],
 	);
 	await running;
-	await activeQueue.stop();
+	const firstStop = activeQueue.stop();
+	const secondStop = activeQueue.stop();
+	assert.equal(firstStop, secondStop, "concurrent stop callers must share one barrier");
+	let activeStopResolved = false;
+	void firstStop.then(() => {
+		activeStopResolved = true;
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(activeStopResolved, false, "stop must join active Task-session release");
+	finishRelease();
+	await firstStop;
 	await new Promise((resolve) => setTimeout(resolve, 25));
 	assert.equal(activeTurns, 1);
 	assert.equal(activeReleases, 1, "stop must release the active Task session");
