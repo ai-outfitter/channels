@@ -1272,6 +1272,35 @@ it("caps unsettled wake deliveries durably and permits a fresh provider event", 
 	await runtime.close();
 });
 
+it("releases a Task session when its wake reaches the delivery cap", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-delivery-cap-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-delivery-cap"));
+	let turns = 0;
+	let releases = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {
+				releases += 1;
+			},
+		},
+	);
+	queue.enqueue(journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number]);
+	await waitFor(() => logs.some((record) => record.event === "a2a_wake_abandoned"));
+	assert.equal(turns, MAX_WAKE_DELIVERIES);
+	assert.equal(releases, 1);
+	queue.stop();
+});
+
 it("bounds the pending wake set and records durable overflow evidence", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-overflow-"));
 	const journal = new ActivationJournal(join(root, "activation.jsonl"));

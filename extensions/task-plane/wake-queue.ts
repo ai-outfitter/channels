@@ -319,6 +319,7 @@ export class DurableWakeQueue {
 
 	async #failDeliveryCap(claim: ActivationClaim, deliveries: number): Promise<void> {
 		const error = `wake delivery cap ${MAX_WAKE_DELIVERIES} reached without Task settlement`;
+		await this.#taskTurns?.release(claim.taskId);
 		await this.#recordUnhealthy(claim, error);
 		await this.#journal.append({
 			kind: "WAKE_FAILED",
