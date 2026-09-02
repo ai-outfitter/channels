@@ -186,6 +186,8 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 		{ OUTFITTER_CHANNELS: "", A2A_SERVER: undefined, OUTFITTER_AGENT_RELAY: undefined },
 		async () => {
 			const { pi, handlers } = fakePi();
+			let starts = 0;
+			let closes = 0;
 			let closeStarted = (): void => {};
 			const closing = new Promise<void>((resolve) => {
 				closeStarted = resolve;
@@ -195,11 +197,14 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 				finishClose = resolve;
 			});
 			channelsRuntimeExtension(pi, {
-				startRuntime: async () =>
-					running(async () => {
+				startRuntime: async () => {
+					starts += 1;
+					return running(async () => {
+						closes += 1;
 						closeStarted();
-						await closeBlocked;
-					}),
+						if (closes === 1) await closeBlocked;
+					});
+				},
 				createTaskSessionHost: () => ({
 					async run() {},
 					async release() {},
@@ -211,15 +216,24 @@ test("concurrent runtime shutdowns share the active cleanup barrier", async () =
 			assert.ok(shutdown);
 			const first = Promise.resolve(shutdown());
 			await closing;
-			let secondResolved = false;
-			const second = Promise.resolve(shutdown()).then(() => {
-				secondResolved = true;
+			const restart = fire(handlers, "session_start");
+			let secondShutdownResolved = false;
+			const secondShutdown = Promise.resolve(shutdown()).then(() => {
+				secondShutdownResolved = true;
 			});
 			await new Promise((resolve) => setImmediate(resolve));
-			assert.equal(secondResolved, false);
+			assert.equal(starts, 1, "restart must wait for the active cleanup barrier");
+			assert.equal(secondShutdownResolved, false);
 			finishClose();
-			await Promise.all([first, second]);
-			assert.equal(secondResolved, true);
+			await Promise.all([first, restart, secondShutdown]);
+			assert.equal(secondShutdownResolved, true);
+			assert.equal(starts, 1, "the overlapping shutdown must cancel the waiting restart");
+			assert.equal(closes, 1);
+
+			await fire(handlers, "session_start");
+			assert.equal(starts, 2, "a later clean start remains available");
+			await fire(handlers, "session_shutdown");
+			assert.equal(closes, 2);
 		},
 	);
 });

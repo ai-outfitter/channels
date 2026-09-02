@@ -139,6 +139,8 @@ export default function channelsRuntimeExtension(
 			taskPlaneHealthy = false;
 			// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: keep coordinator, Task-session host, listener, and shutdown-race startup atomic
 			starting = (async () => {
+				await closing;
+				if (stopped) return;
 				const taskPlaneRoot =
 					process.env.CHANNELS_TASK_STORE_PATH?.trim() ||
 					join(
