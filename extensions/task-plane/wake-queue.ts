@@ -509,21 +509,23 @@ export class DurableWakeQueue {
 				error: errorMessage(evidenceError),
 			});
 		});
-		await this.#journal
-			.append({
+		try {
+			await this.#journal.append({
 				kind: "WAKE_FAILED",
 				activationId: claim.activationId,
 				attempts: deliveries,
 				error,
 				failedAt: new Date().toISOString(),
-			})
-			.catch((journalError) => {
-				this.#log({
-					event: "a2a_wake_failure_evidence_failed",
-					taskId: claim.taskId,
-					error: errorMessage(journalError),
-				});
 			});
+		} catch (journalError) {
+			this.#log({
+				event: "a2a_wake_failure_evidence_failed",
+				taskId: claim.taskId,
+				error: errorMessage(journalError),
+			});
+			this.#retired.delete(claim.activationId);
+			throw journalError;
+		}
 		this.#log({
 			event: "a2a_wake_abandoned",
 			taskId: claim.taskId,

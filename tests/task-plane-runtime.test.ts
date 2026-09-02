@@ -1800,6 +1800,52 @@ it("releases a Task session when its wake reaches the delivery cap", async () =>
 	queue.stop();
 });
 
+it("retries delivery-cap finalization when durable failure evidence cannot be written", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-delivery-cap-evidence-"));
+	const { plane, tasks, journal } = await fixture(root);
+	await plane.accept(activation("task-turn-delivery-cap-evidence"));
+	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
+	for (let delivery = 1; delivery <= MAX_WAKE_DELIVERIES; delivery += 1) {
+		await journal.append({
+			kind: "WAKE_DELIVERED",
+			activationId: claim.activationId,
+			delivery,
+			deliveredAt: new Date().toISOString(),
+		});
+	}
+	const append = journal.append.bind(journal);
+	let failOnce = true;
+	journal.append = async (record, afterAppend) => {
+		if (record.kind === "WAKE_FAILED" && failOnce) {
+			failOnce = false;
+			throw new Error("failure evidence unavailable");
+		}
+		return append(record, afterAppend);
+	};
+	let turns = 0;
+	const logs: Readonly<Record<string, unknown>>[] = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("coordinator must not run inference") },
+		tasks,
+		journal,
+		(record) => logs.push(record),
+		undefined,
+		{
+			async run() {
+				turns += 1;
+			},
+			async release() {},
+		},
+	);
+	queue.enqueue(claim);
+	await waitFor(() => journal.isWakeFailed(claim.activationId));
+	assert.equal(turns, 0);
+	assert.equal(failOnce, false);
+	assert.ok(logs.some((record) => record.event === "a2a_wake_failure_evidence_failed"));
+	assert.ok(logs.some((record) => record.event === "a2a_wake_abandoned"));
+	await queue.stop();
+});
+
 it("releases a live Task session while waiting for caller input", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-task-turn-input-required-"));
 	const { plane, tasks, journal } = await fixture(root);
