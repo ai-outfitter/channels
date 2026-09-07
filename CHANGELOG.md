@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- fix(task-plane): task sessions inherit the resident's model and thinking level.
+- **Operators:** Task sessions now inherit the resident's model and thinking level.
+  Previously they fell back to Pi's built-in default and, without a valid credential
+  for it, produced no turn and abandoned the wake.
 - **A2A profile authors and operators:** workflow outputs declared in
   `A2A_WORKFLOW_MANIFEST` (selected with `A2A_WORKFLOW`) can be recorded as A2A
   artifacts, mid-task with the new `a2a_record_output` tool or at settlement via

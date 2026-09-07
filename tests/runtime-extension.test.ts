@@ -94,6 +94,7 @@ test("Task session factory inherits the resident's current model and thinking le
 				isProjectTrusted: () => true,
 			} as unknown as ExtensionContext;
 			const inputs: TaskSessionFactoryInput[] = [];
+			let taskTurnRunner: RuntimeDependencies["taskTurnRunner"];
 
 			channelsRuntimeExtension(pi, {
 				sources: {
@@ -116,15 +117,16 @@ test("Task session factory inherits the resident's current model and thinking le
 						},
 					}),
 				startRuntime: async (_pi, dependencies) => {
-					residentModel = currentModel;
-					residentThinking = "high";
-					assert.ok(dependencies.taskTurnRunner);
-					await dependencies.taskTurnRunner.run("task", "wake");
+					taskTurnRunner = dependencies.taskTurnRunner;
 					return running();
 				},
 			});
 
 			assert.deepEqual(await fire(handlers, "session_start", {}, context), []);
+			residentModel = currentModel;
+			residentThinking = "high";
+			assert.ok(taskTurnRunner);
+			await taskTurnRunner.run("task", "wake");
 			assert.equal(inputs.length, 1);
 			assert.equal(inputs[0]?.model, currentModel);
 			assert.equal(inputs[0]?.thinkingLevel, "high");
@@ -133,7 +135,7 @@ test("Task session factory inherits the resident's current model and thinking le
 	);
 });
 
-test("Task session factory omits model and thinking level without a parent context", async () => {
+test("Task session factory omits undefined resident model and thinking level", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-task-session-default-model-"));
 	await withEnv(
 		{
@@ -144,6 +146,13 @@ test("Task session factory omits model and thinking level without a parent conte
 		},
 		async () => {
 			const { pi, handlers } = fakePi();
+			Object.assign(pi, { getThinkingLevel: () => undefined });
+			const context = {
+				cwd: root,
+				sessionManager: SessionManager.inMemory(),
+				model: undefined,
+				isProjectTrusted: () => true,
+			} as unknown as ExtensionContext;
 			const inputs: TaskSessionFactoryInput[] = [];
 			channelsRuntimeExtension(pi, {
 				sources: {
@@ -172,7 +181,7 @@ test("Task session factory omits model and thinking level without a parent conte
 				},
 			});
 
-			assert.deepEqual(await fire(handlers, "session_start"), []);
+			assert.deepEqual(await fire(handlers, "session_start", {}, context), []);
 			assert.equal(inputs.length, 1);
 			assert.equal(Object.hasOwn(inputs[0] ?? {}, "model"), false);
 			assert.equal(Object.hasOwn(inputs[0] ?? {}, "thinkingLevel"), false);

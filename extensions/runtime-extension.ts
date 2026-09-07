@@ -164,12 +164,21 @@ export default function channelsRuntimeExtension(
 		context: ExtensionContext | undefined,
 		taskPlaneRoot: string,
 	): TaskSessionOwner => {
+		const getThinkingLevel = (): ReturnType<ExtensionAPI["getThinkingLevel"]> | undefined => {
+			if (!context || typeof pi.getThinkingLevel !== "function") return undefined;
+			try {
+				return pi.getThinkingLevel();
+			} catch {
+				return undefined;
+			}
+		};
 		const options = {
 			cwd: context?.cwd ?? process.cwd(),
 			sessionDir: join(taskPlaneRoot, "pi-sessions"),
 			projectTrusted: context?.isProjectTrusted() ?? false,
+			// Pi's event context resolves this getter against the active session on every read.
 			model: () => context?.model,
-			thinkingLevel: () => (context ? pi.getThinkingLevel() : undefined),
+			thinkingLevel: getThinkingLevel,
 			customTools: taskTools,
 			excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 			log,

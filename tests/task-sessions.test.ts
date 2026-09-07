@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,23 +9,41 @@ import { derivedId } from "../extensions/task-plane/serialize.ts";
 import {
 	isPathInside,
 	type TaskSessionFactory,
+	type TaskSessionFactoryInput,
 	TaskSessionHost,
 } from "../extensions/task-plane/task-sessions.ts";
 
 test("Task session host isolates Tasks, reuses a session, and reopens it after restart", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-task-sessions-"));
 	const sessionDir = join(root, "sessions");
+	const initialModel = { provider: "resident", id: "initial" } as NonNullable<
+		TaskSessionFactoryInput["model"]
+	>;
+	const currentModel = { provider: "resident", id: "current" } as NonNullable<
+		TaskSessionFactoryInput["model"]
+	>;
+	let residentModel = initialModel;
+	let residentThinking: TaskSessionFactoryInput["thinkingLevel"] = "low";
 	const created: Array<{
 		taskId: string;
 		sessionId: string;
 		existingEntries: number;
+		model: TaskSessionFactoryInput["model"];
+		thinkingLevel: TaskSessionFactoryInput["thinkingLevel"];
 		prompts: string[];
 	}> = [];
-	const createSession: TaskSessionFactory = async ({ taskId, sessionManager }) => {
+	const createSession: TaskSessionFactory = async ({
+		taskId,
+		sessionManager,
+		model,
+		thinkingLevel,
+	}) => {
 		const record = {
 			taskId,
 			sessionId: sessionManager.getSessionId(),
 			existingEntries: sessionManager.getEntries().length,
+			model,
+			thinkingLevel,
 			prompts: [] as string[],
 		};
 		created.push(record);
@@ -47,6 +66,8 @@ test("Task session host isolates Tasks, reuses a session, and reopens it after r
 		sessionDir,
 		customTools: [],
 		excludedExtensionRoot: root,
+		model: () => residentModel,
+		thinkingLevel: () => residentThinking,
 		createSession,
 	};
 
@@ -58,14 +79,20 @@ test("Task session host isolates Tasks, reuses a session, and reopens it after r
 
 	assert.equal(created.length, 2);
 	assert.notEqual(created[0]?.sessionId, created[1]?.sessionId);
+	assert.equal(created[0]?.model, initialModel);
+	assert.equal(created[0]?.thinkingLevel, "low");
 	assert.deepEqual(created[0]?.prompts, ["first", "second"]);
 
+	residentModel = currentModel;
+	residentThinking = "high";
 	const secondHost = new TaskSessionHost({ ...options, cwd: join(root, "different-cwd") });
 	await secondHost.run("task-one", "after restart");
 	await secondHost.close();
 
 	assert.equal(created.length, 3);
 	assert.equal(created[2]?.sessionId, created[0]?.sessionId);
+	assert.equal(created[2]?.model, currentModel);
+	assert.equal(created[2]?.thinkingLevel, "high");
 	assert.ok((created[2]?.existingEntries ?? 0) >= 2);
 	assert.deepEqual(created[2]?.prompts, ["after restart"]);
 });
@@ -172,6 +199,25 @@ test("Task session host reopens a partial durable session after factory failure"
 	await host.run("task", "retry");
 	assert.ok(reopenedEntries > 0);
 	await host.close();
+});
+
+test("Task session host reads inherited settings before creating a session manager", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-thunk-failure-"));
+	for (const throwingOption of ["model", "thinkingLevel"] as const) {
+		const sessionDir = join(root, throwingOption);
+		const host = new TaskSessionHost({
+			cwd: root,
+			sessionDir,
+			customTools: [],
+			excludedExtensionRoot: root,
+			[throwingOption]: () => {
+				throw new Error(`${throwingOption} unavailable`);
+			},
+		});
+		await assert.rejects(host.run("task", "wake"), new RegExp(`${throwingOption} unavailable`));
+		assert.equal(existsSync(sessionDir), false);
+		await host.close();
+	}
 });
 
 test("Task session host retains an eager index failure for the first Task turn", async () => {

@@ -137,12 +137,12 @@ export class TaskSessionHost implements TaskTurnRunner {
 			throw new Error(`multiple Pi sessions exist for task "${taskId}"`);
 		}
 		const existingPath = existingPaths[0];
-		const sessionManager = existingPath
-			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
-			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
 		const createSession = this.#options.createSession ?? createPiTaskSession;
 		const model = this.#options.model?.();
 		const thinkingLevel = this.#options.thinkingLevel?.();
+		const sessionManager = existingPath
+			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
+			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
 		let session: TaskSession;
 		try {
 			session = await createSession({
@@ -197,8 +197,8 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		resourceLoader,
 		customTools: [...input.customTools],
 		...(input.model !== undefined ? { model: input.model } : {}),
+		...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
 	});
-	if (input.thinkingLevel !== undefined) session.setThinkingLevel(input.thinkingLevel);
 	const wrapped = wrapSession(session);
 	try {
 		await session.bindExtensions({ mode: "print" });
