@@ -63,6 +63,21 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.11.0](https://github.com/ai-outfitter/channels/compare/v1.10.0...v1.11.0) (2026-09-07)
+
+
+### Features
+
+* **a2a:** add output, type, and value to the outfitter-task/v1 extension schema ([0c74acb](https://github.com/ai-outfitter/channels/commit/0c74acbe2b2a329f8dbf60f0cc4efdabfc566e76))
+* **a2a:** carry recorded workflow outputs as named artifacts ([1e83eea](https://github.com/ai-outfitter/channels/commit/1e83eea4cda536fea61f8954384a758a0d789703))
+* **a2a:** emit one artifact per recorded output from a2a_complete_task ([fc35b67](https://github.com/ai-outfitter/channels/commit/fc35b67a1f34be90dbd99d6a92140f79bf707a1d))
+* **a2a:** reject outputs the workflow does not declare ([366c36f](https://github.com/ai-outfitter/channels/commit/366c36f9e8ffd133292b0cf597ed3555e7c4365e))
+
+
+### Bug Fixes
+
+* **a2a:** announce a2a_record_output on wake and validate manifest slugs ([db36fb1](https://github.com/ai-outfitter/channels/commit/db36fb196d2adf0a4a004d678d4e423d345bc3be)), closes [#69](https://github.com/ai-outfitter/channels/issues/69)
+
 ## [1.10.0](https://github.com/ai-outfitter/channels/compare/v1.9.0...v1.10.0) (2026-09-02)
 
 
