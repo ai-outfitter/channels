@@ -206,6 +206,8 @@ The composed runtime always injects its already-open shared store, so
 `A2A_CREDENTIALS_PATH` (required, `{"credentials": [{"token", "principal"}]}`),
 `A2A_HOST`/`A2A_PORT` (default loopback:8788), and `A2A_PUBLIC_URL` /
 `A2A_AGENT_NAME` / `A2A_AGENT_DESCRIPTION` / `A2A_AGENT_VERSION` for the Card.
+`A2A_WORKFLOW_MANIFEST` points to the exported `workflow-composition.json`, and
+`A2A_WORKFLOW` selects its workflow ID when the manifest contains more than one.
 
 An inbound work message first enters the trusted task-plane sink. Acceptance
 writes the journal claim, creates or continues the Task, appends the authorized
@@ -216,11 +218,13 @@ sole authority, and creates or reopens the durable Pi session derived from its
 Task ID. The coordinator owns sources and stores but performs no inference.
 Task sessions receive the resident's non-Channels extensions plus the shared
 Task-authorized channel tools; they do not start another listener or source
-runtime. The agent then drives the task with three tools:
+runtime. The agent then drives the task with four tools:
 
 - `a2a_read_task` — read the task's history inside untrusted-content markers.
-- `a2a_complete_task` — record the response as an artifact and complete, or
-  reject with a reason.
+- `a2a_complete_task` — record each entry in its optional `outputs` parameter,
+  then the response, as artifacts and complete; or reject with a reason.
+- `a2a_record_output` — record one declared workflow output while the Task is
+  still `WORKING`.
 - `a2a_require_input` — pause the task on the caller with a question; the
   task enters `INPUT_REQUIRED`. Today the answer arrives as an authorized
   explicit `taskId` follow-up; the runtime commits add verified reply
@@ -230,6 +234,24 @@ runtime. The agent then drives the task with three tools:
   a new wake for that Task and reopens its durable Pi session after the paused
   turn's live resources close. This tool is the protocol-native structured-question
   surface ([#27](https://github.com/ai-outfitter/channels/issues/27)).
+
+### Output artifacts
+
+Each recorded output becomes one artifact named for the declared output. Its
+metadata under `outfitter-task/v1` carries `output`, the resolved Outfitter
+output label as `type`, and the concrete object observed by the engine as
+`value`. An output MAY be streamed while the Task is `WORKING` as an
+`artifactUpdate`, allowing a consumer to act before completion.
+
+The legal output names come from the workflow selected from
+`A2A_WORKFLOW_MANIFEST`, with `A2A_WORKFLOW` selecting among multiple workflows.
+Manifest output names and types must match `^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`; a manifest violating this pattern fails to load and is logged as `a2a_workflow_manifest_load_failed`.
+The bridge rejects undeclared names. It validates only that `value` is a JSON
+object; value schemas and deeper validation are deferred to
+[ai-outfitter/outfitter#380](https://github.com/ai-outfitter/outfitter/issues/380).
+The produced object's state (for example draft, reviewed, or merged) belongs to
+the forge: the consumer reads it from the forge, and the agent never asserts it
+in the artifact value.
 
 ### Upgrade from the 1.7 standalone A2A store
 
@@ -242,7 +264,7 @@ New and continued work after the upgrade uses
 `${XDG_DATA_HOME:-$HOME/.local/share}/outfitter/channels/task-plane/tasks.json`
 unless `CHANNELS_TASK_STORE_PATH` selects another task-plane root.
 
-All three tools require the exact Task to be the active turn authority. A task
+All four tools require the exact Task to be the active turn authority. A task
 ID from another queued or completed Task, or a Task with no activation claim,
 is rejected. There is no claim-free resident-owner path. For a native Task whose
 source declares no continuation method, `a2a_require_input` fails and the

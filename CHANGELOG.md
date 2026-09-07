@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A2A profile authors and operators:** workflow outputs declared in
+  `A2A_WORKFLOW_MANIFEST` (selected with `A2A_WORKFLOW`) can be recorded as A2A
+  artifacts, mid-task with the new `a2a_record_output` tool or at settlement via
+  the new `outputs` parameter on `a2a_complete_task`; undeclared names are
+  rejected ([#69](https://github.com/ai-outfitter/channels/issues/69)).
 - **All profile authors (breaking):** The channel-name-plus-locator wake and
   its in-memory notification queue are removed. Every agent wake is now a
   Task-scoped wake from the durable task-plane queue, and old wake-prompt

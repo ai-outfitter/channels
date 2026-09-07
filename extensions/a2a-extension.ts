@@ -9,6 +9,7 @@ import {
 	startA2aServer,
 } from "./a2a/server.ts";
 import type { A2aMessage, A2aPart, A2aTask } from "./a2a/types.ts";
+import { outputArtifact, type WorkflowOutputDeclarations } from "./a2a/workflow-outputs.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import type { RuntimeListener } from "./task-plane/runtime.ts";
 import { contentDigest } from "./task-plane/source-activation.ts";
@@ -90,6 +91,7 @@ export function registerA2aTools(
 	server: () => A2aToolAccess | undefined,
 	hasAuthority: (taskId: string) => Promise<boolean>,
 	canContinue: (taskId: string) => boolean = () => true,
+	declarations: () => WorkflowOutputDeclarations | undefined = () => undefined,
 ): void {
 	const requireServer = (): A2aToolAccess => {
 		const current = server();
@@ -129,8 +131,9 @@ export function registerA2aTools(
 		name: "a2a_complete_task",
 		label: "Settle A2A task",
 		description:
-			"Finish one A2A task: record the response as an artifact and mark the task completed, or mark it rejected.",
-		promptSnippet: "Settle every a2a task you were woken for with a2a_complete_task.",
+			"Finish one A2A task: record declared workflow outputs and the response as artifacts and mark the task completed, or mark it rejected.",
+		promptSnippet:
+			"Settle every a2a task you were woken for with a2a_complete_task, including its declared outputs when completed.",
 		promptGuidelines: ["Call a2a_read_task first, then settle the same task id exactly once."],
 		parameters: Type.Object({
 			taskId: Type.String({ minLength: 1 }),
@@ -138,12 +141,31 @@ export function registerA2aTools(
 			outcome: Type.Union([Type.Literal("completed"), Type.Literal("rejected")], {
 				description: "completed records the response as an artifact; rejected records why not.",
 			}),
+			outputs: Type.Optional(
+				Type.Array(
+					Type.Object({
+						output: Type.String({ minLength: 1 }),
+						value: Type.Object({}, { additionalProperties: true }),
+					}),
+				),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			await authorize(params.taskId);
+			if (params.outcome === "rejected" && params.outputs?.length) {
+				throw new Error("outputs cannot be recorded when outcome is rejected");
+			}
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
+				assertUniqueOutputNames(params.outputs ?? []);
+				const outputArtifacts = (params.outputs ?? []).map((entry) =>
+					outputArtifact(params.taskId, declarations(), {
+						output: entry.output,
+						value: entry.value as Record<string, unknown>,
+					}),
+				);
+				for (const artifact of outputArtifacts) await controller.artifact(artifact);
 				await controller.artifact({
 					artifactId: `response-${params.taskId}`,
 					name: "response",
@@ -156,6 +178,41 @@ export function registerA2aTools(
 			return {
 				content: [{ type: "text", text: `Task ${params.taskId} is ${params.outcome}.` }],
 				details: { taskId: params.taskId, outcome: params.outcome },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "a2a_record_output",
+		label: "Record A2A output",
+		description:
+			"Record one declared workflow output as an A2A artifact while the task is still working, so a consumer can act on it before completion.",
+		promptGuidelines: [
+			"Record the value as the object observed from the forge; for a forge object include at least the repository full name, number or sha, and html_url.",
+			"Never assert the object's state, such as merged or approved, in the value; consumers read state from the forge.",
+		],
+		parameters: Type.Object({
+			taskId: Type.String({ minLength: 1 }),
+			output: Type.String({ minLength: 1 }),
+			value: Type.Object({}, { additionalProperties: true }),
+		}),
+		async execute(_toolCallId, params) {
+			await authorize(params.taskId);
+			const controller = await requireServer().controllerForTask(params.taskId);
+			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
+			const artifact = outputArtifact(params.taskId, declarations(), {
+				output: params.output,
+				value: params.value as Record<string, unknown>,
+			});
+			await controller.artifact(artifact);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task ${params.taskId} recorded output "${params.output}".`,
+					},
+				],
+				details: { taskId: params.taskId, output: params.output },
 			};
 		},
 	});
@@ -188,6 +245,14 @@ export function registerA2aTools(
 			};
 		},
 	});
+}
+
+function assertUniqueOutputNames(outputs: readonly { readonly output: string }[]): void {
+	const names = new Set<string>();
+	for (const { output } of outputs) {
+		if (names.has(output)) throw new Error(`output "${output}" is duplicated`);
+		names.add(output);
+	}
 }
 
 function statusMessage(text: string): A2aMessage {

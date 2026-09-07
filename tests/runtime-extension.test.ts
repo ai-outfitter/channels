@@ -774,6 +774,7 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 			assert.deepEqual([...tools.keys()].filter((name) => name.startsWith("a2a_")).sort(), [
 				"a2a_complete_task",
 				"a2a_read_task",
+				"a2a_record_output",
 				"a2a_require_input",
 			]);
 			const readTool = tools.get("a2a_read_task");
@@ -867,6 +868,7 @@ test("Task tools use startup authority and source access while replay opens a Ta
 			assert.deepEqual(sessionToolNames, [
 				"a2a_complete_task",
 				"a2a_read_task",
+				"a2a_record_output",
 				"a2a_require_input",
 				"channel_read",
 				"channel_respond",
@@ -1007,6 +1009,7 @@ test("native-only deployment registers task tools and settles a Task end to end"
 			assert.deepEqual([...tools.keys()].filter((name) => name.startsWith("a2a_")).sort(), [
 				"a2a_complete_task",
 				"a2a_read_task",
+				"a2a_record_output",
 				"a2a_require_input",
 			]);
 			const accepted = await runtime?.sourceSink.accept({
