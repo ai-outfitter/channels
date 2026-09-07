@@ -25,6 +25,20 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "output": {
+      "description": "The declared workflow output name carried in artifact metadata.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "type": {
+      "description": "The resolved Outfitter output label carried in artifact metadata.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "value": {
+      "description": "The concrete object as the engine observed it, carried in artifact metadata. The object's state is the forge's and is never asserted here.",
+      "type": "object"
+    },
     "idempotency": {
       "type": "object",
       "additionalProperties": false,
@@ -37,6 +51,9 @@
         }
       }
     }
+  },
+  "dependentRequired": {
+    "output": ["type", "value"]
   },
   "$defs": {
     "taskLocator": {
