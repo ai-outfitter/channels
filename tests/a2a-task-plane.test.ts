@@ -10,7 +10,15 @@ import {
 	startA2aServer,
 } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
-import { A2aError, type A2aSendMessageRequest, type A2aTask } from "../extensions/a2a/types.ts";
+import {
+	type A2aArtifact,
+	A2aError,
+	type A2aSendMessageRequest,
+	type A2aStreamResponse,
+	type A2aTask,
+	OUTFITTER_TASK_EXTENSION_KEY,
+} from "../extensions/a2a/types.ts";
+import { registerA2aTools } from "../extensions/a2a-extension.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 after(async () => {
@@ -395,6 +403,94 @@ describe("a2a task plane", () => {
 		await readUntil("TASK_STATE_COMPLETED");
 		assert.match(buffer, /artifactUpdate/);
 		assert.match(buffer, /statusUpdate/);
+	});
+
+	it("a2a_record_output streams a pull-request artifact while the task is working", async () => {
+		const parkingExecutor: A2aExecutor = async (context) => {
+			const controller = await context.begin();
+			await controller.status("TASK_STATE_WORKING");
+			return undefined;
+		};
+		const server = await launch(parkingExecutor);
+		const tools = new Map<
+			string,
+			{ execute(id: string, params: Record<string, unknown>): Promise<unknown> }
+		>();
+		registerA2aTools(
+			{
+				registerTool(tool: {
+					name: string;
+					execute(id: string, params: Record<string, unknown>): Promise<unknown>;
+				}) {
+					tools.set(tool.name, tool);
+				},
+			} as never,
+			() => server,
+			async () => true,
+			() => true,
+			() => new Map([["pull-request", { type: "pull-request" }]]),
+		);
+		const stream = await fetch(`${server.url}/message:stream`, {
+			method: "POST",
+			headers: {
+				authorization: "Bearer token-a",
+				"content-type": "application/a2a+json",
+			},
+			body: JSON.stringify({ message: userMessage("m-output", "open a pull request") }),
+		});
+		assert.ok(stream.body);
+		const reader = stream.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		const readUntil = async (marker: string): Promise<void> => {
+			while (!buffer.includes(marker)) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+			}
+		};
+		await readUntil('"task"');
+		const taskId = /"id":"([^"]+)"/.exec(buffer)?.[1];
+		assert.ok(taskId);
+		const value = {
+			repository: "ai-outfitter/channels",
+			number: 69,
+			html_url: "https://github.com/ai-outfitter/channels/pull/69",
+		};
+		await tools.get("a2a_record_output")?.execute("call", {
+			taskId,
+			output: "pull-request",
+			value,
+		});
+		assert.equal((await server.readTask(taskId))?.status.state, "TASK_STATE_WORKING");
+		await readUntil('"artifactUpdate"');
+		const events = buffer
+			.split("\n")
+			.filter((line) => line.startsWith("data: "))
+			.map((line) => JSON.parse(line.slice(6)) as A2aStreamResponse);
+		const artifactEvent = events.find((event) => "artifactUpdate" in event);
+		const artifact =
+			artifactEvent && "artifactUpdate" in artifactEvent
+				? (artifactEvent.artifactUpdate.artifact as A2aArtifact)
+				: undefined;
+		assert.equal(artifact?.name, "pull-request");
+		assert.deepEqual(artifact?.metadata?.[OUTFITTER_TASK_EXTENSION_KEY], {
+			output: "pull-request",
+			type: "pull-request",
+			value,
+		});
+		await tools.get("a2a_complete_task")?.execute("call", {
+			taskId,
+			response: "done",
+			outcome: "completed",
+		});
+		await readUntil("TASK_STATE_COMPLETED");
+		const completed = await server.readTask(taskId);
+		assert.equal(completed?.status.state, "TASK_STATE_COMPLETED");
+		assert.deepEqual(
+			completed?.artifacts?.map(({ name }) => name),
+			["pull-request", "response"],
+		);
 	});
 
 	it("cancel settles a non-terminal task and refuses a terminal one", async () => {

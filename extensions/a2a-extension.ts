@@ -131,8 +131,9 @@ export function registerA2aTools(
 		name: "a2a_complete_task",
 		label: "Settle A2A task",
 		description:
-			"Finish one A2A task: record the response as an artifact and mark the task completed, or mark it rejected.",
-		promptSnippet: "Settle every a2a task you were woken for with a2a_complete_task.",
+			"Finish one A2A task: record declared workflow outputs and the response as artifacts and mark the task completed, or mark it rejected.",
+		promptSnippet:
+			"Settle every a2a task you were woken for with a2a_complete_task, including its declared outputs when completed.",
 		promptGuidelines: ["Call a2a_read_task first, then settle the same task id exactly once."],
 		parameters: Type.Object({
 			taskId: Type.String({ minLength: 1 }),
@@ -177,6 +178,41 @@ export function registerA2aTools(
 			return {
 				content: [{ type: "text", text: `Task ${params.taskId} is ${params.outcome}.` }],
 				details: { taskId: params.taskId, outcome: params.outcome },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "a2a_record_output",
+		label: "Record A2A output",
+		description:
+			"Record one declared workflow output as an A2A artifact while the task is still working, so a consumer can act on it before completion.",
+		promptGuidelines: [
+			"Record the value as the object observed from the forge; for a forge object include at least the repository full name, number or sha, and html_url.",
+			"Never assert the object's state, such as merged or approved, in the value; consumers read state from the forge.",
+		],
+		parameters: Type.Object({
+			taskId: Type.String({ minLength: 1 }),
+			output: Type.String({ minLength: 1 }),
+			value: Type.Object({}, { additionalProperties: true }),
+		}),
+		async execute(_toolCallId, params) {
+			await authorize(params.taskId);
+			const controller = await requireServer().controllerForTask(params.taskId);
+			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
+			const artifact = outputArtifact(params.taskId, declarations(), {
+				output: params.output,
+				value: params.value as Record<string, unknown>,
+			});
+			await controller.artifact(artifact);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Task ${params.taskId} recorded output "${params.output}".`,
+					},
+				],
+				details: { taskId: params.taskId, output: params.output },
 			};
 		},
 	});
