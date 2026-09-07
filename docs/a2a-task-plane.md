@@ -245,6 +245,7 @@ output label as `type`, and the concrete object observed by the engine as
 
 The legal output names come from the workflow selected from
 `A2A_WORKFLOW_MANIFEST`, with `A2A_WORKFLOW` selecting among multiple workflows.
+Manifest output names and types must match `^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`; a manifest violating this pattern fails to load and is logged as `a2a_workflow_manifest_load_failed`.
 The bridge rejects undeclared names. It validates only that `value` is a JSON
 object; value schemas and deeper validation are deferred to
 [ai-outfitter/outfitter#380](https://github.com/ai-outfitter/outfitter/issues/380).

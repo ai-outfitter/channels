@@ -575,5 +575,5 @@ export class DurableWakeQueue {
 
 /** The single body-free wake text every A2A task path sends. */
 export function taskWakePrompt(taskId: string): string {
-	return `[channels] a2a task ${taskId} awaits. Read it with a2a_read_task, then settle it with a2a_complete_task or a2a_require_input.`;
+	return `[channels] a2a task ${taskId} awaits. Read it with a2a_read_task, then settle it with a2a_complete_task or a2a_require_input. Record any declared workflow output as soon as it exists with a2a_record_output.`;
 }

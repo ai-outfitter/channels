@@ -1125,6 +1125,10 @@ it("grants authority at delivery and treats before_agent_start as idempotent con
 	queue.stop();
 });
 
+it("announces a2a_record_output in the body-free wake prompt", () => {
+	assert.match(taskWakePrompt("task-1"), /a2a_record_output/);
+});
+
 it("re-offers exactly once after a crash following WOKEN for a non-terminal Task", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-wake-crash-"));
 	const { plane, tasks, journal } = await fixture(root);

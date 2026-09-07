@@ -2,12 +2,15 @@ import { readFile } from "node:fs/promises";
 import type { A2aArtifact } from "./types.ts";
 import { OUTFITTER_TASK_EXTENSION_KEY, OUTFITTER_TASK_EXTENSION_URI } from "./types.ts";
 
+const OUTPUT_SLUG_PATTERN = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
+const outputSlug = new RegExp(OUTPUT_SLUG_PATTERN);
+
 export type WorkflowOutputDeclarations = ReadonlyMap<string, { readonly type: string }>;
 
 interface WorkflowManifest {
 	readonly workflows: readonly {
 		readonly id: string;
-		readonly outputs: Readonly<Record<string, { readonly type: string }>>;
+		readonly outputs: Readonly<Record<string, unknown>>;
 	}[];
 }
 
@@ -45,9 +48,7 @@ export async function loadWorkflowOutputsFromEnv(): Promise<
 		);
 	}
 	if (!workflow) throw new Error("the workflow manifest contains no selectable workflow");
-	return new Map(
-		Object.entries(workflow.outputs).map(([name, declaration]) => [name, declaration]),
-	);
+	return parseOutputs(workflow.id, workflow.outputs);
 }
 
 export function outputArtifact(
@@ -83,18 +84,35 @@ function parseManifest(value: unknown): WorkflowManifest {
 		if (!isRecord(workflow) || typeof workflow.id !== "string" || !isRecord(workflow.outputs)) {
 			throw new Error(`workflows[${index}] must have a string id and an outputs object`);
 		}
-		const outputs: Record<string, { readonly type: string }> = {};
-		for (const [name, declaration] of Object.entries(workflow.outputs)) {
-			if (!isRecord(declaration) || typeof declaration.type !== "string") {
-				throw new Error(
-					`workflow ${JSON.stringify(workflow.id)} output ${JSON.stringify(name)} must have a string type`,
-				);
-			}
-			outputs[name] = { type: declaration.type };
-		}
-		return { id: workflow.id, outputs };
+		return { id: workflow.id, outputs: workflow.outputs };
 	});
 	return { workflows };
+}
+
+function parseOutputs(
+	workflowId: string,
+	outputs: Readonly<Record<string, unknown>>,
+): WorkflowOutputDeclarations {
+	return new Map(
+		Object.entries(outputs).map(([name, declaration]) => {
+			if (!outputSlug.test(name)) {
+				throw new Error(
+					`workflow ${JSON.stringify(workflowId)} output ${JSON.stringify(name)} must match pattern ${OUTPUT_SLUG_PATTERN}`,
+				);
+			}
+			if (!isRecord(declaration) || typeof declaration.type !== "string") {
+				throw new Error(
+					`workflow ${JSON.stringify(workflowId)} output ${JSON.stringify(name)} must have a string type`,
+				);
+			}
+			if (!outputSlug.test(declaration.type)) {
+				throw new Error(
+					`workflow ${JSON.stringify(workflowId)} output ${JSON.stringify(name)} type ${JSON.stringify(declaration.type)} must match pattern ${OUTPUT_SLUG_PATTERN}`,
+				);
+			}
+			return [name, { type: declaration.type }];
+		}),
+	);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

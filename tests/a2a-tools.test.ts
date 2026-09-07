@@ -379,6 +379,61 @@ test("loadWorkflowOutputsFromEnv selects absent, single, and explicitly named wo
 	}
 });
 
+test("loadWorkflowOutputsFromEnv rejects output names and types that are not slugs", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-workflow-output-slugs-"));
+	const manifest = join(root, "workflow-composition.json");
+	const priorManifest = process.env.A2A_WORKFLOW_MANIFEST;
+	const priorWorkflow = process.env.A2A_WORKFLOW;
+	try {
+		process.env.A2A_WORKFLOW_MANIFEST = manifest;
+		process.env.A2A_WORKFLOW = "build";
+		await writeFile(
+			manifest,
+			JSON.stringify({
+				workflows: [
+					{ id: "unselected", outputs: {} },
+					{ id: "build", outputs: { "Pull Request": { type: "pull-request" } } },
+				],
+			}),
+		);
+		await assert.rejects(
+			loadWorkflowOutputsFromEnv(),
+			/workflow "build" output "Pull Request" must match pattern \^\[a-z\]/,
+		);
+		await writeFile(
+			manifest,
+			JSON.stringify({
+				workflows: [
+					{ id: "unselected", outputs: {} },
+					{ id: "build", outputs: { branch: { type: "Git Branch" } } },
+				],
+			}),
+		);
+		await assert.rejects(
+			loadWorkflowOutputsFromEnv(),
+			/workflow "build" output "branch" type "Git Branch" must match pattern \^\[a-z\]/,
+		);
+		await writeFile(
+			manifest,
+			JSON.stringify({
+				workflows: [
+					{ id: "unselected", outputs: { "Pull Request": { type: "Git Branch" } } },
+					{ id: "build", outputs: { branch: { type: "git-branch" } } },
+				],
+			}),
+		);
+		assert.deepEqual(
+			[...((await loadWorkflowOutputsFromEnv())?.entries() ?? [])],
+			[["branch", { type: "git-branch" }]],
+		);
+	} finally {
+		if (priorManifest === undefined) delete process.env.A2A_WORKFLOW_MANIFEST;
+		else process.env.A2A_WORKFLOW_MANIFEST = priorManifest;
+		if (priorWorkflow === undefined) delete process.env.A2A_WORKFLOW;
+		else process.env.A2A_WORKFLOW = priorWorkflow;
+	}
+});
+
 test("a2a_complete_task rejects invalid output sets without recording anything", async (t) => {
 	const declared: WorkflowOutputDeclarations = new Map([
 		["pull-request", { type: "pull-request" }],
