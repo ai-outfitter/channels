@@ -3,7 +3,12 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { forwardSourceTaskSink, type SourceRegistration } from "../extensions/index.ts";
 import channelsRuntimeExtension from "../extensions/runtime-extension.ts";
 import type {
@@ -11,8 +16,12 @@ import type {
 	RuntimeDependencies,
 } from "../extensions/task-plane/runtime.ts";
 import { startChannelsRuntime } from "../extensions/task-plane/runtime.ts";
+import {
+	type TaskSessionFactoryInput,
+	TaskSessionHost,
+} from "../extensions/task-plane/task-sessions.ts";
 
-type Handler = (...args: never[]) => Promise<void> | void;
+type Handler = (...args: unknown[]) => Promise<void> | void;
 
 function fakePi(): {
 	pi: ExtensionAPI;
@@ -40,17 +49,137 @@ function fakePi(): {
 	return { pi, handlers, tools };
 }
 
-async function fire(handlers: Map<string, Handler[]>, event: string): Promise<Error[]> {
+async function fire(
+	handlers: Map<string, Handler[]>,
+	event: string,
+	...args: unknown[]
+): Promise<Error[]> {
 	const errors: Error[] = [];
 	for (const handler of handlers.get(event) ?? []) {
 		try {
-			await handler();
+			await handler(...args);
 		} catch (error) {
 			errors.push(error as Error);
 		}
 	}
 	return errors;
 }
+
+test("Task session factory inherits the resident's current model and thinking level", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-model-"));
+	await withEnv(
+		{
+			OUTFITTER_CHANNELS: "test",
+			A2A_SERVER: undefined,
+			OUTFITTER_AGENT_RELAY: undefined,
+			CHANNELS_TASK_STORE_PATH: root,
+		},
+		async () => {
+			const { pi, handlers } = fakePi();
+			const initialModel = { provider: "resident", id: "initial" } as NonNullable<
+				ExtensionContext["model"]
+			>;
+			const currentModel = { provider: "resident", id: "current" } as NonNullable<
+				ExtensionContext["model"]
+			>;
+			let residentModel = initialModel;
+			let residentThinking: ReturnType<ExtensionAPI["getThinkingLevel"]> = "low";
+			Object.assign(pi, { getThinkingLevel: () => residentThinking });
+			const context = {
+				cwd: root,
+				sessionManager: SessionManager.inMemory(),
+				get model() {
+					return residentModel;
+				},
+				isProjectTrusted: () => true,
+			} as unknown as ExtensionContext;
+			const inputs: TaskSessionFactoryInput[] = [];
+
+			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({ start: async () => async () => {} }),
+					},
+				},
+				createTaskSessionHost: (options) =>
+					new TaskSessionHost({
+						...options,
+						createSession: async (input) => {
+							inputs.push(input);
+							return {
+								sessionId: input.sessionManager.getSessionId(),
+								sessionFile: input.sessionManager.getSessionFile(),
+								async prompt() {},
+								async close() {},
+							};
+						},
+					}),
+				startRuntime: async (_pi, dependencies) => {
+					residentModel = currentModel;
+					residentThinking = "high";
+					assert.ok(dependencies.taskTurnRunner);
+					await dependencies.taskTurnRunner.run("task", "wake");
+					return running();
+				},
+			});
+
+			assert.deepEqual(await fire(handlers, "session_start", {}, context), []);
+			assert.equal(inputs.length, 1);
+			assert.equal(inputs[0]?.model, currentModel);
+			assert.equal(inputs[0]?.thinkingLevel, "high");
+			await fire(handlers, "session_shutdown");
+		},
+	);
+});
+
+test("Task session factory omits model and thinking level without a parent context", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-session-default-model-"));
+	await withEnv(
+		{
+			OUTFITTER_CHANNELS: "test",
+			A2A_SERVER: undefined,
+			OUTFITTER_AGENT_RELAY: undefined,
+			CHANNELS_TASK_STORE_PATH: root,
+		},
+		async () => {
+			const { pi, handlers } = fakePi();
+			const inputs: TaskSessionFactoryInput[] = [];
+			channelsRuntimeExtension(pi, {
+				sources: {
+					test: {
+						configured: () => true,
+						load: async () => ({ start: async () => async () => {} }),
+					},
+				},
+				createTaskSessionHost: (options) =>
+					new TaskSessionHost({
+						...options,
+						createSession: async (input) => {
+							inputs.push(input);
+							return {
+								sessionId: input.sessionManager.getSessionId(),
+								sessionFile: input.sessionManager.getSessionFile(),
+								async prompt() {},
+								async close() {},
+							};
+						},
+					}),
+				startRuntime: async (_pi, dependencies) => {
+					assert.ok(dependencies.taskTurnRunner);
+					await dependencies.taskTurnRunner.run("task", "wake");
+					return running();
+				},
+			});
+
+			assert.deepEqual(await fire(handlers, "session_start"), []);
+			assert.equal(inputs.length, 1);
+			assert.equal(Object.hasOwn(inputs[0] ?? {}, "model"), false);
+			assert.equal(Object.hasOwn(inputs[0] ?? {}, "thinkingLevel"), false);
+			await fire(handlers, "session_shutdown");
+		},
+	);
+});
 
 async function waitFor(predicate: () => boolean): Promise<void> {
 	for (let attempt = 0; attempt < 200; attempt += 1) {

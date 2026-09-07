@@ -168,6 +168,8 @@ export default function channelsRuntimeExtension(
 			cwd: context?.cwd ?? process.cwd(),
 			sessionDir: join(taskPlaneRoot, "pi-sessions"),
 			projectTrusted: context?.isProjectTrusted() ?? false,
+			model: () => context?.model,
+			thinkingLevel: () => (context ? pi.getThinkingLevel() : undefined),
 			customTools: taskTools,
 			excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 			log,

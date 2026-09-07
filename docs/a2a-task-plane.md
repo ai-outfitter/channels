@@ -216,6 +216,8 @@ Task. Explicit continuation is authorized before its caller message is
 persisted. The wake queue changes the Task to `WORKING`, grants it as the turn's
 sole authority, and creates or reopens the durable Pi session derived from its
 Task ID. The coordinator owns sources and stores but performs no inference.
+Task sessions run on the resident's current model and thinking level, inherited
+from the main session at creation.
 Task sessions receive the resident's non-Channels extensions plus the shared
 Task-authorized channel tools; they do not start another listener or source
 runtime. The agent then drives the task with four tools:
