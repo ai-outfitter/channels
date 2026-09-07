@@ -378,3 +378,96 @@ test("loadWorkflowOutputsFromEnv selects absent, single, and explicitly named wo
 		else process.env.A2A_WORKFLOW = priorWorkflow;
 	}
 });
+
+test("a2a_complete_task rejects invalid output sets without recording anything", async (t) => {
+	const declared: WorkflowOutputDeclarations = new Map([
+		["pull-request", { type: "pull-request" }],
+	]);
+	const cases = [
+		{
+			name: "undeclared output",
+			declarations: declared,
+			outcome: "completed",
+			outputs: [{ output: "issue", value: { number: 69 } }],
+			error: /output "issue" is not declared by the workflow/,
+		},
+		{
+			name: "missing declarations",
+			declarations: undefined,
+			outcome: "completed",
+			outputs: [{ output: "pull-request", value: { number: 69 } }],
+			error: /no workflow output declarations are configured; set A2A_WORKFLOW_MANIFEST/,
+		},
+		{
+			name: "duplicate output",
+			declarations: declared,
+			outcome: "completed",
+			outputs: [
+				{ output: "pull-request", value: { number: 69 } },
+				{ output: "pull-request", value: { number: 70 } },
+			],
+			error: /output "pull-request" is duplicated/,
+		},
+		{
+			name: "outputs on rejection",
+			declarations: declared,
+			outcome: "rejected",
+			outputs: [{ output: "pull-request", value: { number: 69 } }],
+			error: /outputs cannot be recorded when outcome is rejected/,
+		},
+	] as const;
+	for (const testCase of cases) {
+		await t.test(testCase.name, async () => {
+			const recorded: string[] = [];
+			const tools = new Map<string, { execute(id: string, params: never): Promise<unknown> }>();
+			const task = {
+				id: "task-invalid-output",
+				contextId: "context-invalid-output",
+				status: { state: "TASK_STATE_WORKING" as const },
+			};
+			registerA2aTools(
+				{
+					registerTool(tool: {
+						name: string;
+						execute(id: string, params: never): Promise<unknown>;
+					}) {
+						tools.set(tool.name, tool);
+					},
+				} as never,
+				() => ({
+					async readTask() {
+						return task;
+					},
+					async controllerForTask() {
+						return {
+							task,
+							async artifact() {
+								recorded.push("artifact");
+								return task;
+							},
+							async status() {
+								recorded.push("status");
+								return task;
+							},
+						};
+					},
+				}),
+				async () => true,
+				() => true,
+				() => testCase.declarations,
+			);
+			const complete = tools.get("a2a_complete_task");
+			assert.ok(complete);
+			await assert.rejects(
+				complete.execute("call", {
+					taskId: task.id,
+					response: "done",
+					outcome: testCase.outcome,
+					outputs: testCase.outputs,
+				} as never),
+				testCase.error,
+			);
+			assert.deepEqual(recorded, []);
+		});
+	}
+});

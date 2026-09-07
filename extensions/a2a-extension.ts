@@ -151,9 +151,13 @@ export function registerA2aTools(
 		}),
 		async execute(_toolCallId, params) {
 			await authorize(params.taskId);
+			if (params.outcome === "rejected" && params.outputs?.length) {
+				throw new Error("outputs cannot be recorded when outcome is rejected");
+			}
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
+				assertUniqueOutputNames(params.outputs ?? []);
 				const outputArtifacts = (params.outputs ?? []).map((entry) =>
 					outputArtifact(params.taskId, declarations(), {
 						output: entry.output,
@@ -205,6 +209,14 @@ export function registerA2aTools(
 			};
 		},
 	});
+}
+
+function assertUniqueOutputNames(outputs: readonly { readonly output: string }[]): void {
+	const names = new Set<string>();
+	for (const { output } of outputs) {
+		if (names.has(output)) throw new Error(`output "${output}" is duplicated`);
+		names.add(output);
+	}
 }
 
 function statusMessage(text: string): A2aMessage {
