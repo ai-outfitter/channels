@@ -7,9 +7,14 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { RunningA2aServer } from "./a2a/server.ts";
+import {
+	loadWorkflowOutputsFromEnv,
+	type WorkflowOutputDeclarations,
+} from "./a2a/workflow-outputs.ts";
 import { type A2aToolAccess, createA2aRuntimeListener, registerA2aTools } from "./a2a-extension.ts";
 import channelEventsExtension, { locatorChannel, type SourceRegistration } from "./index.ts";
 import relayExtension from "./relay-extension.ts";
+import { errorMessage } from "./sources/util.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import { type RunningChannelsRuntime, startChannelsRuntime } from "./task-plane/runtime.ts";
 import {
@@ -26,6 +31,7 @@ export interface ChannelsRuntimeExtensionDependencies {
 	readonly sources?: Readonly<Record<string, SourceRegistration>>;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 	readonly createTaskSessionHost?: (options: TaskSessionHostOptions) => TaskSessionOwner;
+	readonly loadWorkflowOutputs?: () => Promise<WorkflowOutputDeclarations | undefined>;
 }
 
 const CHANNELS_PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -52,6 +58,7 @@ export default function channelsRuntimeExtension(
 	let startingSourceSink: SourceTaskActivationSink | undefined;
 	let closing: Promise<void> | undefined;
 	let shutdownRequest = 0;
+	let workflowOutputs: WorkflowOutputDeclarations | undefined;
 	const taskTools: ToolDefinition[] = [];
 	const taskToolPi = captureTools(pi, taskTools, async (locator) => {
 		const sourceSink = runtime?.sourceSink ?? startingSourceSink;
@@ -109,6 +116,7 @@ export default function channelsRuntimeExtension(
 				const queue = runtime?.wakeQueue ?? startingWakeQueue;
 				return queue !== undefined && queue.sourceForTask(taskId) === "a2a";
 			},
+			() => workflowOutputs,
 		);
 	}
 	const closeTaskPlane = (): Promise<void> => {
@@ -236,7 +244,15 @@ export default function channelsRuntimeExtension(
 		lifecycleRequest += 1;
 		stopped = false;
 		taskPlaneHealthy = false;
-		starting = launchTaskPlane(context);
+		starting = (async () => {
+			try {
+				workflowOutputs = await (dependencies.loadWorkflowOutputs ?? loadWorkflowOutputsFromEnv)();
+			} catch (error) {
+				workflowOutputs = undefined;
+				log({ event: "a2a_workflow_manifest_load_failed", error: errorMessage(error) });
+			}
+			await launchTaskPlane(context);
+		})();
 		try {
 			await starting;
 		} finally {

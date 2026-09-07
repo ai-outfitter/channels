@@ -5,6 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { type A2aExecutor, configFromEnv } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
+import {
+	loadWorkflowOutputsFromEnv,
+	type WorkflowOutputDeclarations,
+} from "../extensions/a2a/workflow-outputs.ts";
 import { createA2aRuntimeListener, registerA2aTools } from "../extensions/a2a-extension.ts";
 
 test("task-plane tools enforce active authority and reject input-required without continuation", async () => {
@@ -269,5 +273,108 @@ test("composed A2A configuration does not require the retired standalone store p
 		else process.env.A2A_CREDENTIALS_PATH = priorCredentials;
 		if (priorStore === undefined) delete process.env.A2A_STORE_PATH;
 		else process.env.A2A_STORE_PATH = priorStore;
+	}
+});
+
+test("a2a_complete_task records declared outputs before the response", async () => {
+	const artifacts: Array<{ name?: string }> = [];
+	const states: string[] = [];
+	const tools = new Map<string, { execute(id: string, params: never): Promise<unknown> }>();
+	const task = {
+		id: "task-output",
+		contextId: "context-output",
+		status: { state: "TASK_STATE_WORKING" as const },
+	};
+	const declarations: WorkflowOutputDeclarations = new Map([
+		["pull-request", { type: "pull-request" }],
+		["merge-commit", { type: "git-commit" }],
+	]);
+	registerA2aTools(
+		{
+			registerTool(tool: { name: string; execute(id: string, params: never): Promise<unknown> }) {
+				tools.set(tool.name, tool);
+			},
+		} as never,
+		() => ({
+			async readTask() {
+				return task;
+			},
+			async controllerForTask() {
+				return {
+					task,
+					async artifact(artifact: { name?: string }) {
+						artifacts.push(artifact);
+						return task;
+					},
+					async status(state: string) {
+						states.push(state);
+						return task;
+					},
+				};
+			},
+		}),
+		async () => true,
+		() => true,
+		() => declarations,
+	);
+	await tools.get("a2a_complete_task")?.execute("call", {
+		taskId: task.id,
+		response: "done",
+		outcome: "completed",
+		outputs: [
+			{ output: "pull-request", value: { number: 69 } },
+			{ output: "merge-commit", value: { sha: "abc123" } },
+		],
+	} as never);
+	assert.deepEqual(
+		artifacts.map(({ name }) => name),
+		["pull-request", "merge-commit", "response"],
+	);
+	assert.deepEqual(states, ["TASK_STATE_COMPLETED"]);
+});
+
+test("loadWorkflowOutputsFromEnv selects absent, single, and explicitly named workflows", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-workflow-outputs-"));
+	const manifest = join(root, "workflow-composition.json");
+	const priorManifest = process.env.A2A_WORKFLOW_MANIFEST;
+	const priorWorkflow = process.env.A2A_WORKFLOW;
+	try {
+		delete process.env.A2A_WORKFLOW_MANIFEST;
+		delete process.env.A2A_WORKFLOW;
+		assert.equal(await loadWorkflowOutputsFromEnv(), undefined);
+		await writeFile(
+			manifest,
+			JSON.stringify({
+				workflows: [
+					{ id: "build", outputs: { branch: { from: "implement", type: "git-branch" } } },
+				],
+			}),
+		);
+		process.env.A2A_WORKFLOW_MANIFEST = manifest;
+		assert.deepEqual(
+			[...((await loadWorkflowOutputsFromEnv())?.entries() ?? [])],
+			[["branch", { type: "git-branch" }]],
+		);
+		await writeFile(
+			manifest,
+			JSON.stringify({
+				workflows: [
+					{ id: "build", outputs: {} },
+					{ id: "release", outputs: { commit: { from: "merge", type: "git-commit" } } },
+				],
+			}),
+		);
+		process.env.A2A_WORKFLOW = "release";
+		assert.deepEqual(
+			[...((await loadWorkflowOutputsFromEnv())?.entries() ?? [])],
+			[["commit", { type: "git-commit" }]],
+		);
+		process.env.A2A_WORKFLOW = "missing";
+		await assert.rejects(loadWorkflowOutputsFromEnv(), /workflow "missing" is absent/);
+	} finally {
+		if (priorManifest === undefined) delete process.env.A2A_WORKFLOW_MANIFEST;
+		else process.env.A2A_WORKFLOW_MANIFEST = priorManifest;
+		if (priorWorkflow === undefined) delete process.env.A2A_WORKFLOW;
+		else process.env.A2A_WORKFLOW = priorWorkflow;
 	}
 });

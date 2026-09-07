@@ -24,6 +24,7 @@ export const AGENT_CARD_PATH = "/.well-known/agent-card.json" as const;
  */
 export const OUTFITTER_TASK_EXTENSION_URI =
 	"https://github.com/ai-outfitter/channels/a2a-extensions/outfitter-task/v1" as const;
+export const OUTFITTER_TASK_EXTENSION_KEY = "outfitter-task/v1" as const;
 
 export const TASK_STATES = [
 	"TASK_STATE_UNSPECIFIED",

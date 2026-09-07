@@ -9,6 +9,7 @@ import {
 	startA2aServer,
 } from "./a2a/server.ts";
 import type { A2aMessage, A2aPart, A2aTask } from "./a2a/types.ts";
+import { outputArtifact, type WorkflowOutputDeclarations } from "./a2a/workflow-outputs.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import type { RuntimeListener } from "./task-plane/runtime.ts";
 import { contentDigest } from "./task-plane/source-activation.ts";
@@ -90,6 +91,7 @@ export function registerA2aTools(
 	server: () => A2aToolAccess | undefined,
 	hasAuthority: (taskId: string) => Promise<boolean>,
 	canContinue: (taskId: string) => boolean = () => true,
+	declarations: () => WorkflowOutputDeclarations | undefined = () => undefined,
 ): void {
 	const requireServer = (): A2aToolAccess => {
 		const current = server();
@@ -138,12 +140,27 @@ export function registerA2aTools(
 			outcome: Type.Union([Type.Literal("completed"), Type.Literal("rejected")], {
 				description: "completed records the response as an artifact; rejected records why not.",
 			}),
+			outputs: Type.Optional(
+				Type.Array(
+					Type.Object({
+						output: Type.String({ minLength: 1 }),
+						value: Type.Object({}, { additionalProperties: true }),
+					}),
+				),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			await authorize(params.taskId);
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
+				const outputArtifacts = (params.outputs ?? []).map((entry) =>
+					outputArtifact(params.taskId, declarations(), {
+						output: entry.output,
+						value: entry.value as Record<string, unknown>,
+					}),
+				);
+				for (const artifact of outputArtifacts) await controller.artifact(artifact);
 				await controller.artifact({
 					artifactId: `response-${params.taskId}`,
 					name: "response",
