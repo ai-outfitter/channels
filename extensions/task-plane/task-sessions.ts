@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	type AgentSession,
+	type CreateAgentSessionOptions,
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
@@ -31,6 +32,8 @@ export interface TaskSessionFactoryInput {
 	readonly sessionManager: SessionManager;
 	readonly customTools: readonly ToolDefinition[];
 	readonly excludedExtensionRoot: string;
+	readonly model?: CreateAgentSessionOptions["model"];
+	readonly thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 }
 
 export type TaskSessionFactory = (input: TaskSessionFactoryInput) => Promise<TaskSession>;
@@ -42,6 +45,8 @@ export interface TaskSessionHostOptions {
 	readonly excludedExtensionRoot: string;
 	readonly agentDir?: string;
 	readonly projectTrusted?: boolean;
+	readonly model?: () => CreateAgentSessionOptions["model"];
+	readonly thinkingLevel?: () => CreateAgentSessionOptions["thinkingLevel"];
 	readonly createSession?: TaskSessionFactory;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -132,10 +137,12 @@ export class TaskSessionHost implements TaskTurnRunner {
 			throw new Error(`multiple Pi sessions exist for task "${taskId}"`);
 		}
 		const existingPath = existingPaths[0];
+		const createSession = this.#options.createSession ?? createPiTaskSession;
+		const model = this.#options.model?.();
+		const thinkingLevel = this.#options.thinkingLevel?.();
 		const sessionManager = existingPath
 			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
 			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
-		const createSession = this.#options.createSession ?? createPiTaskSession;
 		let session: TaskSession;
 		try {
 			session = await createSession({
@@ -146,6 +153,8 @@ export class TaskSessionHost implements TaskTurnRunner {
 				sessionManager,
 				customTools: this.#options.customTools,
 				excludedExtensionRoot: this.#options.excludedExtensionRoot,
+				...(model !== undefined ? { model } : {}),
+				...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
 			});
 		} catch (error) {
 			const partialFile = sessionManager.getSessionFile();
@@ -187,6 +196,8 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		settingsManager,
 		resourceLoader,
 		customTools: [...input.customTools],
+		...(input.model !== undefined ? { model: input.model } : {}),
+		...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
 	});
 	const wrapped = wrapSession(session);
 	try {
