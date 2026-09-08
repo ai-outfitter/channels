@@ -66,6 +66,16 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.11.1](https://github.com/ai-outfitter/channels/compare/v1.11.0...v1.11.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **task-plane:** degrade to the default model when the captured context is stale ([07368ce](https://github.com/ai-outfitter/channels/commit/07368ce6e5c229eb25d2b47d9fbb233c6ce5a4f8))
+* **task-plane:** read the resident's model live and keep the thunks exception-safe ([8f43fe4](https://github.com/ai-outfitter/channels/commit/8f43fe4ae5707cb166cf61eaf09f54fdf9f72dc9))
+* **task-plane:** task sessions inherit the resident's model and thinking level ([9b2e37c](https://github.com/ai-outfitter/channels/commit/9b2e37c585b3e848c2eb5bb1c4cf76335c4a66fe))
+* **task-plane:** task sessions inherit the resident's model and thinking level ([1375c1b](https://github.com/ai-outfitter/channels/commit/1375c1bd20df08aa34c137464db8f772b76b78c5))
+
 ## [1.11.0](https://github.com/ai-outfitter/channels/compare/v1.10.0...v1.11.0) (2026-09-07)
 
 
