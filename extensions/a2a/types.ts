@@ -26,6 +26,20 @@ export const OUTFITTER_TASK_EXTENSION_URI =
 	"https://github.com/ai-outfitter/channels/a2a-extensions/outfitter-task/v1" as const;
 export const OUTFITTER_TASK_EXTENSION_KEY = "outfitter-task/v1" as const;
 
+/** Typed, non-sensitive user input using the MCP 2025-06-18 elicitation subset. */
+export const ELICITATION_EXTENSION_URI =
+	"https://github.com/ai-outfitter/channels/a2a-extensions/elicitation/v1" as const;
+export const ELICITATION_EXTENSION_KEY = "elicitation/v1" as const;
+
+export interface ElicitationRequest {
+	readonly message: string;
+	readonly requestedSchema: Readonly<Record<string, unknown>>;
+}
+
+export type ElicitationResponse =
+	| { readonly action: "accept"; readonly content: Readonly<Record<string, unknown>> }
+	| { readonly action: "decline" | "cancel" };
+
 export const TASK_STATES = [
 	"TASK_STATE_UNSPECIFIED",
 	"TASK_STATE_SUBMITTED",

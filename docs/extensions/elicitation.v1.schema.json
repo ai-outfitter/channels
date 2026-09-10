@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ai-outfitter/channels/a2a-extensions/elicitation/v1",
+  "title": "Outfitter A2A typed elicitation",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["message", "requestedSchema"],
+      "properties": {
+        "message": { "type": "string", "minLength": 1 },
+        "requestedSchema": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": { "enum": ["accept", "decline", "cancel"] },
+        "content": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "action": { "const": "accept" } } },
+          "then": { "required": ["content"] },
+          "else": { "not": { "required": ["content"] } }
+        }
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

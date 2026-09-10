@@ -15,6 +15,7 @@ import {
 	type A2aTask,
 	type A2aTaskState,
 	AGENT_CARD_PATH,
+	ELICITATION_EXTENSION_URI,
 	isSettled,
 	isTerminal,
 	OUTFITTER_TASK_EXTENSION_URI,
@@ -296,6 +297,12 @@ export async function startA2aServer(
 			streaming: true,
 			pushNotifications: false,
 			extensions: [
+				{
+					uri: ELICITATION_EXTENSION_URI,
+					description:
+						"Typed, non-sensitive input requests and responses using the MCP elicitation schema subset.",
+					required: false,
+				},
 				{
 					uri: OUTFITTER_TASK_EXTENSION_URI,
 					description:

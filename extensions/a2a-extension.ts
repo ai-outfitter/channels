@@ -8,7 +8,13 @@ import {
 	type RunningA2aServer,
 	startA2aServer,
 } from "./a2a/server.ts";
-import type { A2aMessage, A2aPart, A2aTask } from "./a2a/types.ts";
+import {
+	type A2aMessage,
+	type A2aPart,
+	type A2aTask,
+	ELICITATION_EXTENSION_KEY,
+	ELICITATION_EXTENSION_URI,
+} from "./a2a/types.ts";
 import { outputArtifact, type WorkflowOutputDeclarations } from "./a2a/workflow-outputs.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import type { RuntimeListener } from "./task-plane/runtime.ts";
@@ -223,9 +229,22 @@ export function registerA2aTools(
 		description:
 			"Pause one A2A task on its caller with a structured question. The task enters input-required; the caller's answer arrives as a new wake for the same task.",
 		promptSnippet: "Ask the task's caller for missing input with a2a_require_input.",
+		promptGuidelines: [
+			"Use requestedSchema when the answer has known fields or choices; never ask for passwords, tokens, or other sensitive information.",
+			"For an Other choice, include an enum value named other and a separate optional string field for the caller's text.",
+		],
 		parameters: Type.Object({
 			taskId: Type.String({ minLength: 1 }),
 			question: Type.String({ minLength: 1, maxLength: 40_000 }),
+			requestedSchema: Type.Optional(
+				Type.Object(
+					{},
+					{
+						additionalProperties: true,
+						description: "MCP elicitation requestedSchema: a flat object of primitive fields.",
+					},
+				),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			await authorize(params.taskId);
@@ -236,7 +255,14 @@ export function registerA2aTools(
 			}
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
-			await controller.status("TASK_STATE_INPUT_REQUIRED", statusMessage(params.question));
+			const requestedSchema = params.requestedSchema as Record<string, unknown> | undefined;
+			if (requestedSchema) assertElicitationSchema(requestedSchema);
+			await controller.status(
+				"TASK_STATE_INPUT_REQUIRED",
+				requestedSchema
+					? elicitationStatusMessage(params.question, requestedSchema)
+					: statusMessage(params.question),
+			);
 			return {
 				content: [
 					{ type: "text", text: `Task ${params.taskId} is paused on the caller's answer.` },
@@ -245,6 +271,65 @@ export function registerA2aTools(
 			};
 		},
 	});
+}
+
+function assertElicitationSchema(schema: Record<string, unknown>): void {
+	if (schema.type !== "object") throw new Error("requestedSchema.type must be object");
+	if (!isRecord(schema.properties)) throw new Error("requestedSchema.properties must be an object");
+	for (const [name, value] of Object.entries(schema.properties)) {
+		assertElicitationProperty(name, value);
+	}
+	if (
+		schema.required !== undefined &&
+		(!Array.isArray(schema.required) ||
+			!schema.required.every(
+				(name) => typeof name === "string" && Object.hasOwn(schema.properties as object, name),
+			))
+	) {
+		throw new Error("requestedSchema.required must name declared properties");
+	}
+}
+
+function assertElicitationProperty(name: string, value: unknown): void {
+	const allowedTypes = new Set(["string", "number", "integer", "boolean"]);
+	if (!isRecord(value) || !allowedTypes.has(String(value.type))) {
+		throw new Error(`requestedSchema property "${name}" must have a primitive type`);
+	}
+	if (value.enum === undefined) return;
+	if (
+		value.type !== "string" ||
+		!Array.isArray(value.enum) ||
+		value.enum.length === 0 ||
+		!value.enum.every((entry) => typeof entry === "string")
+	) {
+		throw new Error(`requestedSchema property "${name}" has an invalid string enum`);
+	}
+	if (
+		value.enumNames !== undefined &&
+		(!Array.isArray(value.enumNames) ||
+			!value.enumNames.every((entry) => typeof entry === "string") ||
+			value.enumNames.length !== value.enum.length)
+	) {
+		throw new Error(`requestedSchema property "${name}" enumNames must match enum`);
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function elicitationStatusMessage(
+	message: string,
+	requestedSchema: Record<string, unknown>,
+): A2aMessage {
+	return {
+		...statusMessage(message),
+		parts: [
+			{ text: message },
+			{ data: { [ELICITATION_EXTENSION_KEY]: { message, requestedSchema } } },
+		],
+		extensions: [ELICITATION_EXTENSION_URI],
+	};
 }
 
 function assertUniqueOutputNames(outputs: readonly { readonly output: string }[]): void {

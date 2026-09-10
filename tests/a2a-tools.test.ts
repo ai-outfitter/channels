@@ -6,6 +6,11 @@ import test from "node:test";
 import { type A2aExecutor, configFromEnv } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
 import {
+	type A2aMessage,
+	ELICITATION_EXTENSION_KEY,
+	ELICITATION_EXTENSION_URI,
+} from "../extensions/a2a/types.ts";
+import {
 	loadWorkflowOutputsFromEnv,
 	type WorkflowOutputDeclarations,
 } from "../extensions/a2a/workflow-outputs.ts";
@@ -60,6 +65,76 @@ test("task-plane tools enforce active authority and reject input-required withou
 		}),
 		/no continuation method/,
 	);
+});
+
+test("a2a_require_input emits typed elicitation with a text fallback", async () => {
+	let message: A2aMessage | undefined;
+	const tools = new Map<string, { execute(id: string, params: never): Promise<unknown> }>();
+	const task = {
+		id: "task-typed",
+		contextId: "context-typed",
+		status: { state: "TASK_STATE_WORKING" as const },
+	};
+	registerA2aTools(
+		{
+			registerTool(tool: { name: string; execute(id: string, params: never): Promise<unknown> }) {
+				tools.set(tool.name, tool);
+			},
+		} as never,
+		() => ({
+			async readTask() {
+				return task;
+			},
+			async controllerForTask() {
+				return {
+					task,
+					async status(_state: string, statusMessage?: A2aMessage) {
+						message = statusMessage;
+						return task;
+					},
+					async artifact() {
+						return task;
+					},
+				} as never;
+			},
+		}),
+		async () => true,
+	);
+	await tools.get("a2a_require_input")?.execute("call", {
+		taskId: task.id,
+		question: "Which repository?",
+		requestedSchema: {
+			type: "object",
+			properties: {
+				repository: {
+					type: "string",
+					enum: ["outfitter", "channels", "other"],
+					enumNames: ["Outfitter", "Channels", "Other"],
+				},
+				other: { type: "string", title: "Other repository" },
+			},
+			required: ["repository"],
+		},
+	} as never);
+	assert.ok(message);
+	assert.deepEqual(message?.extensions, [ELICITATION_EXTENSION_URI]);
+	assert.equal(message?.parts[0]?.text, "Which repository?");
+	assert.ok(message.parts[1]?.data);
+	assert.deepEqual((message.parts[1].data as Record<string, unknown>)[ELICITATION_EXTENSION_KEY], {
+		message: "Which repository?",
+		requestedSchema: {
+			type: "object",
+			properties: {
+				repository: {
+					type: "string",
+					enum: ["outfitter", "channels", "other"],
+					enumNames: ["Outfitter", "Channels", "Other"],
+				},
+				other: { type: "string", title: "Other repository" },
+			},
+			required: ["repository"],
+		},
+	});
 });
 
 test("the runtime listener injects the task plane's one shared Task store", async () => {

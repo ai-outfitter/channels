@@ -338,7 +338,12 @@ describe("a2a task plane", () => {
 		};
 		assert.equal(card.capabilities.streaming, true);
 		assert.equal(card.capabilities.pushNotifications, false);
-		assert.match(card.capabilities.extensions[0].uri, /outfitter-task\/v1$/);
+		assert.ok(
+			card.capabilities.extensions.some((extension) => /outfitter-task\/v1$/.test(extension.uri)),
+		);
+		assert.ok(
+			card.capabilities.extensions.some((extension) => /elicitation\/v1$/.test(extension.uri)),
+		);
 		assert.equal(card.supportedInterfaces[0].protocolBinding, "HTTP+JSON");
 		assert.equal(card.supportedInterfaces[0].protocolVersion, "1.0");
 	});
