@@ -33,7 +33,7 @@ Two upstream inconsistencies, resolved as follows:
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/.well-known/agent-card.json` | GET | Public Agent Card: streaming on, push notifications off, `outfitter-task/v1` extension declared |
+| `/.well-known/agent-card.json` | GET | Public Agent Card: streaming on, push notifications off, `outfitter-task/v1` and `elicitation/v1` extensions declared |
 | `/message:send` | POST | Send a message; blocks until the task settles unless `configuration.returnImmediately` |
 | `/message:stream` | POST | Send and stream `task` / `statusUpdate` / `artifactUpdate` frames over SSE |
 | `/tasks` | GET | List the caller's tasks, filtered by `contextId`, `status`, `statusTimestampAfter` |
@@ -45,6 +45,13 @@ Two upstream inconsistencies, resolved as follows:
 Version negotiation: an `A2A-Version` header other than `1.0` fails
 explicitly with `VERSION_NOT_SUPPORTED`. Authentication is bearer-token; each
 token maps to a principal, and every task and dedupe record is scoped to it.
+
+Extension use is negotiated per request. A client lists the supported extension
+URIs it wants to activate in `A2A-Extensions`; the server echoes the supported
+subset in the response header and carries only those URIs on contributed
+messages. In particular, a caller must activate `elicitation/v1` before the
+resident emits its typed data part. Otherwise `a2a_require_input` preserves the
+plain-text question and omits the extension payload.
 
 ## Task and conversation semantics
 

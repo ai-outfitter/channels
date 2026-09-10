@@ -74,6 +74,14 @@ test("a2a_require_input emits typed elicitation with a text fallback", async () 
 		id: "task-typed",
 		contextId: "context-typed",
 		status: { state: "TASK_STATE_WORKING" as const },
+		history: [
+			{
+				messageId: "request",
+				role: "ROLE_USER" as const,
+				parts: [{ text: "work" }],
+				extensions: [ELICITATION_EXTENSION_URI],
+			},
+		],
 	};
 	registerA2aTools(
 		{
@@ -135,6 +143,40 @@ test("a2a_require_input emits typed elicitation with a text fallback", async () 
 			required: ["repository"],
 		},
 	});
+
+	message = undefined;
+	task.history.push({
+		messageId: "follow-up-without-typed-elicitation",
+		role: "ROLE_USER",
+		parts: [{ text: "continue" }],
+		extensions: [],
+	});
+	await tools.get("a2a_require_input")?.execute("call", {
+		taskId: task.id,
+		question: "Which repository?",
+		requestedSchema: {
+			type: "object",
+			properties: { repository: { type: "string" } },
+		},
+	} as never);
+	const fallback = message as A2aMessage | undefined;
+	assert.ok(fallback);
+	assert.equal(fallback.extensions, undefined);
+	assert.deepEqual(fallback.parts, [{ text: "Which repository?" }]);
+
+	const requireInput = tools.get("a2a_require_input");
+	assert.ok(requireInput);
+	await assert.rejects(
+		requireInput.execute("call", {
+			taskId: task.id,
+			question: "Unsafe field",
+			requestedSchema: {
+				type: "object",
+				properties: { secret: { type: "string", format: "hidden" } },
+			},
+		} as never),
+		/invalid format/,
+	);
 });
 
 test("the runtime listener injects the task plane's one shared Task store", async () => {

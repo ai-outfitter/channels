@@ -13,6 +13,7 @@
 export const A2A_PROTOCOL_VERSION = "1.0" as const;
 export const A2A_MEDIA_TYPE = "application/a2a+json" as const;
 export const A2A_VERSION_HEADER = "a2a-version" as const;
+export const A2A_EXTENSIONS_HEADER = "a2a-extensions" as const;
 export const AGENT_CARD_PATH = "/.well-known/agent-card.json" as const;
 
 /**

@@ -281,6 +281,7 @@ function messageFor(claim: ActivationClaim): A2aMessage {
 		contextId: claim.contextId,
 		role: "ROLE_USER",
 		parts: claim.input.parts,
+		...(claim.input.extensions?.length ? { extensions: claim.input.extensions } : {}),
 	};
 }
 

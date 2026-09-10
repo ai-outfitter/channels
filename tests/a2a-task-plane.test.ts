@@ -11,12 +11,16 @@ import {
 } from "../extensions/a2a/server.ts";
 import { A2aTaskStore } from "../extensions/a2a/store.ts";
 import {
+	A2A_EXTENSIONS_HEADER,
 	type A2aArtifact,
 	A2aError,
+	type A2aMessage,
 	type A2aSendMessageRequest,
 	type A2aStreamResponse,
 	type A2aTask,
+	ELICITATION_EXTENSION_URI,
 	OUTFITTER_TASK_EXTENSION_KEY,
+	OUTFITTER_TASK_EXTENSION_URI,
 } from "../extensions/a2a/types.ts";
 import { registerA2aTools } from "../extensions/a2a-extension.ts";
 
@@ -348,6 +352,98 @@ describe("a2a task plane", () => {
 		assert.equal(card.supportedInterfaces[0].protocolVersion, "1.0");
 	});
 
+	it("activates only supported extensions requested through the service header", async () => {
+		const server = await launch(directExecutor);
+		const response = await send(
+			server,
+			"token-a",
+			{ message: userMessage("m-extensions", "hello") },
+			{
+				[A2A_EXTENSIONS_HEADER]: `${ELICITATION_EXTENSION_URI},https://example.test/unsupported`,
+			},
+		);
+		assert.equal(response.headers.get(A2A_EXTENSIONS_HEADER), ELICITATION_EXTENSION_URI);
+	});
+
+	it("projects extension messages and artifacts only when the request activates them", async () => {
+		let received: A2aMessage | undefined;
+		const direct: A2aExecutor = async () => ({
+			messageId: "direct-extension",
+			role: "ROLE_AGENT",
+			parts: [{ text: "reply" }],
+			extensions: [OUTFITTER_TASK_EXTENSION_URI],
+			metadata: { [OUTFITTER_TASK_EXTENSION_KEY]: { output: "result" } },
+		});
+		const directServer = await launch(direct);
+		const plain = await send(directServer, "token-a", {
+			message: userMessage("m-extension-plain", "hello"),
+		});
+		const plainMessage = ((await plain.json()) as { message: A2aMessage }).message;
+		assert.deepEqual(plainMessage.extensions, []);
+		assert.equal(plainMessage.metadata, undefined);
+		const typed = await send(
+			directServer,
+			"token-a",
+			{ message: userMessage("m-extension-typed", "hello") },
+			{ [A2A_EXTENSIONS_HEADER]: OUTFITTER_TASK_EXTENSION_URI },
+		);
+		const typedMessage = ((await typed.json()) as { message: A2aMessage }).message;
+		assert.deepEqual(typedMessage.extensions, [OUTFITTER_TASK_EXTENSION_URI]);
+		assert.ok(typedMessage.metadata?.[OUTFITTER_TASK_EXTENSION_KEY]);
+
+		const inboundServer = await launch(async (context) => {
+			received = context.message;
+			return {
+				messageId: "inbound-projection",
+				role: "ROLE_AGENT",
+				parts: [{ text: "ok" }],
+			};
+		});
+		await send(inboundServer, "token-a", {
+			message: userMessage("m-inbound-unactivated", "reply", {
+				parts: [
+					{ text: "reply" },
+					{ data: { "elicitation/v1": { action: "accept", content: { choice: "yes" } } } },
+				],
+				extensions: [ELICITATION_EXTENSION_URI],
+				metadata: { [OUTFITTER_TASK_EXTENSION_KEY]: { idempotency: { scope: "test" } } },
+			}),
+		});
+		assert.ok(received);
+		assert.deepEqual(received.parts, [{ text: "reply" }]);
+		assert.equal(received.metadata, undefined);
+		assert.deepEqual(received.extensions, []);
+		const extensionOnly = await send(inboundServer, "token-a", {
+			message: userMessage("m-inbound-extension-only", "", {
+				parts: [{ data: { "elicitation/v1": { action: "accept", content: {} } } }],
+				extensions: [ELICITATION_EXTENSION_URI],
+			}),
+		});
+		assert.equal(extensionOnly.status, 400);
+		assert.equal(
+			((await extensionOnly.json()) as { details: [{ reason: string }] }).details[0].reason,
+			"INVALID_ARGUMENT",
+		);
+
+		const artifactServer = await launch(async (context) => {
+			const controller = await context.begin();
+			await controller.artifact({
+				artifactId: "typed-output",
+				parts: [{ data: { number: 1 } }],
+				extensions: [OUTFITTER_TASK_EXTENSION_URI],
+				metadata: { [OUTFITTER_TASK_EXTENSION_KEY]: { output: "pull-request" } },
+			});
+			await controller.status("TASK_STATE_COMPLETED");
+			return undefined;
+		});
+		const artifactResponse = await send(artifactServer, "token-a", {
+			message: userMessage("m-artifact-plain", "work"),
+		});
+		const artifactTask = ((await artifactResponse.json()) as { task: A2aTask }).task;
+		assert.deepEqual(artifactTask.artifacts?.[0]?.extensions, []);
+		assert.equal(artifactTask.artifacts?.[0]?.metadata, undefined);
+	});
+
 	it("listTasks filters by contextId and status within the authenticated principal", async () => {
 		const server = await launch(completingExecutor);
 		const created = await send(server, "token-a", { message: userMessage("m-15", "work") });
@@ -440,6 +536,7 @@ describe("a2a task plane", () => {
 			headers: {
 				authorization: "Bearer token-a",
 				"content-type": "application/a2a+json",
+				[A2A_EXTENSIONS_HEADER]: OUTFITTER_TASK_EXTENSION_URI,
 			},
 			body: JSON.stringify({ message: userMessage("m-output", "open a pull request") }),
 		});
