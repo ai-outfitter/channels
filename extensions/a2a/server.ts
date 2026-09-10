@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { A2aTaskStore, trimTask } from "./store.ts";
 import {
+	A2A_EXTENSIONS_HEADER,
 	A2A_MEDIA_TYPE,
 	A2A_PROTOCOL_VERSION,
 	A2A_VERSION_HEADER,
@@ -15,8 +16,11 @@ import {
 	type A2aTask,
 	type A2aTaskState,
 	AGENT_CARD_PATH,
+	ELICITATION_EXTENSION_KEY,
+	ELICITATION_EXTENSION_URI,
 	isSettled,
 	isTerminal,
+	OUTFITTER_TASK_EXTENSION_KEY,
 	OUTFITTER_TASK_EXTENSION_URI,
 	validateMessage,
 } from "./types.ts";
@@ -50,6 +54,8 @@ export interface A2aTaskController {
 export interface A2aExecutorContext {
 	readonly principal: string;
 	readonly message: A2aMessage;
+	/** Supported extensions activated by this request's A2A-Extensions header. */
+	readonly activatedExtensions?: readonly string[];
 	/** Present when the message continues an existing task. */
 	readonly task?: A2aTask;
 	/**
@@ -92,6 +98,134 @@ const DEFAULT_BLOCKING_TIMEOUT_MS = 60_000;
 
 type Subscriber = (event: A2aStreamResponse) => void;
 
+function projectMetadata(
+	metadata: Record<string, unknown> | undefined,
+	activated: readonly string[],
+): Record<string, unknown> | undefined {
+	if (!metadata) return undefined;
+	const projected = { ...metadata };
+	if (!activated.includes(OUTFITTER_TASK_EXTENSION_URI)) {
+		delete projected[OUTFITTER_TASK_EXTENSION_KEY];
+	}
+	if (!activated.includes(ELICITATION_EXTENSION_URI)) {
+		delete projected[ELICITATION_EXTENSION_KEY];
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectMessage(
+	message: A2aMessage,
+	activated: readonly string[],
+	empty: "placeholder" | "client-error" | "server-error" = "placeholder",
+): A2aMessage {
+	const metadata = projectMetadata(message.metadata, activated);
+	const { metadata: _metadata, extensions: _extensions, ...base } = message;
+	const parts = message.parts.flatMap((part) => {
+		if (
+			activated.includes(ELICITATION_EXTENSION_URI) ||
+			typeof part.data !== "object" ||
+			part.data === null ||
+			Array.isArray(part.data) ||
+			!Object.hasOwn(part.data, ELICITATION_EXTENSION_KEY)
+		) {
+			return [part];
+		}
+		const data = { ...(part.data as Record<string, unknown>) };
+		delete data[ELICITATION_EXTENSION_KEY];
+		return Object.keys(data).length > 0 ? [{ ...part, data }] : [];
+	});
+	if (parts.length === 0) {
+		if (empty === "client-error") {
+			throw new A2aError(
+				400,
+				"INVALID_ARGUMENT",
+				"message has no content from activated extensions",
+			);
+		}
+		if (empty === "server-error") {
+			throw new A2aError(
+				500,
+				"INTERNAL",
+				"executor message has no content from activated extensions",
+			);
+		}
+		parts.push({ text: "[unactivated extension content omitted]" });
+	}
+	return {
+		...base,
+		parts,
+		...(metadata ? { metadata } : {}),
+		...(message.extensions
+			? { extensions: message.extensions.filter((uri) => activated.includes(uri)) }
+			: {}),
+	};
+}
+
+function projectArtifact(artifact: A2aArtifact, activated: readonly string[]): A2aArtifact {
+	const metadata = projectMetadata(artifact.metadata, activated);
+	const { metadata: _metadata, extensions: _extensions, ...base } = artifact;
+	return {
+		...base,
+		...(metadata ? { metadata } : {}),
+		...(artifact.extensions
+			? { extensions: artifact.extensions.filter((uri) => activated.includes(uri)) }
+			: {}),
+	};
+}
+
+function projectTask(task: A2aTask, activated: readonly string[]): A2aTask {
+	return {
+		...task,
+		status: {
+			...task.status,
+			...(task.status.message ? { message: projectMessage(task.status.message, activated) } : {}),
+		},
+		...(task.history
+			? { history: task.history.map((message) => projectMessage(message, activated)) }
+			: {}),
+		...(task.artifacts
+			? { artifacts: task.artifacts.map((artifact) => projectArtifact(artifact, activated)) }
+			: {}),
+	};
+}
+
+function projectResponse(
+	response: A2aSendMessageResponse,
+	activated: readonly string[],
+): A2aSendMessageResponse {
+	return "task" in response
+		? { task: projectTask(response.task, activated) }
+		: { message: projectMessage(response.message, activated) };
+}
+
+function projectEvent(event: A2aStreamResponse, activated: readonly string[]): A2aStreamResponse {
+	if ("task" in event) return { task: projectTask(event.task, activated) };
+	if ("message" in event) return { message: projectMessage(event.message, activated) };
+	if ("artifactUpdate" in event) {
+		return {
+			artifactUpdate: {
+				...event.artifactUpdate,
+				artifact: projectArtifact(event.artifactUpdate.artifact, activated),
+			},
+		};
+	}
+	return {
+		statusUpdate: {
+			...event.statusUpdate,
+			status: {
+				...event.statusUpdate.status,
+				...(event.statusUpdate.status.message
+					? { message: projectMessage(event.statusUpdate.status.message, activated) }
+					: {}),
+			},
+		},
+	};
+}
+
+function taskExtensions(task: A2aTask): readonly string[] {
+	return task.history?.findLast((message) => message.role === "ROLE_USER")?.extensions ?? [];
+}
+
 export async function startA2aServer(
 	config: A2aServerConfig,
 	executor: A2aExecutor,
@@ -123,9 +257,12 @@ export async function startA2aServer(
 				return current;
 			},
 			async status(state, message) {
+				const projected = message
+					? projectMessage(message, taskExtensions(current), "server-error")
+					: undefined;
 				current = await store.updateStatus(principal, current.id, {
 					state,
-					...(message ? { message } : {}),
+					...(projected ? { message: projected } : {}),
 				});
 				emit(current.id, {
 					statusUpdate: {
@@ -137,9 +274,10 @@ export async function startA2aServer(
 				return current;
 			},
 			async artifact(artifact) {
-				current = await store.addArtifact(principal, current.id, artifact);
+				const projected = projectArtifact(artifact, taskExtensions(current));
+				current = await store.addArtifact(principal, current.id, projected);
 				emit(current.id, {
-					artifactUpdate: { taskId: current.id, contextId: current.contextId, artifact },
+					artifactUpdate: { taskId: current.id, contextId: current.contextId, artifact: projected },
 				});
 				return current;
 			},
@@ -193,9 +331,17 @@ export async function startA2aServer(
 	const executeSend = async (
 		principal: string,
 		request: A2aSendMessageRequest,
+		activatedExtensions: readonly string[],
 		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: protocol outcomes and persistence failures remain explicit in one boundary
 	): Promise<ExecutionOutcome> => {
-		const message = validateMessage(request.message, "ROLE_USER");
+		const message = projectMessage(
+			{
+				...validateMessage(request.message, "ROLE_USER"),
+				extensions: activatedExtensions,
+			},
+			activatedExtensions,
+			"client-error",
+		);
 		const replay = await replayPrior(principal, message);
 		if (replay) return replay;
 		const existing = await loadContinuation(principal, message);
@@ -212,6 +358,7 @@ export async function startA2aServer(
 		const context: A2aExecutorContext = {
 			principal,
 			message,
+			activatedExtensions,
 			...(existing ? { task: existing } : {}),
 			begin,
 		};
@@ -229,7 +376,7 @@ export async function startA2aServer(
 			}
 			if (existing) await store.appendHistory(principal, existing.id, message);
 			const reply: A2aMessage = {
-				...direct,
+				...projectMessage(direct, activatedExtensions, "server-error"),
 				messageId: direct.messageId || randomUUID(),
 				role: "ROLE_AGENT",
 			};
@@ -297,6 +444,12 @@ export async function startA2aServer(
 			pushNotifications: false,
 			extensions: [
 				{
+					uri: ELICITATION_EXTENSION_URI,
+					description:
+						"Typed, non-sensitive input requests and responses using the MCP elicitation schema subset.",
+					required: false,
+				},
+				{
 					uri: OUTFITTER_TASK_EXTENSION_URI,
 					description:
 						"Ticket Run lineage, scoped task locators, retry/supersession links, and idempotency data for Outfitter-coordinated work.",
@@ -333,25 +486,28 @@ export async function startA2aServer(
 		}
 		requireSupportedVersion(request);
 		const principal = authenticate(request, config.credentials);
+		const activated = activatedExtensions(request);
+		const negotiatedHeaders =
+			activated.length > 0 ? { [A2A_EXTENSIONS_HEADER]: activated.join(",") } : {};
 		if (request.method === "POST" && path === "/message:send") {
 			const body = (await readJsonBody(request)) as A2aSendMessageRequest;
-			const outcome = await executeSend(principal, body);
+			const outcome = await executeSend(principal, body, activated);
 			const blocking = body.configuration?.returnImmediately !== true;
 			const payload =
 				blocking && outcome.taskId
-					? { task: await waitUntilSettled(principal, outcome.taskId) }
-					: outcome.response;
-			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE });
+					? { task: projectTask(await waitUntilSettled(principal, outcome.taskId), activated) }
+					: projectResponse(outcome.response, activated);
+			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE, ...negotiatedHeaders });
 			response.end(JSON.stringify(payload));
 			return;
 		}
 		if (request.method === "POST" && path === "/message:stream") {
 			const body = (await readJsonBody(request)) as A2aSendMessageRequest;
-			openEventStream(response);
+			openEventStream(response, negotiatedHeaders);
 			const forward = (event: A2aStreamResponse): void => {
-				response.write(`data: ${JSON.stringify(event)}\n\n`);
+				response.write(`data: ${JSON.stringify(projectEvent(event, activated))}\n\n`);
 			};
-			const outcome = await executeSend(principal, body);
+			const outcome = await executeSend(principal, body, activated);
 			forward(outcome.response);
 			if (!outcome.taskId) {
 				response.end();
@@ -386,8 +542,13 @@ export async function startA2aServer(
 				...(historyLength === undefined ? {} : { historyLength }),
 				includeArtifacts: url.searchParams.get("includeArtifacts") === "true",
 			});
-			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE });
-			response.end(JSON.stringify({ tasks, nextPageToken: "" }));
+			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE, ...negotiatedHeaders });
+			response.end(
+				JSON.stringify({
+					tasks: tasks.map((task) => projectTask(task, activated)),
+					nextPageToken: "",
+				}),
+			);
 			return;
 		}
 		const subscribeMatch = path.match(/^\/tasks\/([^/:]+):subscribe$/);
@@ -404,9 +565,9 @@ export async function startA2aServer(
 					`task "${task.id}" is in terminal state ${task.status.state}`,
 				);
 			}
-			openEventStream(response);
+			openEventStream(response, negotiatedHeaders);
 			const unsubscribe = subscribe(task.id, (event) => {
-				response.write(`data: ${JSON.stringify(event)}\n\n`);
+				response.write(`data: ${JSON.stringify(projectEvent(event, activated))}\n\n`);
 				if ("statusUpdate" in event && isTerminal(event.statusUpdate.status.state)) {
 					unsubscribe();
 					response.end();
@@ -434,17 +595,22 @@ export async function startA2aServer(
 			emit(task.id, {
 				statusUpdate: { taskId: task.id, contextId: task.contextId, status: canceled.status },
 			});
-			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE });
-			response.end(JSON.stringify(canceled));
+			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE, ...negotiatedHeaders });
+			response.end(JSON.stringify(projectTask(canceled, activated)));
 			return;
 		}
 		const taskMatch = path.match(/^\/tasks\/([^/:]+)$/);
 		if (request.method === "GET" && taskMatch) {
 			const historyLength = integerParam(url, "historyLength");
 			const task = await store.getTask(principal, taskMatch[1] as string);
-			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE });
+			response.writeHead(200, { "content-type": A2A_MEDIA_TYPE, ...negotiatedHeaders });
 			response.end(
-				JSON.stringify(historyLength === undefined ? task : trimTask(task, historyLength, true)),
+				JSON.stringify(
+					projectTask(
+						historyLength === undefined ? task : trimTask(task, historyLength, true),
+						activated,
+					),
+				),
 			);
 			return;
 		}
@@ -504,15 +670,29 @@ function authenticate(request: IncomingMessage, credentials: readonly A2aCredent
 	return credential.principal;
 }
 
+function activatedExtensions(request: IncomingMessage): readonly string[] {
+	const raw = request.headers[A2A_EXTENSIONS_HEADER];
+	const values = (Array.isArray(raw) ? raw : [raw ?? ""])
+		.flatMap((entry) => entry.split(","))
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+	const supported = new Set<string>([ELICITATION_EXTENSION_URI, OUTFITTER_TASK_EXTENSION_URI]);
+	return [...new Set(values.filter((uri) => supported.has(uri)))];
+}
+
 function isExecutorTask(value: A2aMessage | A2aExecutorTask | undefined): value is A2aExecutorTask {
 	return Boolean(value && "kind" in value && value.kind === "task" && !("parts" in value));
 }
 
-function openEventStream(response: ServerResponse): void {
+function openEventStream(
+	response: ServerResponse,
+	extraHeaders: Readonly<Record<string, string>> = {},
+): void {
 	response.writeHead(200, {
 		"content-type": "text/event-stream",
 		"cache-control": "no-cache",
 		connection: "keep-alive",
+		...extraHeaders,
 	});
 	response.flushHeaders();
 }

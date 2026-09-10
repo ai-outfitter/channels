@@ -8,7 +8,13 @@ import {
 	type RunningA2aServer,
 	startA2aServer,
 } from "./a2a/server.ts";
-import type { A2aMessage, A2aPart, A2aTask } from "./a2a/types.ts";
+import {
+	type A2aMessage,
+	type A2aPart,
+	type A2aTask,
+	ELICITATION_EXTENSION_KEY,
+	ELICITATION_EXTENSION_URI,
+} from "./a2a/types.ts";
 import { outputArtifact, type WorkflowOutputDeclarations } from "./a2a/workflow-outputs.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import type { RuntimeListener } from "./task-plane/runtime.ts";
@@ -45,6 +51,7 @@ export function createA2aRuntimeListener(
 	return {
 		async start(taskPlane, sink) {
 			const executor: A2aExecutor = async (context) => {
+				const activatedExtensions = context.activatedExtensions ?? [];
 				const activation = {
 					principal: context.principal,
 					source: "a2a",
@@ -59,8 +66,10 @@ export function createA2aRuntimeListener(
 					contentDigest: contentDigest({
 						role: context.message.role,
 						parts: context.message.parts,
+						extensions: activatedExtensions,
 						referenceTaskIds: context.message.referenceTaskIds ?? [],
 					}),
+					...(activatedExtensions.length ? { extensions: activatedExtensions } : {}),
 				};
 				const accepted = context.task
 					? await sink.continue({ ...activation, taskId: context.task.id })
@@ -223,9 +232,22 @@ export function registerA2aTools(
 		description:
 			"Pause one A2A task on its caller with a structured question. The task enters input-required; the caller's answer arrives as a new wake for the same task.",
 		promptSnippet: "Ask the task's caller for missing input with a2a_require_input.",
+		promptGuidelines: [
+			"Use requestedSchema when the answer has known fields or choices; never ask for passwords, tokens, or other sensitive information.",
+			"For an Other choice, include an enum value named other and a separate optional string field for the caller's text.",
+		],
 		parameters: Type.Object({
 			taskId: Type.String({ minLength: 1 }),
 			question: Type.String({ minLength: 1, maxLength: 40_000 }),
+			requestedSchema: Type.Optional(
+				Type.Object(
+					{},
+					{
+						additionalProperties: true,
+						description: "MCP elicitation requestedSchema: a flat object of primitive fields.",
+					},
+				),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			await authorize(params.taskId);
@@ -236,7 +258,17 @@ export function registerA2aTools(
 			}
 			const controller = await requireServer().controllerForTask(params.taskId);
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
-			await controller.status("TASK_STATE_INPUT_REQUIRED", statusMessage(params.question));
+			const requestedSchema = params.requestedSchema as Record<string, unknown> | undefined;
+			if (requestedSchema) assertElicitationSchema(requestedSchema);
+			const elicitationActive = controller.task.history
+				?.findLast((message) => message.role === "ROLE_USER")
+				?.extensions?.includes(ELICITATION_EXTENSION_URI);
+			await controller.status(
+				"TASK_STATE_INPUT_REQUIRED",
+				requestedSchema && elicitationActive
+					? elicitationStatusMessage(params.question, requestedSchema)
+					: statusMessage(params.question),
+			);
 			return {
 				content: [
 					{ type: "text", text: `Task ${params.taskId} is paused on the caller's answer.` },
@@ -245,6 +277,192 @@ export function registerA2aTools(
 			};
 		},
 	});
+}
+
+function assertElicitationSchema(schema: Record<string, unknown>): void {
+	assertOnlyKeys(schema, ["type", "properties", "required"], "requestedSchema");
+	if (schema.type !== "object") throw new Error("requestedSchema.type must be object");
+	if (!isRecord(schema.properties)) throw new Error("requestedSchema.properties must be an object");
+	for (const [name, value] of Object.entries(schema.properties)) {
+		assertElicitationProperty(name, value);
+	}
+	if (
+		schema.required !== undefined &&
+		(!Array.isArray(schema.required) ||
+			!schema.required.every(
+				(name) => typeof name === "string" && Object.hasOwn(schema.properties as object, name),
+			))
+	) {
+		throw new Error("requestedSchema.required must name declared properties");
+	}
+	if (Array.isArray(schema.required) && new Set(schema.required).size !== schema.required.length) {
+		throw new Error("requestedSchema.required must not contain duplicates");
+	}
+}
+
+function assertElicitationProperty(name: string, value: unknown): void {
+	if (
+		!isRecord(value) ||
+		!["string", "number", "integer", "boolean"].includes(String(value.type))
+	) {
+		throw new Error(`requestedSchema property "${name}" must have a primitive type`);
+	}
+	assertOptionalString(value.title, name, "title");
+	assertOptionalString(value.description, name, "description");
+	if (value.type === "string") assertStringProperty(name, value);
+	else if (value.type === "number" || value.type === "integer") assertNumericProperty(name, value);
+	else assertBooleanProperty(name, value);
+}
+
+function assertStringProperty(name: string, value: Record<string, unknown>): void {
+	assertOnlyKeys(
+		value,
+		[
+			"type",
+			"title",
+			"description",
+			"default",
+			"minLength",
+			"maxLength",
+			"format",
+			"enum",
+			"enumNames",
+		],
+		`requestedSchema property "${name}"`,
+	);
+	assertOptionalNonnegativeInteger(value.minLength, name, "minLength");
+	assertOptionalNonnegativeInteger(value.maxLength, name, "maxLength");
+	if (
+		typeof value.minLength === "number" &&
+		typeof value.maxLength === "number" &&
+		value.minLength > value.maxLength
+	) {
+		throw new Error(`requestedSchema property "${name}" minLength must not exceed maxLength`);
+	}
+	if (
+		value.format !== undefined &&
+		!["email", "uri", "date", "date-time"].includes(String(value.format))
+	) {
+		throw new Error(`requestedSchema property "${name}" has an invalid format`);
+	}
+	if (value.default !== undefined && typeof value.default !== "string") {
+		throw new Error(`requestedSchema property "${name}" has an invalid default`);
+	}
+	assertStringEnum(name, value);
+}
+
+function assertStringEnum(name: string, value: Record<string, unknown>): void {
+	if (value.enum === undefined) {
+		if (value.enumNames !== undefined) {
+			throw new Error(`requestedSchema property "${name}" enumNames requires enum`);
+		}
+		return;
+	}
+	if (
+		value.type !== "string" ||
+		!Array.isArray(value.enum) ||
+		value.enum.length === 0 ||
+		!value.enum.every((entry) => typeof entry === "string")
+	) {
+		throw new Error(`requestedSchema property "${name}" has an invalid string enum`);
+	}
+	if (
+		value.enumNames !== undefined &&
+		(!Array.isArray(value.enumNames) ||
+			!value.enumNames.every((entry) => typeof entry === "string") ||
+			value.enumNames.length !== value.enum.length)
+	) {
+		throw new Error(`requestedSchema property "${name}" enumNames must match enum`);
+	}
+	if (new Set(value.enum).size !== value.enum.length) {
+		throw new Error(`requestedSchema property "${name}" enum must not contain duplicates`);
+	}
+	if (typeof value.default === "string" && !value.enum.includes(value.default)) {
+		throw new Error(`requestedSchema property "${name}" default must be in enum`);
+	}
+}
+
+function assertNumericProperty(name: string, value: Record<string, unknown>): void {
+	assertOnlyKeys(
+		value,
+		["type", "title", "description", "default", "minimum", "maximum"],
+		`requestedSchema property "${name}"`,
+	);
+	for (const keyword of ["minimum", "maximum", "default"] as const) {
+		const entry = value[keyword];
+		if (
+			entry !== undefined &&
+			(typeof entry !== "number" ||
+				!Number.isFinite(entry) ||
+				(value.type === "integer" && !Number.isInteger(entry)))
+		) {
+			throw new Error(`requestedSchema property "${name}" has an invalid ${keyword}`);
+		}
+	}
+	if (
+		typeof value.minimum === "number" &&
+		typeof value.maximum === "number" &&
+		value.minimum > value.maximum
+	) {
+		throw new Error(`requestedSchema property "${name}" minimum must not exceed maximum`);
+	}
+	if (
+		typeof value.default === "number" &&
+		((typeof value.minimum === "number" && value.default < value.minimum) ||
+			(typeof value.maximum === "number" && value.default > value.maximum))
+	) {
+		throw new Error(`requestedSchema property "${name}" default must satisfy its bounds`);
+	}
+}
+
+function assertBooleanProperty(name: string, value: Record<string, unknown>): void {
+	assertOnlyKeys(
+		value,
+		["type", "title", "description", "default"],
+		`requestedSchema property "${name}"`,
+	);
+	if (value.default !== undefined && typeof value.default !== "boolean") {
+		throw new Error(`requestedSchema property "${name}" has an invalid default`);
+	}
+}
+
+function assertOnlyKeys(
+	value: Record<string, unknown>,
+	allowed: readonly string[],
+	label: string,
+): void {
+	const unknown = Object.keys(value).find((key) => !allowed.includes(key));
+	if (unknown) throw new Error(`${label} has unsupported keyword "${unknown}"`);
+}
+
+function assertOptionalString(value: unknown, name: string, keyword: string): void {
+	if (value !== undefined && typeof value !== "string") {
+		throw new Error(`requestedSchema property "${name}" has an invalid ${keyword}`);
+	}
+}
+
+function assertOptionalNonnegativeInteger(value: unknown, name: string, keyword: string): void {
+	if (value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 0)) {
+		throw new Error(`requestedSchema property "${name}" has an invalid ${keyword}`);
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function elicitationStatusMessage(
+	message: string,
+	requestedSchema: Record<string, unknown>,
+): A2aMessage {
+	return {
+		...statusMessage(message),
+		parts: [
+			{ text: message },
+			{ data: { [ELICITATION_EXTENSION_KEY]: { message, requestedSchema } } },
+		],
+		extensions: [ELICITATION_EXTENSION_URI],
+	};
 }
 
 function assertUniqueOutputNames(outputs: readonly { readonly output: string }[]): void {

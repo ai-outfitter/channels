@@ -33,7 +33,7 @@ Two upstream inconsistencies, resolved as follows:
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/.well-known/agent-card.json` | GET | Public Agent Card: streaming on, push notifications off, `outfitter-task/v1` extension declared |
+| `/.well-known/agent-card.json` | GET | Public Agent Card: streaming on, push notifications off, `outfitter-task/v1` and `elicitation/v1` extensions declared |
 | `/message:send` | POST | Send a message; blocks until the task settles unless `configuration.returnImmediately` |
 | `/message:stream` | POST | Send and stream `task` / `statusUpdate` / `artifactUpdate` frames over SSE |
 | `/tasks` | GET | List the caller's tasks, filtered by `contextId`, `status`, `statusTimestampAfter` |
@@ -45,6 +45,13 @@ Two upstream inconsistencies, resolved as follows:
 Version negotiation: an `A2A-Version` header other than `1.0` fails
 explicitly with `VERSION_NOT_SUPPORTED`. Authentication is bearer-token; each
 token maps to a principal, and every task and dedupe record is scoped to it.
+
+Extension use is negotiated per request. A client lists the supported extension
+URIs it wants to activate in `A2A-Extensions`; the server echoes the supported
+subset in the response header and carries only those URIs on contributed
+messages. In particular, a caller must activate `elicitation/v1` before the
+resident emits its typed data part. Otherwise `a2a_require_input` preserves the
+plain-text question and omits the extension payload.
 
 ## Task and conversation semantics
 
@@ -228,7 +235,9 @@ runtime. The agent then drives the task with four tools:
 - `a2a_record_output` — record one declared workflow output while the Task is
   still `WORKING`.
 - `a2a_require_input` — pause the task on the caller with a question; the
-  task enters `INPUT_REQUIRED`. Today the answer arrives as an authorized
+  task enters `INPUT_REQUIRED`. An optional MCP-compatible `requestedSchema`
+  is emitted as an `elicitation/v1` data part, while the question remains as a
+  text fallback. The answer arrives as an authorized
   explicit `taskId` follow-up; the runtime commits add verified reply
   anchors, and make this tool fail for a Task whose source declares no
   continuation method in the conformance matrix — the executor completes or

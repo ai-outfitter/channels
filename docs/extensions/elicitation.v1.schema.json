@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ai-outfitter/channels/a2a-extensions/elicitation/v1",
+  "title": "Outfitter A2A typed elicitation",
+  "$defs": {
+    "stringProperty": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "default": { "type": "string" },
+        "minLength": { "type": "integer", "minimum": 0 },
+        "maxLength": { "type": "integer", "minimum": 0 },
+        "format": { "enum": ["email", "uri", "date", "date-time"] },
+        "enum": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "enumNames": {
+          "description": "Display labels in enum order and with the same length as enum; equal length is enforced by the runtime.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "dependentRequired": { "enumNames": ["enum"] },
+      "additionalProperties": false
+    },
+    "numberProperty": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "number" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "default": { "type": "number" },
+        "minimum": { "type": "number" },
+        "maximum": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "integerProperty": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "integer" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "default": { "type": "integer" },
+        "minimum": { "type": "integer" },
+        "maximum": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "booleanProperty": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "boolean" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "default": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "requestedSchema": {
+      "type": "object",
+      "required": ["type", "properties"],
+      "properties": {
+        "type": { "const": "object" },
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "$ref": "#/$defs/stringProperty" },
+              { "$ref": "#/$defs/numberProperty" },
+              { "$ref": "#/$defs/integerProperty" },
+              { "$ref": "#/$defs/booleanProperty" }
+            ]
+          }
+        },
+        "required": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["message", "requestedSchema"],
+      "properties": {
+        "message": { "type": "string", "minLength": 1 },
+        "requestedSchema": { "$ref": "#/$defs/requestedSchema" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": { "enum": ["accept", "decline", "cancel"] },
+        "content": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "boolean"]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "action": { "const": "accept" } } },
+          "then": { "required": ["content"] },
+          "else": { "not": { "required": ["content"] } }
+        }
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

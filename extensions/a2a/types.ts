@@ -13,6 +13,7 @@
 export const A2A_PROTOCOL_VERSION = "1.0" as const;
 export const A2A_MEDIA_TYPE = "application/a2a+json" as const;
 export const A2A_VERSION_HEADER = "a2a-version" as const;
+export const A2A_EXTENSIONS_HEADER = "a2a-extensions" as const;
 export const AGENT_CARD_PATH = "/.well-known/agent-card.json" as const;
 
 /**
@@ -25,6 +26,20 @@ export const AGENT_CARD_PATH = "/.well-known/agent-card.json" as const;
 export const OUTFITTER_TASK_EXTENSION_URI =
 	"https://github.com/ai-outfitter/channels/a2a-extensions/outfitter-task/v1" as const;
 export const OUTFITTER_TASK_EXTENSION_KEY = "outfitter-task/v1" as const;
+
+/** Typed, non-sensitive user input using the MCP 2025-06-18 elicitation subset. */
+export const ELICITATION_EXTENSION_URI =
+	"https://github.com/ai-outfitter/channels/a2a-extensions/elicitation/v1" as const;
+export const ELICITATION_EXTENSION_KEY = "elicitation/v1" as const;
+
+export interface ElicitationRequest {
+	readonly message: string;
+	readonly requestedSchema: Readonly<Record<string, unknown>>;
+}
+
+export type ElicitationResponse =
+	| { readonly action: "accept"; readonly content: Readonly<Record<string, unknown>> }
+	| { readonly action: "decline" | "cancel" };
 
 export const TASK_STATES = [
 	"TASK_STATE_UNSPECIFIED",

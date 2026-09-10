@@ -10,6 +10,8 @@ export interface NativeActivation {
 	readonly conversationKey?: string;
 	readonly nativeDisplayUrl?: string;
 	readonly parts: readonly A2aPart[];
+	/** Extensions activated by a trusted protocol binding for this message. */
+	readonly extensions?: readonly string[];
 	readonly contentDigest: string;
 	readonly evidenceLocator?: string;
 }
