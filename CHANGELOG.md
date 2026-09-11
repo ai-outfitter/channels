@@ -66,6 +66,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.12.0](https://github.com/ai-outfitter/channels/compare/v1.11.1...v1.12.0) (2026-09-10)
+
+
+### Features
+
+* **a2a:** add typed elicitation payloads ([#76](https://github.com/ai-outfitter/channels/issues/76)) ([58702f7](https://github.com/ai-outfitter/channels/commit/58702f775ca82551c15b45c3fe843f9179a113c5))
+
 ## [1.11.1](https://github.com/ai-outfitter/channels/compare/v1.11.0...v1.11.1) (2026-09-08)
 
 
