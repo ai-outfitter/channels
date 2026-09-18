@@ -331,7 +331,17 @@ async function emitNew(
 					},
 					receivedAt: thread.updated_at,
 					conversationKey: sourceIdentifier("conversation", path),
-					parts: [{ data: { threadId: thread.id, revision: thread.updated_at, path, reason } }],
+					parts: [
+						{
+							data: {
+								threadId: thread.id,
+								revision: thread.updated_at,
+								path,
+								repository: thread.repository?.full_name ?? "",
+								reason,
+							},
+						},
+					],
 					contentDigest: contentDigest({ thread, reason }),
 				});
 				if (cfg.markRead) {

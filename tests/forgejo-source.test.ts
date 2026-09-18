@@ -133,6 +133,53 @@ test("wakes on a review request and reports a trusted reason, not the title", as
 	assert.deepEqual(events, [{ channel: "forgejo", summary: "review_requested" }]);
 });
 
+test("includes the exact Forgejo repository in the task message", async () => {
+	const { restore } = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 1 } },
+		[`${API}/notifications?`]: { body: [thread(15, "Issue", 29)] },
+		[`${API}/repos/o/r/issues/29`]: {
+			body: { assignees: [{ login: "drago" }], requested_reviewers: [] },
+		},
+	});
+	let accepted: NativeActivation | undefined;
+	const sink: SourceTaskActivationSink = {
+		async accept(input) {
+			accepted = input;
+			return {
+				activationId: input.providerEventId,
+				taskId: "task-repository",
+				contextId: input.conversationKey ?? "context",
+				disposition: "created",
+			};
+		},
+		async continue() {
+			throw new Error("unused");
+		},
+		async recordEvidence() {},
+	};
+	const stop = await createForgejoSourceImpl(config, sink).start(() => {
+		throw new Error("legacy onEvent must not be used");
+	});
+	try {
+		for (let wait = 0; !accepted && wait < 100; wait += 1) await settle(5);
+		assert.equal(accepted?.nativeLocator.repository, "o/r");
+		assert.deepEqual(accepted?.parts, [
+			{
+				data: {
+					threadId: 15,
+					revision: "2026-07-28T11:59:00Z",
+					path: "/repos/o/r/issues/29",
+					repository: "o/r",
+					reason: "assigned_issue",
+				},
+			},
+		]);
+	} finally {
+		await stop();
+		restore();
+	}
+});
+
 test("distinguishes an assigned pull request from an assigned issue", async () => {
 	for (const [type, expected] of [
 		["Pull", "assigned_pr"],
