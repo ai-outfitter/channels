@@ -66,6 +66,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.12.1](https://github.com/ai-outfitter/channels/compare/v1.12.0...v1.12.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **forgejo:** expose repository in task payload ([#78](https://github.com/ai-outfitter/channels/issues/78)) ([004c1cd](https://github.com/ai-outfitter/channels/commit/004c1cd624443344a7a31f2aaf4739421edc1927))
+
 ## [1.12.0](https://github.com/ai-outfitter/channels/compare/v1.11.1...v1.12.0) (2026-09-10)
 
 
