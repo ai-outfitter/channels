@@ -18,6 +18,7 @@ import { errorMessage } from "./sources/util.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import { type RunningChannelsRuntime, startChannelsRuntime } from "./task-plane/runtime.ts";
 import {
+	commandLineExtensionPaths,
 	TaskSessionHost,
 	type TaskSessionHostOptions,
 	type TaskTurnRunner,
@@ -188,6 +189,7 @@ export default function channelsRuntimeExtension(
 			model: getModel,
 			thinkingLevel: getThinkingLevel,
 			customTools: taskTools,
+			additionalExtensionPaths: commandLineExtensionPaths(process.argv),
 			excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 			log,
 		};
