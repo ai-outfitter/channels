@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	type AgentSession,
@@ -31,6 +31,7 @@ export interface TaskSessionFactoryInput {
 	readonly projectTrusted: boolean;
 	readonly sessionManager: SessionManager;
 	readonly customTools: readonly ToolDefinition[];
+	readonly additionalExtensionPaths: readonly string[];
 	readonly excludedExtensionRoot: string;
 	readonly model?: CreateAgentSessionOptions["model"];
 	readonly thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
@@ -42,6 +43,7 @@ export interface TaskSessionHostOptions {
 	readonly cwd: string;
 	readonly sessionDir: string;
 	readonly customTools: readonly ToolDefinition[];
+	readonly additionalExtensionPaths?: readonly string[];
 	readonly excludedExtensionRoot: string;
 	readonly agentDir?: string;
 	readonly projectTrusted?: boolean;
@@ -152,6 +154,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 				projectTrusted: this.#options.projectTrusted ?? false,
 				sessionManager,
 				customTools: this.#options.customTools,
+				additionalExtensionPaths: this.#options.additionalExtensionPaths ?? [],
 				excludedExtensionRoot: this.#options.excludedExtensionRoot,
 				...(model !== undefined ? { model } : {}),
 				...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
@@ -181,6 +184,7 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		cwd: input.cwd,
 		agentDir: input.agentDir,
 		settingsManager,
+		additionalExtensionPaths: [...input.additionalExtensionPaths],
 		extensionsOverride: (loaded) => ({
 			...loaded,
 			extensions: loaded.extensions.filter(
@@ -234,9 +238,35 @@ function wrapSession(session: AgentSession): TaskSession {
 }
 
 export function isPathInside(path: string, root: string): boolean {
-	const fromRoot = relative(resolve(root), resolve(path));
+	const canonical = (value: string) => {
+		try {
+			return realpathSync(value);
+		} catch {
+			return resolve(value);
+		}
+	};
+	const fromRoot = relative(canonical(root), canonical(path));
 	return (
 		fromRoot === "" ||
 		(fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot))
 	);
+}
+
+/** Pi receives Outfitter-selected extensions on the command line, outside its default resource paths. */
+export function commandLineExtensionPaths(argv: readonly string[]): string[] {
+	const paths = new Set<string>();
+	for (let index = 0; index < argv.length; index += 1) {
+		const arg = argv[index];
+		if (arg === "--extension" || arg === "-e") {
+			const value = argv[index + 1];
+			if (value && !value.startsWith("--")) {
+				paths.add(value);
+				index += 1;
+			}
+		} else if (arg?.startsWith("--extension=")) {
+			const value = arg.slice("--extension=".length);
+			if (value) paths.add(value);
+		}
+	}
+	return [...paths];
 }

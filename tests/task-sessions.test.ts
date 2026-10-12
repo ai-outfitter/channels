@@ -1,17 +1,68 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { derivedId } from "../extensions/task-plane/serialize.ts";
 import {
+	commandLineExtensionPaths,
 	isPathInside,
 	type TaskSessionFactory,
 	type TaskSessionFactoryInput,
 	TaskSessionHost,
 } from "../extensions/task-plane/task-sessions.ts";
+
+test("Task sessions inherit the parent's explicitly selected extension paths", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-extensions-"));
+	const paths = commandLineExtensionPaths([
+		"pi",
+		"--extension",
+		"/cache/github-mcp",
+		"--mode",
+		"rpc",
+		"--extension=/cache/channels",
+		"--extension",
+		"/cache/github-mcp",
+		"-e",
+		"/cache/extra",
+	]);
+	assert.deepEqual(paths, ["/cache/github-mcp", "/cache/channels", "/cache/extra"]);
+	let received: readonly string[] | undefined;
+	const host = new TaskSessionHost({
+		cwd: root,
+		sessionDir: join(root, "sessions"),
+		customTools: [],
+		additionalExtensionPaths: paths,
+		excludedExtensionRoot: "/cache/channels",
+		createSession: async ({ sessionManager, additionalExtensionPaths }) => {
+			received = additionalExtensionPaths;
+			return {
+				sessionId: sessionManager.getSessionId(),
+				sessionFile: sessionManager.getSessionFile(),
+				async prompt() {},
+				async close() {},
+			};
+		},
+	});
+	await host.run("review", "check the PR");
+	await host.close();
+	assert.deepEqual(received, paths);
+});
+
+test("Pi's task resource loader sees an extension selected on the parent command line", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-task-extension-loader-"));
+	const extension = join(root, "review-tool.mjs");
+	await writeFile(extension, "export default function reviewTool() {}\n");
+	const loader = new DefaultResourceLoader({
+		cwd: root,
+		agentDir: join(root, "agent"),
+		additionalExtensionPaths: commandLineExtensionPaths(["pi", "--extension", extension]),
+	});
+	await loader.reload();
+	assert.ok(loader.getExtensions().extensions.some((item) => item.resolvedPath === extension));
+});
 
 test("Task session host isolates Tasks, reuses a session, and reopens it after restart", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-task-sessions-"));
@@ -325,4 +376,19 @@ test("extension containment uses path boundaries", () => {
 	assert.equal(isPathInside(join(root, "extensions", "index.ts"), root), true);
 	assert.equal(isPathInside(`${root}-extra`, root), false);
 	assert.equal(isPathInside("relative/extension.ts", "relative"), true);
+});
+
+test("extension containment resolves symlinked package paths before excluding Channels", async () => {
+	const sandbox = await mkdtemp(join(tmpdir(), "channels-package-link-"));
+	try {
+		const packageRoot = join(sandbox, "real", "channels");
+		const extension = join(packageRoot, "extensions", "runtime-extension.mjs");
+		const linkedExtension = join(sandbox, "linked-extension.mjs");
+		await mkdir(join(packageRoot, "extensions"), { recursive: true });
+		await writeFile(extension, "export default function extension() {}\n");
+		await symlink(extension, linkedExtension);
+		assert.equal(isPathInside(linkedExtension, packageRoot), true);
+	} finally {
+		await rm(sandbox, { recursive: true, force: true });
+	}
 });
