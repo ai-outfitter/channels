@@ -66,6 +66,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.12.2](https://github.com/ai-outfitter/channels/compare/v1.12.1...v1.12.2) (2026-10-12)
+
+
+### Bug Fixes
+
+* **task-plane:** inherit selected extensions in task sessions ([#80](https://github.com/ai-outfitter/channels/issues/80)) ([152bb7e](https://github.com/ai-outfitter/channels/commit/152bb7e273ba2d8d8ce841ba8f2f02a37b0619a3))
+
 ## [1.12.1](https://github.com/ai-outfitter/channels/compare/v1.12.0...v1.12.1) (2026-09-18)
 
 
