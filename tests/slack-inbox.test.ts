@@ -476,3 +476,35 @@ it("delivers a signed webhook through the durable inbox into a real task store a
 		await rm(root, { recursive: true, force: true });
 	}
 });
+
+it("rebinding a resident to another workspace/app cannot read or acknowledge its previous queue", async () => {
+	const { database, env, get } = fixture();
+	try {
+		await handleSlackInbox(signed(event), env);
+		const configured = JSON.parse(env.SLACK_RESIDENT_BINDINGS) as ResidentSlackBinding[];
+		const first = configured[0];
+		assert.ok(first);
+		first.workspaceId = "TNEW";
+		first.appId = "ANEW";
+		env.SLACK_RESIDENT_BINDINGS = JSON.stringify(configured);
+		assert.equal(
+			((await (await get(binding.deliveryToken)).json()) as { events: unknown[] }).events.length,
+			0,
+		);
+		await handleSlackInbox(
+			new Request("https://inbox.example/events/ack", {
+				method: "POST",
+				headers: { Authorization: `Bearer ${binding.deliveryToken}` },
+				body: JSON.stringify({ eventIds: [event.event_id] }),
+			}),
+			env,
+		);
+		assert.equal(
+			database.prepare("SELECT acknowledgedAt FROM resident_slack_events").get()?.acknowledgedAt,
+			null,
+		);
+		assert.notEqual(database.prepare("SELECT body FROM resident_slack_events").get()?.body, "{}");
+	} finally {
+		database.close();
+	}
+});

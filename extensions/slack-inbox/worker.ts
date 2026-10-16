@@ -209,9 +209,16 @@ async function deliver(
 			? ` AND json_extract(body,'$.event.channel') IN (${bound.channelIds.map(() => "?").join(",")})`
 			: "";
 		const rows = await env.DB.prepare(
-			`SELECT eventId,body FROM resident_slack_events WHERE organizationId=? AND residentId=? AND acknowledgedAt IS NULL AND createdAt >= ?${channelFilter} ORDER BY createdAt,eventId LIMIT 20`,
+			`SELECT eventId,body FROM resident_slack_events WHERE organizationId=? AND residentId=? AND acknowledgedAt IS NULL AND createdAt >= ? AND json_extract(body,'$.team_id')=? AND json_extract(body,'$.api_app_id')=?${channelFilter} ORDER BY createdAt,eventId LIMIT 20`,
 		)
-			.bind(bound.organizationId, bound.residentId, Date.now() - 86_400_000, ...bound.channelIds)
+			.bind(
+				bound.organizationId,
+				bound.residentId,
+				Date.now() - 86_400_000,
+				bound.workspaceId,
+				bound.appId,
+				...bound.channelIds,
+			)
 			.all<{ eventId: string; body: string }>();
 		return Response.json(
 			{
@@ -234,9 +241,16 @@ async function deliver(
 			return new Response("Invalid acknowledgement", { status: 400 });
 		for (const id of body.eventIds)
 			await env.DB.prepare(
-				"UPDATE resident_slack_events SET acknowledgedAt=?, body='{}' WHERE organizationId=? AND residentId=? AND eventId=?",
+				"UPDATE resident_slack_events SET acknowledgedAt=?, body='{}' WHERE organizationId=? AND residentId=? AND eventId=? AND json_extract(body,'$.team_id')=? AND json_extract(body,'$.api_app_id')=?",
 			)
-				.bind(Date.now(), bound.organizationId, bound.residentId, id)
+				.bind(
+					Date.now(),
+					bound.organizationId,
+					bound.residentId,
+					id,
+					bound.workspaceId,
+					bound.appId,
+				)
 				.run();
 		return new Response("Acknowledged");
 	}
