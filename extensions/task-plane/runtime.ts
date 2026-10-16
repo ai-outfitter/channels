@@ -115,6 +115,21 @@ export async function startChannelsRuntime(
 	// 3-4. The task plane/sink and queue now exist. Hook registration is owned
 	// by the caller's single Pi entrypoint before it invokes this start routine.
 
+	const maintain = async () => {
+		for (const taskId of await tasks.expireIdle()) {
+			await wakeQueue.cancelTask(taskId);
+			log({ event: "task_idle_expired", taskId });
+		}
+	};
+	await maintain();
+	let maintenance: Promise<void> = Promise.resolve();
+	const maintenanceTimer = setInterval(() => {
+		maintenance = maintenance
+			.then(maintain)
+			.catch((error) => log({ event: "task_maintenance_failed", error: errorMessage(error) }));
+	}, 60_000);
+	maintenanceTimer.unref();
+
 	const stops: Array<() => Promise<void>> = [];
 	const buffered: Array<() => void> = [];
 	let intakeOpen = false;
@@ -338,7 +353,9 @@ export async function startChannelsRuntime(
 	} catch (error) {
 		deliveryOpen = false;
 		intakeOpen = false;
+		clearInterval(maintenanceTimer);
 		await wakeQueue.stop();
+		await maintenance;
 		for (const stop of stops.reverse()) await stop().catch(() => {});
 		await drainDeliveries();
 		log({ event: "channels_unhealthy", error: errorMessage(error) });
@@ -352,12 +369,15 @@ export async function startChannelsRuntime(
 		sourceSink,
 		wakeQueue,
 		async close() {
+			clearInterval(maintenanceTimer);
 			deliveryOpen = false;
 			// Preserve startup order at the boundary: sources stop accepting native
 			// events before the plane closes intake underneath an in-flight callback.
 			for (const stop of stops.reverse()) await stop().catch(() => {});
 			intakeOpen = false;
+			clearInterval(maintenanceTimer);
 			await wakeQueue.stop();
+			await maintenance;
 			await drainDeliveries();
 		},
 	};
