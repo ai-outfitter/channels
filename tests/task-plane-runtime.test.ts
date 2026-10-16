@@ -1449,7 +1449,7 @@ it("bounds rejecting wake delivery with timer backoff and durable failure eviden
 	}, 5);
 	const claim = journal.claims()[0] as ReturnType<ActivationJournal["claims"]>[number];
 	queue.enqueue(claim);
-	await waitFor(() => timerFired && journal.isWakeFailed(claim.activationId));
+	await waitFor(() => timerFired && logs.some((record) => record.event === "a2a_wake_abandoned"));
 	assert.equal(timerFired, true);
 	assert.equal(attempts, 3);
 	assert.equal(journal.isWakeFailed(claim.activationId), true);
@@ -1842,7 +1842,8 @@ it("retries delivery-cap finalization when durable failure evidence cannot be wr
 		},
 	);
 	queue.enqueue(claim);
-	await waitFor(() => journal.isWakeFailed(claim.activationId));
+	await waitFor(() => logs.some((record) => record.event === "a2a_wake_abandoned"));
+	assert.equal((await tasks.lookup(claim.taskId))?.task.status.state, "TASK_STATE_FAILED");
 	assert.equal(turns, 0);
 	assert.equal(failOnce, false);
 	assert.ok(logs.some((record) => record.event === "a2a_wake_failure_evidence_failed"));
@@ -3071,4 +3072,28 @@ it("publishes one stateless Pi entrypoint that reloads with Jiti moduleCache dis
 	);
 	assert.equal(typeof first.default, "function");
 	assert.equal(typeof second.default, "function");
+});
+
+it("repairs durable failed wake tasks on restart without replaying them", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-failed-wake-repair-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("failed-wake-repair"));
+	await tasks.updateStatus("source:user", accepted.taskId, { state: "TASK_STATE_WORKING" });
+	const claim = journal.claims()[0];
+	assert.ok(claim);
+	await journal.append({
+		kind: "WAKE_FAILED",
+		activationId: claim.activationId,
+		attempts: MAX_WAKE_DELIVERIES,
+		error: "exhausted",
+		failedAt: new Date().toISOString(),
+	});
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: () => assert.fail("failed wake replayed") },
+		tasks,
+		journal,
+	);
+	await queue.replay();
+	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_FAILED");
+	await queue.stop();
 });

@@ -352,6 +352,29 @@ export class A2aTaskStore {
 		});
 	}
 
+	/** Settle a permanently undeliverable runnable task without overwriting newer work. */
+	async failRunnable(taskId: string, reason: string, expected: A2aTask): Promise<boolean> {
+		return this.#run(async () => {
+			const stored = this.#data.tasks[taskId];
+			if (
+				!stored ||
+				stored.task !== expected ||
+				!["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"].includes(stored.task.status.state)
+			)
+				return false;
+			await this.#replace(stored, {
+				...stored.task,
+				status: {
+					state: "TASK_STATE_FAILED",
+					timestamp: new Date().toISOString(),
+					message: { messageId: randomUUID(), role: "ROLE_AGENT", parts: [{ text: reason }] },
+				},
+			});
+			this.#notifyExpired(taskId);
+			return true;
+		});
+	}
+
 	#notifyExpired(id: string): void {
 		const task = this.#data.tasks[id]?.task;
 		if (!task) return;

@@ -319,3 +319,8 @@ every minute thereafter; expiry releases task sessions and notifies live A2A
 subscribers. A turn lasting 24 hours must record meaningful progress to continue.
 Failure evidence remains durable for the normal terminal-task retention window.
 Older version-1 stores use their saved update time until new progress is recorded.
+
+A durable `WAKE_FAILED` for the newest accepted activation now settles a runnable
+task as FAILED. Startup repairs older exhausted records without redelivering them.
+Waiting tasks and newer continuation claims are preserved. Failure evidence is
+written before task settlement so a crash between those writes can be repaired.
