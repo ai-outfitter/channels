@@ -8,6 +8,7 @@ import { DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding
 import { derivedId } from "../extensions/task-plane/serialize.ts";
 import {
 	commandLineExtensionPaths,
+	commandLinePromptSources,
 	isPathInside,
 	type TaskSessionFactory,
 	type TaskSessionFactoryInput,
@@ -391,4 +392,27 @@ test("extension containment resolves symlinked package paths before excluding Ch
 	} finally {
 		await rm(sandbox, { recursive: true, force: true });
 	}
+});
+
+test("preserves catalog system and appended prompts for resident task sessions", () => {
+	assert.deepEqual(
+		commandLinePromptSources([
+			"pi",
+			"--system-prompt",
+			"/private/catalog-agent.md",
+			"--append-system-prompt",
+			"/private/skills.md",
+			"--append-system-prompt",
+			"Additional instruction",
+		]),
+		{
+			systemPrompt: "/private/catalog-agent.md",
+			appendSystemPrompt: ["/private/skills.md", "Additional instruction"],
+		},
+	);
+	assert.throws(() => commandLinePromptSources(["pi", "--system-prompt"]), /Missing value/);
+	assert.deepEqual(commandLinePromptSources(["pi"]), {});
+	assert.deepEqual(commandLinePromptSources(["pi", "--append-system-prompt=Extra"]), {
+		appendSystemPrompt: ["Extra"],
+	});
 });

@@ -336,9 +336,14 @@ its bio through a task-session system-prompt hook. A bio change applies at the
 next task turn, including an existing task session; it does not interrupt a turn.
 
 The runtime writes `resident-runtime.v1.json` beside its task store. It contains
-only a timestamp, loopback Chrome probe state and the last profile revision used
+only a timestamp, loopback Chrome probe state, resident ID, bio digest and the last profile revision used
 in a task prompt. It contains no bio, credentials, browser URLs or page contents.
 A fresh file is not evidence that a downloaded profile has been used: the applied
 revision advances only when the prompt hook runs. An unreadable profile endpoint
 preserves the last validated bio; a restart has no cached bio until a successful
 read. Snapshot readers must enforce their own freshness limit.
+
+Resolved catalog system-prompt and appended-prompt arguments are preserved in
+isolated task sessions before the organization bio is appended. Acknowledgements
+include the resident ID and bio digest, preventing a recreated resident or a
+rolled-back definition from matching an unrelated revision number.

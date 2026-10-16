@@ -40,6 +40,8 @@ it("reports a verified loopback browser and acknowledges only a profile used in 
 		assert.equal(runtime.bioForPrompt(), "Example bio 1");
 		await runtime.refresh();
 		assert.equal((await snapshot()).profileAppliedRevision, 1);
+		assert.equal((await snapshot()).profileResidentId, "example-resident");
+		assert.match((await snapshot()).profileBioDigest, /^[a-f0-9]{64}$/);
 		revision = 2;
 		await runtime.refresh();
 		assert.equal((await snapshot()).profileAppliedRevision, 1);

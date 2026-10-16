@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { atomicWrite } from "./stores.ts";
 
@@ -7,6 +8,8 @@ export interface ResidentRuntimeSnapshot {
 	readonly observedAt: number;
 	readonly browser: "ready" | "unavailable" | "not-configured";
 	readonly profileAppliedRevision: number | null;
+	readonly profileResidentId: string | null;
+	readonly profileBioDigest: string | null;
 }
 
 /** Private runtime configuration, independent of catalog profile identity. */
@@ -15,6 +18,8 @@ export class ResidentRuntime {
 	readonly #fetch: typeof fetch;
 	#profile: Profile | undefined;
 	#appliedRevision: number | null = null;
+	#appliedResidentId: string | null = null;
+	#appliedBioDigest: string | null = null;
 	#root: string | undefined;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#pending: Promise<void> = Promise.resolve();
@@ -28,6 +33,10 @@ export class ResidentRuntime {
 	/** Called by the task session's system-prompt hook, never by a channel message. */
 	bioForPrompt(): string {
 		this.#appliedRevision = this.#profile?.revision ?? null;
+		this.#appliedResidentId = this.#profile?.residentId ?? null;
+		this.#appliedBioDigest = this.#profile
+			? createHash("sha256").update(this.#profile.bio).digest("hex")
+			: null;
 		return this.#profile?.bio ?? "";
 	}
 
@@ -71,6 +80,8 @@ export class ResidentRuntime {
 				observedAt: Date.now(),
 				browser,
 				profileAppliedRevision: this.#appliedRevision,
+				profileResidentId: this.#appliedResidentId ?? this.#env.OUTFITTER_RESIDENT_ID ?? null,
+				profileBioDigest: this.#appliedBioDigest,
 			} satisfies ResidentRuntimeSnapshot);
 	}
 

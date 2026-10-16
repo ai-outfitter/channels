@@ -20,6 +20,7 @@ import { ResidentRuntime } from "./task-plane/resident-runtime.ts";
 import { type RunningChannelsRuntime, startChannelsRuntime } from "./task-plane/runtime.ts";
 import {
 	commandLineExtensionPaths,
+	commandLinePromptSources,
 	TaskSessionHost,
 	type TaskSessionHostOptions,
 	type TaskTurnRunner,
@@ -193,6 +194,7 @@ export default function channelsRuntimeExtension(
 			customTools: taskTools,
 			residentBio: () => residentRuntime.bioForPrompt(),
 			additionalExtensionPaths: commandLineExtensionPaths(process.argv),
+			promptSources: commandLinePromptSources(process.argv),
 			excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 			log,
 		};
