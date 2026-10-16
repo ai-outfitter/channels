@@ -23,13 +23,31 @@ export function slackDevConfig(env: NodeJS.ProcessEnv = process.env): SlackDevCo
 	const botToken = env.SLACK_BOT_TOKEN?.trim();
 	const channelIds = [...parseSlackChannelIds(env.SLACK_CHANNEL_IDS)];
 
-	if (!appToken?.startsWith("xapp-")) {
+	const inboxUrl = env.OUTFITTER_SLACK_EVENTS_URL?.trim();
+	const inboxToken = env.OUTFITTER_SLACK_EVENTS_TOKEN?.trim();
+	if (Boolean(inboxUrl) !== Boolean(inboxToken))
+		throw new Error("Slack inbox URL and token must be configured together");
+	if (inboxUrl && !env.OUTFITTER_RESIDENT_ID?.trim())
+		throw new Error("Slack inbox requires a resident ID");
+	if (inboxUrl) {
+		const url = new URL(inboxUrl);
+		if (
+			url.protocol !== "https:" ||
+			url.pathname !== "/events" ||
+			url.username ||
+			url.password ||
+			url.search ||
+			url.hash
+		)
+			throw new Error("Invalid Slack inbox URL");
+	}
+	if (!inboxUrl && !appToken?.startsWith("xapp-")) {
 		throw new Error("SLACK_APP_TOKEN must be an xapp- Socket Mode token");
 	}
 	if (!botToken?.startsWith("xoxb-")) {
 		throw new Error("SLACK_BOT_TOKEN must be an xoxb- bot token");
 	}
-	return { appToken, botToken, channelIds };
+	return { appToken: appToken ?? "", botToken, channelIds };
 }
 
 export async function runSlackPreflight(
@@ -80,7 +98,11 @@ async function main(): Promise<void> {
 	} else {
 		console.log("Listening for mentions in every channel the bot has joined.");
 	}
-	console.log("The Socket Mode app token will be verified when the resident connection starts.");
+	console.log(
+		config.appToken
+			? "The Socket Mode app token will be verified when the resident connection starts."
+			: "The shared inbox binding will be verified when the resident connection starts.",
+	);
 }
 
 function slackErrorCode(error: unknown): string | undefined {

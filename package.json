@@ -26,6 +26,7 @@
 	],
 	"files": [
 		"dist",
+		"deploy/slack-inbox",
 		"extensions",
 		"docs"
 	],

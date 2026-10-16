@@ -203,3 +203,12 @@ credential auto-detection select the available channels.
    downgrade instead and keeps waking on mail.)
 5. No mail arriving → no Task-session turns run between heartbeats.
 6. Quit/reload → the EventSource is closed by `session_shutdown` (no orphan).
+
+Resident deployments may use the shared Slack HTTP inbox instead of Socket Mode.
+Set `SLACK_BOT_TOKEN`, `OUTFITTER_SLACK_EVENTS_URL`,
+`OUTFITTER_SLACK_EVENTS_TOKEN`, and `OUTFITTER_RESIDENT_ID`; see
+[shared inbox deployment](../deploy/slack-inbox/README.md). The inbox takes
+precedence when both transports are configured. No `SLACK_APP_TOKEN` is required
+for inbox mode. Bot workspace identity and resident binding are checked before
+native task acceptance, and permanent intake failures are recorded before being
+acknowledged so newer mentions can proceed.

@@ -7,16 +7,23 @@
  * trusted wake. The Slack responder fetches context and replies with the bot
  * token through the Web API.
  */
+import { setTimeout as delay } from "node:timers/promises";
 import { SocketModeClient } from "@slack/socket-mode";
 import {
 	type ConversationsHistoryResponse,
 	type ConversationsRepliesResponse,
 	WebClient,
 } from "@slack/web-api";
+import { readBody } from "../slack-inbox/body.ts";
 import { derivedId } from "../task-plane/serialize.ts";
-import { contentDigest, sourceIdentifier } from "../task-plane/source-activation.ts";
+import {
+	contentDigest,
+	permanentIntakeFailure,
+	sourceIdentifier,
+} from "../task-plane/source-activation.ts";
 import type { SourceTaskActivationSink } from "../task-plane/types.ts";
 import { compareSlackTimestamps, parseSlackChannelIds } from "./slack-config.ts";
+import { readSlackHuddles } from "./slack-huddles.ts";
 import type {
 	ChannelActions,
 	ChannelContextMessage,
@@ -37,6 +44,10 @@ const MAX_THREAD_PAGES = 20;
 export interface SlackConfig {
 	/** App-level token (`xapp-…`) with `connections:write`, for Socket Mode. */
 	appToken: string;
+	inboxUrl?: string;
+	inboxToken?: string;
+	residentId?: string;
+	workspaceId?: string;
 	/** Bot token (`xoxb-…`) validated here and used by the responder's Web API calls. */
 	botToken: string;
 	/** Explicit channel allowlist; empty = every channel the bot has joined. */
@@ -56,6 +67,7 @@ type SlackMessage =
 export interface SlackClientFactories {
 	socket(appToken: string): SocketModeClient;
 	web(botToken: string): WebClient;
+	inbox?: typeof fetch;
 }
 
 const defaultClients: SlackClientFactories = {
@@ -73,10 +85,19 @@ interface SlackEnvelope {
 export function slackConfigFromEnv(): SlackConfig | undefined {
 	const appToken = process.env.SLACK_APP_TOKEN?.trim();
 	const botToken = process.env.SLACK_BOT_TOKEN?.trim();
-	if (!appToken || !botToken) return undefined;
+	const inboxUrl = process.env.OUTFITTER_SLACK_EVENTS_URL?.trim();
+	const inboxToken = process.env.OUTFITTER_SLACK_EVENTS_TOKEN?.trim();
+	if (Boolean(inboxUrl) !== Boolean(inboxToken))
+		throw new Error("Slack inbox URL and token must be configured together");
+	if (inboxUrl && !process.env.OUTFITTER_RESIDENT_ID?.trim())
+		throw new Error("Slack inbox requires a resident ID");
+	if (!botToken || (!appToken && !(inboxUrl && inboxToken))) return undefined;
 	return {
-		appToken,
+		appToken: appToken ?? "",
 		botToken,
+		...(inboxUrl && inboxToken
+			? { inboxUrl, inboxToken, residentId: process.env.OUTFITTER_RESIDENT_ID?.trim() ?? "" }
+			: {}),
 		channelIds: parseSlackChannelIds(process.env.SLACK_CHANNEL_IDS),
 	};
 }
@@ -164,7 +185,13 @@ export function createSlackActions(
 				channel: "slack",
 				locator,
 				handled: hasOwnReaction(target, cfg.doneEmoji, ownUserId),
-				messages: messages.map((message) => contextMessage(message, decoded.messageTs)),
+				messages: [
+					...messages.map((message) => contextMessage(message, decoded.messageTs)),
+					...(await readSlackHuddles(
+						messages.flatMap((message) => message.files ?? []),
+						(id) => web.files.info({ file: id }),
+					)),
+				],
 			};
 		},
 
@@ -445,9 +472,132 @@ export function createSlackSource(
 	retryMs ??= RECONNECT_DELAY_MS;
 	return {
 		async start() {
-			return supervise((signal) => runSlackAttempt(cfg, clients, signal, taskSink), log, retryMs);
+			return supervise(
+				(signal) =>
+					cfg.inboxUrl
+						? runSlackInbox(
+								cfg,
+								clients.web(cfg.botToken),
+								signal,
+								taskSink,
+								clients.inbox ?? fetch,
+							)
+						: runSlackAttempt(cfg, clients, signal, taskSink),
+				log,
+				retryMs,
+			);
 		},
 	};
+}
+
+function slackInboxEndpoint(cfg: SlackConfig): URL {
+	const endpoint = new URL(cfg.inboxUrl ?? "");
+	if (
+		endpoint.protocol !== "https:" ||
+		endpoint.username ||
+		endpoint.password ||
+		endpoint.search ||
+		endpoint.hash ||
+		endpoint.pathname !== "/events" ||
+		!cfg.inboxToken
+	)
+		throw new Error("Invalid Slack inbox configuration");
+	return endpoint;
+}
+
+async function acceptInboxEvent(
+	event: { eventId: string; body: unknown },
+	cfg: SlackConfig,
+	taskSink: SourceTaskActivationSink,
+): Promise<void> {
+	if (
+		!event ||
+		typeof event !== "object" ||
+		typeof event.eventId !== "string" ||
+		event.eventId.length > 128
+	)
+		throw new Error("Invalid Slack inbox event");
+	let acknowledged = false;
+	try {
+		await handleSlackEnvelope(
+			{
+				type: "events_api",
+				body: event.body,
+				ack: async () => {
+					acknowledged = true;
+				},
+			},
+			cfg.channelIds,
+			taskSink,
+		);
+	} catch (error) {
+		const permanent = permanentIntakeFailure(error);
+		if (!permanent || !taskSink.recordEvidence) throw error;
+		await recordNonWorkSlackEnvelope(taskSink, event.body, permanent.kind);
+		acknowledged = true;
+	}
+	if (!acknowledged) throw new Error("Slack inbox event was not accepted");
+}
+
+export async function pollSlackInbox(
+	cfg: SlackConfig,
+	taskSink: SourceTaskActivationSink,
+	signal: AbortSignal,
+	transport: typeof fetch = fetch,
+): Promise<void> {
+	const endpoint = slackInboxEndpoint(cfg);
+	const headers = { Authorization: `Bearer ${cfg.inboxToken}`, "Content-Type": "application/json" };
+	const response = await transport(endpoint, {
+		headers,
+		redirect: "error",
+		signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+	});
+	if (!response.ok) throw new Error("Slack inbox unavailable");
+	const text = await readBody(response, 1_500_000);
+	const value = JSON.parse(text) as {
+		residentId?: string;
+		workspaceId?: string;
+		events?: Array<{ eventId: string; body: unknown }>;
+	};
+	if (
+		!cfg.residentId ||
+		value.residentId !== cfg.residentId ||
+		!cfg.workspaceId ||
+		value.workspaceId !== cfg.workspaceId
+	)
+		throw new Error("Slack inbox binding mismatch");
+	if (!Array.isArray(value.events) || value.events.length > 20)
+		throw new Error("Invalid Slack inbox response");
+	for (const event of value.events) {
+		await acceptInboxEvent(event, cfg, taskSink);
+		const ack = new URL(endpoint);
+		ack.pathname = "/events/ack";
+		const result = await transport(ack, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ eventIds: [event.eventId] }),
+			redirect: "error",
+			signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+		});
+		if (!result.ok) throw new Error("Slack inbox acknowledgement failed");
+	}
+}
+
+async function runSlackInbox(
+	cfg: SlackConfig,
+	web: WebClient,
+	signal: AbortSignal,
+	sink: SourceTaskActivationSink,
+	transport: typeof fetch,
+): Promise<void> {
+	const auth = await web.auth.test();
+	assertSlackOk(auth, "auth.test");
+	if (!auth.user_id || !auth.team_id) throw new Error("Slack bot workspace identity unavailable");
+	const bound = { ...cfg, workspaceId: auth.team_id };
+	while (!signal.aborted) {
+		await pollSlackInbox(bound, sink, signal, transport);
+		await delay(5000, undefined, { signal });
+	}
 }
 
 async function runSlackAttempt(
