@@ -3097,3 +3097,47 @@ it("repairs durable failed wake tasks on restart without replaying them", async 
 	assert.equal((await tasks.lookup(accepted.taskId))?.task.status.state, "TASK_STATE_FAILED");
 	await queue.stop();
 });
+
+it("preserves a newer continuation granted during failed-wake reconciliation", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-failure-continuation-race-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const accepted = await plane.accept(activation("old-failed-wake"));
+	await tasks.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_INPUT_REQUIRED",
+		message: { messageId: "question", role: "ROLE_AGENT", parts: [{ text: "Continue?" }] },
+	});
+	const old = journal.claims()[0];
+	assert.ok(old);
+	await journal.append({
+		kind: "WAKE_FAILED",
+		activationId: old.activationId,
+		attempts: MAX_WAKE_DELIVERIES,
+		error: "exhausted",
+		failedAt: new Date().toISOString(),
+	});
+	const prompts: string[] = [];
+	const queue = new DurableWakeQueue(
+		{
+			sendUserMessage: (prompt) => {
+				prompts.push(String(prompt));
+			},
+		},
+		tasks,
+		journal,
+	);
+	const lookup = tasks.lookup.bind(tasks);
+	tasks.lookup = async (taskId) => {
+		tasks.lookup = lookup;
+		await plane.continue({ ...activation("new-answer"), taskId: accepted.taskId });
+		const newer = journal.claims().at(-1);
+		assert.ok(newer);
+		queue.enqueue(newer);
+		await waitFor(() => prompts.length === 1);
+		return lookup(taskId);
+	};
+	await queue.replay();
+	assert.equal((await lookup(accepted.taskId))?.task.status.state, "TASK_STATE_WORKING");
+	assert.equal(await queue.hasAuthority(accepted.taskId), true);
+	assert.equal(journal.isWoken(old.activationId), false);
+	await queue.stop();
+});
