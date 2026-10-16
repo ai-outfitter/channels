@@ -324,3 +324,21 @@ A durable `WAKE_FAILED` for the newest accepted activation now settles a runnabl
 task as FAILED. Startup repairs older exhausted records without redelivering them.
 Waiting tasks and newer continuation claims are preserved. Failure evidence is
 written before task settlement so a crash between those writes can be repaired.
+
+### Organization-owned resident profile and browser reports
+
+A resident can read its owner-managed bio from an HTTPS `/resident-profile`
+endpoint configured with `OUTFITTER_RESIDENT_PROFILE_URL`,
+`OUTFITTER_RESIDENT_PROFILE_TOKEN`, and the pinned `OUTFITTER_RESIDENT_ID`.
+These deployment values never belong in a catalog profile. The runtime polls
+at startup and every 30 seconds, validates the resident/revision, and appends
+its bio through a task-session system-prompt hook. A bio change applies at the
+next task turn, including an existing task session; it does not interrupt a turn.
+
+The runtime writes `resident-runtime.v1.json` beside its task store. It contains
+only a timestamp, loopback Chrome probe state and the last profile revision used
+in a task prompt. It contains no bio, credentials, browser URLs or page contents.
+A fresh file is not evidence that a downloaded profile has been used: the applied
+revision advances only when the prompt hook runs. An unreadable profile endpoint
+preserves the last validated bio; a restart has no cached bio until a successful
+read. Snapshot readers must enforce their own freshness limit.

@@ -6,6 +6,7 @@ import { errorMessage } from "../sources/util.ts";
 import { type ActivationClaim, ActivationJournal } from "./journal.ts";
 import { OriginStore } from "./origins.ts";
 import { createTaskPlane, type TaskPlane } from "./plane.ts";
+import type { ResidentRuntime } from "./resident-runtime.ts";
 import { derivedId } from "./serialize.ts";
 import {
 	ActivationEvidenceStore,
@@ -29,6 +30,7 @@ export interface RuntimeListener {
 
 export interface RuntimeDependencies {
 	readonly storePath: string;
+	readonly residentRuntime?: ResidentRuntime;
 	readonly originStorePath?: string;
 	readonly agentInterface: string;
 	readonly sources: readonly RuntimeSource[];
@@ -308,6 +310,7 @@ export async function startChannelsRuntime(
 	};
 	dependencies.taskPlaneReady?.(taskPlane, wakeQueue, sourceSink);
 	try {
+		if (dependencies.residentRuntime) stops.push(await dependencies.residentRuntime.start(root));
 		// 5. Sources start with a closed intake gate. Even if one source invokes
 		// its sink during start, no activation can enter until every start wins.
 		const sourceResults = await Promise.allSettled(
