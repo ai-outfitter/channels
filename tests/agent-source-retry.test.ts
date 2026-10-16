@@ -3,11 +3,11 @@ import test from "node:test";
 import type { AgentTransport } from "../extensions/agent/types.ts";
 import { createAgentSource } from "../extensions/sources/agent.ts";
 
-const config = { endpointId: "link:vega", principalId: "link:vega", spoolPath: "" };
+const config = { endpointId: "link:atlas", principalId: "link:atlas", spoolPath: "" };
 
 function transportWith(subscribe: AgentTransport["subscribe"]): AgentTransport {
 	return {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		subscribe,
 		async close() {},
 	} as unknown as AgentTransport;
@@ -39,7 +39,7 @@ test("stopping during retry cancels cleanly and closes the transport", async () 
 	let attempts = 0;
 	let closed = false;
 	const transport = {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		async subscribe() {
 			attempts += 1;
 			throw new Error("always down");
@@ -63,7 +63,7 @@ function message(id: string) {
 		id,
 		conversationId: "conversation-1",
 		sender: "link:drago",
-		recipient: "link:vega",
+		recipient: "link:atlas",
 		createdAt: "2026-08-15T12:00:00.000Z",
 		body: "work",
 	};

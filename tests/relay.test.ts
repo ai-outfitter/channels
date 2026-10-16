@@ -788,7 +788,7 @@ test("configFromEnv keeps broker policy on AGENT_RELAY_* variables only", async 
 		process.env.AGENT_RELAY_STORE_PATH = join(root, "store.json");
 		// The client transport's identity variable must never leak into broker
 		// policy: no singleton fallback, no wide bind, just because it is set.
-		process.env.AGENT_ENDPOINT_ID = "link:vega";
+		process.env.AGENT_ENDPOINT_ID = "link:atlas";
 		delete process.env.AGENT_RELAY_SINGLETON_ENDPOINTS;
 		delete process.env.AGENT_RELAY_HOST;
 		delete process.env.AGENT_RELAY_TLS_KEY_PATH;
@@ -799,9 +799,9 @@ test("configFromEnv keeps broker policy on AGENT_RELAY_* variables only", async 
 		assert.equal(config.host, "127.0.0.1");
 
 		// Folding is enabled only by its own explicit variable.
-		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS = "link:vega link:rigel";
+		process.env.AGENT_RELAY_SINGLETON_ENDPOINTS = "link:atlas link:rigel";
 		const explicit = await configFromEnv();
-		assert.deepEqual(explicit.singletonEndpoints, ["link:vega", "link:rigel"]);
+		assert.deepEqual(explicit.singletonEndpoints, ["link:atlas", "link:rigel"]);
 
 		// A missing store path refuses to start rather than opening an empty
 		// store somewhere the operator did not choose.

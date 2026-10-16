@@ -124,7 +124,7 @@ the [source conformance matrix](./a2a-source-conformance.md).
   ```text
   event: calendarAlert
   data: {"@type":"CalendarAlert","accountId":"i","calendarEventId":"b",
-         "uid":"vega-cron-probe-001","recurrenceId":null,"alertId":"a1"}
+         "uid":"atlas-cron-probe-001","recurrenceId":null,"alertId":"a1"}
   ```
 
   Stalwart's `calendar-alarm.minTriggerInterval` (default one hour per account)

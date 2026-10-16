@@ -40,3 +40,9 @@ source evidence before acknowledgement; transient failures retain the event.
 Only native mention fields are stored, excluding Slack's deprecated verification
 token and unrelated metadata. Acknowledgement clears the message body immediately;
 the retained deduplication row contains only routing/event IDs and timestamps.
+
+For initial app creation, omit `requestUrl` from the private input. This generates
+a bot/scopes-only manifest. Create/install that app, provision its identity and
+signing secret in the shared service, then generate the manifest again with
+`requestUrl` to enable and verify webhook delivery. This avoids requiring a
+signing secret before Slack has created the app.

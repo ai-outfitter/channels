@@ -210,7 +210,7 @@ test("stays silent for activity that does not involve this account", async () =>
 		[`${API}/notifications?`]: { body: [thread(3, "Pull")] },
 		[`${API}/repos/o/r/pulls/1`]: {
 			// Someone else's review request, and assigned to someone else.
-			body: { requested_reviewers: [{ login: "vega" }], assignees: [{ login: "luce" }] },
+			body: { requested_reviewers: [{ login: "atlas" }], assignees: [{ login: "mira" }] },
 		},
 	});
 	const events: unknown[] = [];
