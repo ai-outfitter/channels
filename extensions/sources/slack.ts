@@ -46,6 +46,7 @@ export interface SlackConfig {
 	appToken: string;
 	inboxUrl?: string;
 	inboxToken?: string;
+	inboxRevision?: string;
 	residentId?: string;
 	workspaceId?: string;
 	/** Bot token (`xoxb-…`) validated here and used by the responder's Web API calls. */
@@ -278,7 +279,7 @@ export function createSlackActions(
 	};
 }
 
-function decodeSlackLocator(locator: string): DecodedSlackLocator {
+export function decodeSlackLocator(locator: string): DecodedSlackLocator {
 	const [channel, version, encoded, extra] = locator.split(":");
 	if (
 		channel !== "slack" ||
@@ -498,7 +499,7 @@ function slackInboxEndpoint(cfg: SlackConfig): URL {
 		endpoint.password ||
 		endpoint.search ||
 		endpoint.hash ||
-		endpoint.pathname !== "/events" ||
+		!["/events", "/api/connectors/resident-slack/runtime/events"].includes(endpoint.pathname) ||
 		!cfg.inboxToken
 	)
 		throw new Error("Invalid Slack inbox configuration");
@@ -557,6 +558,7 @@ export async function pollSlackInbox(
 	const value = JSON.parse(text) as {
 		residentId?: string;
 		workspaceId?: string;
+		revision?: string;
 		events?: Array<{ eventId: string; body: unknown }>;
 	};
 	if (
@@ -566,12 +568,14 @@ export async function pollSlackInbox(
 		value.workspaceId !== cfg.workspaceId
 	)
 		throw new Error("Slack inbox binding mismatch");
+	if (cfg.inboxRevision && value.revision !== cfg.inboxRevision)
+		throw new Error("Slack inbox configuration changed");
 	if (!Array.isArray(value.events) || value.events.length > 20)
 		throw new Error("Invalid Slack inbox response");
 	for (const event of value.events) {
 		await acceptInboxEvent(event, cfg, taskSink);
 		const ack = new URL(endpoint);
-		ack.pathname = "/events/ack";
+		ack.pathname = `${endpoint.pathname}/ack`;
 		const result = await transport(ack, {
 			method: "POST",
 			headers,

@@ -46,3 +46,19 @@ a bot/scopes-only manifest. Create/install that app, provision its identity and
 signing secret in the shared service, then generate the manifest again with
 `requestUrl` to enable and verify webhook delivery. This avoids requiring a
 signing secret before Slack has created the app.
+
+### Platform-managed resident setup
+
+When the Resident Agent app manages bot authorization and channel grants, use
+`OUTFITTER_SLACK_CONFIG_URL` (HTTPS, exact
+`/api/connectors/resident-slack/runtime/config` path),
+`OUTFITTER_SLACK_RUNTIME_TOKEN`, and `OUTFITTER_RESIDENT_ID`. Include `slack` in an
+explicit `OUTFITTER_CHANNELS` selection while preserving existing sources.
+
+The resident-scoped workload credential is provisioned once by the service
+operator. Slack bot credentials stay in encrypted platform storage. The runtime
+receives only a pinned inbox URL, provider proxy URL, workspace and allowed
+channels. Changes are polled every 30 seconds; disconnects and unavailable
+configuration stop that source. Actions recheck configuration every time.
+This explicit managed configuration takes precedence over standalone Slack
+credentials and Socket Mode, and it does not reset source checkpoints or Tasks.
