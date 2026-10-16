@@ -47,7 +47,7 @@ export interface SlackConfig {
 	inboxUrl?: string;
 	inboxToken?: string;
 	inboxRevision?: string;
-	residentId?: string;
+	bindingId?: string;
 	workspaceId?: string;
 	/** Bot token (`xoxb-…`) validated here and used by the responder's Web API calls. */
 	botToken: string;
@@ -86,18 +86,18 @@ interface SlackEnvelope {
 export function slackConfigFromEnv(): SlackConfig | undefined {
 	const appToken = process.env.SLACK_APP_TOKEN?.trim();
 	const botToken = process.env.SLACK_BOT_TOKEN?.trim();
-	const inboxUrl = process.env.OUTFITTER_SLACK_EVENTS_URL?.trim();
-	const inboxToken = process.env.OUTFITTER_SLACK_EVENTS_TOKEN?.trim();
+	const inboxUrl = process.env.SLACK_EVENTS_URL?.trim();
+	const inboxToken = process.env.SLACK_EVENTS_TOKEN?.trim();
 	if (Boolean(inboxUrl) !== Boolean(inboxToken))
 		throw new Error("Slack inbox URL and token must be configured together");
-	if (inboxUrl && !process.env.OUTFITTER_RESIDENT_ID?.trim())
-		throw new Error("Slack inbox requires a resident ID");
+	if (inboxUrl && !process.env.SLACK_BINDING_ID?.trim())
+		throw new Error("Slack inbox requires a binding ID");
 	if (!botToken || (!appToken && !(inboxUrl && inboxToken))) return undefined;
 	return {
 		appToken: appToken ?? "",
 		botToken,
 		...(inboxUrl && inboxToken
-			? { inboxUrl, inboxToken, residentId: process.env.OUTFITTER_RESIDENT_ID?.trim() ?? "" }
+			? { inboxUrl, inboxToken, bindingId: process.env.SLACK_BINDING_ID?.trim() ?? "" }
 			: {}),
 		channelIds: parseSlackChannelIds(process.env.SLACK_CHANNEL_IDS),
 	};
@@ -499,7 +499,7 @@ function slackInboxEndpoint(cfg: SlackConfig): URL {
 		endpoint.password ||
 		endpoint.search ||
 		endpoint.hash ||
-		!["/events", "/api/connectors/resident-slack/runtime/events"].includes(endpoint.pathname) ||
+		endpoint.pathname.endsWith("/") ||
 		!cfg.inboxToken
 	)
 		throw new Error("Invalid Slack inbox configuration");
@@ -556,14 +556,14 @@ export async function pollSlackInbox(
 	if (!response.ok) throw new Error("Slack inbox unavailable");
 	const text = await readBody(response, 1_500_000);
 	const value = JSON.parse(text) as {
-		residentId?: string;
+		bindingId?: string;
 		workspaceId?: string;
 		revision?: string;
 		events?: Array<{ eventId: string; body: unknown }>;
 	};
 	if (
-		!cfg.residentId ||
-		value.residentId !== cfg.residentId ||
+		!cfg.bindingId ||
+		value.bindingId !== cfg.bindingId ||
 		!cfg.workspaceId ||
 		value.workspaceId !== cfg.workspaceId
 	)

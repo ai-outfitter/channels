@@ -8,22 +8,22 @@ import {
 } from "../extensions/sources/managed-slack.ts";
 import type { SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
-const origin = "https://resident.example.test";
+const origin = "https://service.example.test";
 const options = {
-	url: `${origin}/api/connectors/resident-slack/runtime/config`,
+	url: `${origin}/integrations/bot-config`,
 	token: "synthetic-runtime-scoped-credential",
-	residentId: "synthetic-resident",
+	bindingId: "synthetic-resident",
 };
 const config = {
-	residentId: options.residentId,
+	bindingId: options.bindingId,
 	workspaceId: "T0123456789",
 	revision: "one",
 	channelIds: ["C0123456789"],
-	inboxUrl: `${origin}/api/connectors/resident-slack/runtime/events`,
-	proxyUrl: `${origin}/api/connectors/resident-slack/runtime/slack/`,
+	inboxUrl: `${origin}/inbox/deliveries`,
+	proxyUrl: `${origin}/gateway/slack/`,
 };
 const sink = {} as SourceTaskActivationSink;
-test("managed Slack pins resident and endpoints without accepting provider credentials or arbitrary proxy hosts", async () => {
+test("managed Slack pins binding and endpoints without accepting provider credentials or arbitrary proxy hosts", async () => {
 	let value = config;
 	const transport: typeof fetch = async (_input, init) => {
 		assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${options.token}`);
@@ -31,10 +31,21 @@ test("managed Slack pins resident and endpoints without accepting provider crede
 		return Response.json(value);
 	};
 	assert.deepEqual(await readManagedSlack({ ...options, transport }), config);
-	value = { ...config, residentId: "another-resident" };
+	value = { ...config, bindingId: "another-resident" };
 	await assert.rejects(readManagedSlack({ ...options, transport }), /binding mismatch/);
-	value = { ...config, proxyUrl: "https://other.example.test/" };
-	await assert.rejects(readManagedSlack({ ...options, transport }), /binding mismatch/);
+	for (const overrides of [
+		{ proxyUrl: "https://other.example.test/" },
+		{ inboxUrl: "https://other.example.test/events" },
+		{ proxyUrl: `${origin}/proxy` },
+		{ inboxUrl: `${origin}/events/` },
+		{ proxyUrl: `${origin}/proxy/?token=secret` },
+		{ inboxUrl: `https://user:secret@service.example.test/events` },
+		{ inboxUrl: `${origin}/events#fragment` },
+		{ inboxUrl: `http://service.example.test/events` },
+	]) {
+		value = { ...config, ...overrides };
+		await assert.rejects(readManagedSlack({ ...options, transport }), /binding mismatch/);
+	}
 	assert.equal(
 		await readManagedSlack({
 			...options,
@@ -78,24 +89,24 @@ test("a disconnected managed Slack source waits without blocking or requiring So
 	assert.equal(calls, stopped);
 	assert.ok(calls >= 2);
 });
-test("managed Slack configuration requires a pinned resident and HTTPS platform path", () => {
+test("managed Slack configuration requires a pinned binding and HTTPS service URL", () => {
 	const previous = {
-		url: process.env.OUTFITTER_SLACK_CONFIG_URL,
-		token: process.env.OUTFITTER_SLACK_RUNTIME_TOKEN,
-		resident: process.env.OUTFITTER_RESIDENT_ID,
+		url: process.env.SLACK_CONFIG_URL,
+		token: process.env.SLACK_CONFIG_TOKEN,
+		resident: process.env.SLACK_BINDING_ID,
 	};
 	try {
-		process.env.OUTFITTER_SLACK_CONFIG_URL = "https://resident.example.test/wrong";
-		process.env.OUTFITTER_SLACK_RUNTIME_TOKEN = options.token;
-		process.env.OUTFITTER_RESIDENT_ID = options.residentId;
+		process.env.SLACK_CONFIG_URL = "http://service.example.test/config";
+		process.env.SLACK_CONFIG_TOKEN = options.token;
+		process.env.SLACK_BINDING_ID = options.bindingId;
 		assert.throws(() => managedSlackFromEnv(), /Invalid managed Slack endpoint/);
-		process.env.OUTFITTER_SLACK_CONFIG_URL = options.url;
-		assert.equal(managedSlackFromEnv()?.residentId, options.residentId);
+		process.env.SLACK_CONFIG_URL = options.url;
+		assert.equal(managedSlackFromEnv()?.bindingId, options.bindingId);
 	} finally {
 		for (const [env, value] of [
-			["OUTFITTER_SLACK_CONFIG_URL", previous.url],
-			["OUTFITTER_SLACK_RUNTIME_TOKEN", previous.token],
-			["OUTFITTER_RESIDENT_ID", previous.resident],
+			["SLACK_CONFIG_URL", previous.url],
+			["SLACK_CONFIG_TOKEN", previous.token],
+			["SLACK_BINDING_ID", previous.resident],
 		] as const) {
 			if (value === undefined) delete process.env[env];
 			else process.env[env] = value;
@@ -109,7 +120,7 @@ test("a changed inbox revision cannot silently acknowledge a newly granted chann
 	const transport: typeof fetch = async () => {
 		requests++;
 		return Response.json({
-			residentId: options.residentId,
+			bindingId: options.bindingId,
 			workspaceId: config.workspaceId,
 			revision: "new-revision",
 			events: [
@@ -138,7 +149,7 @@ test("a changed inbox revision cannot silently acknowledge a newly granted chann
 				inboxUrl: config.inboxUrl,
 				inboxToken: options.token,
 				inboxRevision: "old-revision",
-				residentId: options.residentId,
+				bindingId: options.bindingId,
 				workspaceId: config.workspaceId,
 				channelIds: new Set(config.channelIds),
 			},

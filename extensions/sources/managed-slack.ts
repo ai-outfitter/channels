@@ -1,4 +1,4 @@
-/** Resident-scoped platform proxy: Slack credentials never enter the runtime. */
+/** Binding-scoped managed Slack: provider credentials never enter the runtime. */
 
 import { setTimeout as delay } from "node:timers/promises";
 import { WebClient } from "@slack/web-api";
@@ -12,9 +12,8 @@ import {
 } from "./slack.ts";
 import type { ChannelActions, ChannelSource } from "./types.ts";
 
-const prefix = "/api/connectors/resident-slack/runtime";
 interface ManagedConfig {
-	residentId: string;
+	bindingId: string;
 	workspaceId: string;
 	revision: string;
 	channelIds: string[];
@@ -24,35 +23,46 @@ interface ManagedConfig {
 export interface ManagedSlackOptions {
 	url: string;
 	token: string;
-	residentId: string;
+	bindingId: string;
 	transport?: typeof fetch;
 	pollMs?: number;
 }
 export function managedSlackFromEnv(): ManagedSlackOptions | undefined {
-	const url = process.env.OUTFITTER_SLACK_CONFIG_URL?.trim();
-	const token = process.env.OUTFITTER_SLACK_RUNTIME_TOKEN?.trim();
-	const residentId = process.env.OUTFITTER_RESIDENT_ID?.trim();
+	const url = process.env.SLACK_CONFIG_URL?.trim();
+	const token = process.env.SLACK_CONFIG_TOKEN?.trim();
+	const bindingId = process.env.SLACK_BINDING_ID?.trim();
 	if (!url && !token) return undefined;
-	if (!url || !token || !residentId)
-		throw new Error(
-			"Managed Slack requires configuration URL, runtime credential, and resident ID",
-		);
-	const endpoint = new URL(url);
+	if (!url || !token || !bindingId)
+		throw new Error("Managed Slack requires configuration URL, runtime credential, and binding ID");
+	const endpoint = serviceEndpoint(url);
+	return { url: endpoint.href, token, bindingId };
+}
+function serviceEndpoint(value: string): URL {
+	const endpoint = new URL(value);
 	if (
 		endpoint.protocol !== "https:" ||
-		endpoint.pathname !== `${prefix}/config` ||
 		endpoint.username ||
 		endpoint.password ||
 		endpoint.hash ||
 		endpoint.search
 	)
 		throw new Error("Invalid managed Slack endpoint");
-	return { url: endpoint.href, token, residentId };
+	return endpoint;
 }
+function sameOriginEndpoint(value: unknown, origin: string, directory: boolean): boolean {
+	if (typeof value !== "string") return false;
+	try {
+		const endpoint = serviceEndpoint(value);
+		return endpoint.origin === origin && endpoint.pathname.endsWith("/") === directory;
+	} catch {
+		return false;
+	}
+}
+
 export async function readManagedSlack(
 	options: ManagedSlackOptions,
 ): Promise<ManagedConfig | null> {
-	const response = await (options.transport ?? fetch)(options.url, {
+	const response = await (options.transport ?? fetch)(serviceEndpoint(options.url), {
 		headers: { Authorization: `Bearer ${options.token}` },
 		redirect: "error",
 		signal: AbortSignal.timeout(10_000),
@@ -68,7 +78,7 @@ export async function readManagedSlack(
 	const cfg = JSON.parse(await readBody(response, 16_384)) as ManagedConfig;
 	const origin = new URL(options.url).origin;
 	if (
-		cfg.residentId !== options.residentId ||
+		cfg.bindingId !== options.bindingId ||
 		typeof cfg.workspaceId !== "string" ||
 		!/^T[A-Z0-9]{8,20}$/.test(cfg.workspaceId) ||
 		typeof cfg.revision !== "string" ||
@@ -76,8 +86,8 @@ export async function readManagedSlack(
 		!cfg.channelIds.length ||
 		cfg.channelIds.length > 20 ||
 		cfg.channelIds.some((id) => typeof id !== "string" || !/^C[A-Z0-9]{8,20}$/.test(id)) ||
-		cfg.inboxUrl !== `${origin}${prefix}/events` ||
-		cfg.proxyUrl !== `${origin}${prefix}/slack/`
+		!sameOriginEndpoint(cfg.inboxUrl, origin, false) ||
+		!sameOriginEndpoint(cfg.proxyUrl, origin, true)
 	)
 		throw new Error("Managed Slack binding mismatch");
 	return cfg;
@@ -93,7 +103,7 @@ function adapters(options: ManagedSlackOptions, cfg: ManagedConfig) {
 		inboxUrl: cfg.inboxUrl,
 		inboxToken: options.token,
 		inboxRevision: cfg.revision,
-		residentId: cfg.residentId,
+		bindingId: cfg.bindingId,
 		workspaceId: cfg.workspaceId,
 		channelIds: new Set(cfg.channelIds),
 	};
@@ -163,7 +173,7 @@ export function managedSlackActions(
 	const load = async (locator: string) => {
 		const cfg = await readManagedSlack(options);
 		if (!cfg?.channelIds.includes(decodeSlackLocator(locator).channelId))
-			throw new Error("Resident Slack channel is not granted");
+			throw new Error("Slack channel is not granted");
 		const { web } = adapters(options, cfg);
 		return createSlackActions(
 			{ botToken: options.token, doneEmoji: "white_check_mark" },

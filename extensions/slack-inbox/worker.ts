@@ -1,7 +1,7 @@
 /** Shared Slack webhook inbox. Identities and signing keys are private deployment data. */
-export interface ResidentSlackBinding {
-	organizationId: string;
-	residentId: string;
+export interface SlackInboxBinding {
+	tenantId: string;
+	bindingId: string;
 	workspaceId: string;
 	appId: string;
 	signingSecret: string;
@@ -15,7 +15,7 @@ interface Statement {
 }
 export interface SlackInboxEnv {
 	DB: { prepare(sql: string): Statement };
-	SLACK_RESIDENT_BINDINGS: string;
+	SLACK_INBOX_BINDINGS: string;
 }
 
 import { PayloadTooLarge, readBody } from "./body.ts";
@@ -31,23 +31,23 @@ async function equalSecret(actual: string, expected: string): Promise<boolean> {
 		difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
 	return difference === 0;
 }
-function bindings(env: SlackInboxEnv): ResidentSlackBinding[] {
-	const values: unknown = JSON.parse(env.SLACK_RESIDENT_BINDINGS);
+function bindings(env: SlackInboxEnv): SlackInboxBinding[] {
+	const values: unknown = JSON.parse(env.SLACK_INBOX_BINDINGS);
 	if (!Array.isArray(values) || values.length > 100)
-		throw new Error("Invalid resident Slack configuration");
+		throw new Error("Invalid Slack inbox configuration");
 	const keys = new Set<string>();
 	const tokens = new Set<string>();
 	for (const value of values) {
 		for (const key of [
-			"organizationId",
-			"residentId",
+			"tenantId",
+			"bindingId",
 			"workspaceId",
 			"appId",
 			"signingSecret",
 			"deliveryToken",
 		]) {
 			if (typeof value?.[key] !== "string" || !value[key].trim())
-				throw new Error("Missing resident Slack binding");
+				throw new Error("Missing Slack inbox binding");
 		}
 		if (
 			!Array.isArray(value.channelIds) ||
@@ -56,7 +56,7 @@ function bindings(env: SlackInboxEnv): ResidentSlackBinding[] {
 			throw new Error("Invalid channel restriction");
 		const key = `${value.workspaceId}:${value.appId}`;
 		if (keys.has(key) || tokens.has(value.deliveryToken))
-			throw new Error("Ambiguous resident Slack binding");
+			throw new Error("Ambiguous Slack inbox binding");
 		keys.add(key);
 		tokens.add(value.deliveryToken);
 	}
@@ -91,8 +91,8 @@ async function verifySignature(
 	raw: string,
 	timestamp: string,
 	body: { api_app_id?: unknown; team_id?: unknown },
-	configured: ResidentSlackBinding[],
-): Promise<ResidentSlackBinding | undefined> {
+	configured: SlackInboxBinding[],
+): Promise<SlackInboxBinding | undefined> {
 	const candidates = body.api_app_id
 		? configured.filter(
 				(binding) =>
@@ -100,7 +100,7 @@ async function verifySignature(
 					(!body.team_id || binding.workspaceId === body.team_id),
 			)
 		: configured;
-	let bound: ResidentSlackBinding | undefined;
+	let bound: SlackInboxBinding | undefined;
 	for (const candidate of candidates) {
 		const key = await crypto.subtle.importKey(
 			"raw",
@@ -150,7 +150,7 @@ function validEnvelope(value: unknown): boolean {
 async function receive(
 	request: Request,
 	env: SlackInboxEnv,
-	configured: ResidentSlackBinding[],
+	configured: SlackInboxBinding[],
 ): Promise<Response> {
 	const timestamp = request.headers.get("x-slack-request-timestamp") ?? "";
 	if (!/^\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > 300)
@@ -171,22 +171,16 @@ async function receive(
 	if (typeof body.event_id !== "string" || body.event_id.length > 128)
 		return new Response("Invalid event", { status: 400 });
 	await env.DB.prepare(
-		"INSERT INTO resident_slack_events (organizationId,residentId,eventId,body,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(organizationId,residentId,eventId) DO NOTHING",
+		"INSERT INTO slack_inbox_events (tenantId,bindingId,eventId,body,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(tenantId,bindingId,eventId) DO NOTHING",
 	)
-		.bind(
-			bound.organizationId,
-			bound.residentId,
-			body.event_id,
-			projectEnvelope(body, event),
-			Date.now(),
-		)
+		.bind(bound.tenantId, bound.bindingId, body.event_id, projectEnvelope(body, event), Date.now())
 		.run();
 	return new Response("Accepted");
 }
-async function resident(
+async function binding(
 	request: Request,
-	configured: ResidentSlackBinding[],
-): Promise<ResidentSlackBinding | undefined> {
+	configured: SlackInboxBinding[],
+): Promise<SlackInboxBinding | undefined> {
 	for (const binding of configured)
 		if (
 			await equalSecret(
@@ -200,20 +194,20 @@ async function resident(
 async function deliver(
 	request: Request,
 	env: SlackInboxEnv,
-	configured: ResidentSlackBinding[],
+	configured: SlackInboxBinding[],
 ): Promise<Response> {
-	const bound = await resident(request, configured);
+	const bound = await binding(request, configured);
 	if (!bound) return new Response("Unauthorized", { status: 401 });
 	if (request.method === "GET" && new URL(request.url).pathname === "/events") {
 		const channelFilter = bound.channelIds.length
 			? ` AND json_extract(body,'$.event.channel') IN (${bound.channelIds.map(() => "?").join(",")})`
 			: "";
 		const rows = await env.DB.prepare(
-			`SELECT eventId,body FROM resident_slack_events WHERE organizationId=? AND residentId=? AND acknowledgedAt IS NULL AND createdAt >= ? AND json_extract(body,'$.team_id')=? AND json_extract(body,'$.api_app_id')=?${channelFilter} ORDER BY createdAt,eventId LIMIT 20`,
+			`SELECT eventId,body FROM slack_inbox_events WHERE tenantId=? AND bindingId=? AND acknowledgedAt IS NULL AND createdAt >= ? AND json_extract(body,'$.team_id')=? AND json_extract(body,'$.api_app_id')=?${channelFilter} ORDER BY createdAt,eventId LIMIT 20`,
 		)
 			.bind(
-				bound.organizationId,
-				bound.residentId,
+				bound.tenantId,
+				bound.bindingId,
 				Date.now() - 86_400_000,
 				bound.workspaceId,
 				bound.appId,
@@ -222,7 +216,7 @@ async function deliver(
 			.all<{ eventId: string; body: string }>();
 		return Response.json(
 			{
-				residentId: bound.residentId,
+				bindingId: bound.bindingId,
 				workspaceId: bound.workspaceId,
 				events: rows.results.map((row) => ({ eventId: row.eventId, body: JSON.parse(row.body) })),
 			},
@@ -241,16 +235,9 @@ async function deliver(
 			return new Response("Invalid acknowledgement", { status: 400 });
 		for (const id of body.eventIds)
 			await env.DB.prepare(
-				"UPDATE resident_slack_events SET acknowledgedAt=?, body='{}' WHERE organizationId=? AND residentId=? AND eventId=? AND json_extract(body,'$.team_id')=? AND json_extract(body,'$.api_app_id')=?",
+				"UPDATE slack_inbox_events SET acknowledgedAt=?, body='{}' WHERE tenantId=? AND bindingId=? AND eventId=? AND json_extract(body,'$.team_id')=? AND json_extract(body,'$.api_app_id')=?",
 			)
-				.bind(
-					Date.now(),
-					bound.organizationId,
-					bound.residentId,
-					id,
-					bound.workspaceId,
-					bound.appId,
-				)
+				.bind(Date.now(), bound.tenantId, bound.bindingId, id, bound.workspaceId, bound.appId)
 				.run();
 		return new Response("Acknowledged");
 	}
@@ -259,7 +246,7 @@ async function deliver(
 export async function handleSlackInbox(request: Request, env: SlackInboxEnv): Promise<Response> {
 	try {
 		const path = new URL(request.url).pathname;
-		let configured: ResidentSlackBinding[];
+		let configured: SlackInboxBinding[];
 		try {
 			configured = bindings(env);
 		} catch {
@@ -281,11 +268,11 @@ export default {
 	fetch: handleSlackInbox,
 	async scheduled(_event: unknown, env: SlackInboxEnv) {
 		await env.DB.prepare(
-			"UPDATE resident_slack_events SET body='{}', acknowledgedAt=? WHERE createdAt < ? AND acknowledgedAt IS NULL",
+			"UPDATE slack_inbox_events SET body='{}', acknowledgedAt=? WHERE createdAt < ? AND acknowledgedAt IS NULL",
 		)
 			.bind(Date.now(), Date.now() - 86_400_000)
 			.run();
-		await env.DB.prepare("DELETE FROM resident_slack_events WHERE createdAt < ?")
+		await env.DB.prepare("DELETE FROM slack_inbox_events WHERE createdAt < ?")
 			.bind(Date.now() - 30 * 86_400_000)
 			.run();
 	},

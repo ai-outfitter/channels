@@ -128,13 +128,13 @@ export function createSourceRegistry(
 		slack: {
 			configured: () =>
 				Boolean(
-					process.env.OUTFITTER_SLACK_CONFIG_URL ||
-						process.env.OUTFITTER_SLACK_RUNTIME_TOKEN ||
+					process.env.SLACK_CONFIG_URL ||
+						process.env.SLACK_CONFIG_TOKEN ||
 						process.env.SLACK_APP_TOKEN ||
 						process.env.SLACK_BOT_TOKEN,
 				),
 			async load(_journal, taskSink) {
-				if (process.env.OUTFITTER_SLACK_CONFIG_URL || process.env.OUTFITTER_SLACK_RUNTIME_TOKEN) {
+				if (process.env.SLACK_CONFIG_URL || process.env.SLACK_CONFIG_TOKEN) {
 					const managed = await importOnce(
 						"./sources/managed-slack.ts",
 						() => import("./sources/managed-slack.ts"),
@@ -147,7 +147,7 @@ export function createSourceRegistry(
 				return cfg ? m.createSlackSource(cfg, undefined, undefined, taskSink) : undefined;
 			},
 			async loadActions(_journal, taskSink) {
-				if (process.env.OUTFITTER_SLACK_CONFIG_URL || process.env.OUTFITTER_SLACK_RUNTIME_TOKEN) {
+				if (process.env.SLACK_CONFIG_URL || process.env.SLACK_CONFIG_TOKEN) {
 					const managed = await importOnce(
 						"./sources/managed-slack.ts",
 						() => import("./sources/managed-slack.ts"),
