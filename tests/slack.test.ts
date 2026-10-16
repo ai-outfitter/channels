@@ -1129,9 +1129,10 @@ function restoreEnv(name: string, value: string | undefined): void {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
+	const deadline = Date.now() + 2000;
+	while (Date.now() < deadline) {
 		if (predicate()) return;
-		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error("condition was not met");
 }

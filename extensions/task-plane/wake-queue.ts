@@ -508,6 +508,12 @@ export class DurableWakeQueue {
 		if (newest?.activationId !== claim.activationId) return;
 		const stored = await this.#tasks.lookup(claim.taskId);
 		if (!stored) return;
+		// A continuation may be journaled while lookup waits on the task store.
+		// Preserve even an unfinished newer claim; replay owns its projection.
+		const latestClaim = this.#journal
+			.claims()
+			.findLast((candidate) => candidate.taskId === claim.taskId);
+		if (latestClaim?.activationId !== claim.activationId) return;
 		if (
 			await this.#tasks.failRunnable(
 				claim.taskId,
