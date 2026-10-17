@@ -5,15 +5,15 @@ import { DatabaseSync } from "node:sqlite";
 import { it } from "node:test";
 import {
 	handleSlackInbox,
-	type ResidentSlackBinding,
+	type SlackInboxBinding,
 	type SlackInboxEnv,
 } from "../extensions/slack-inbox/worker.ts";
 import { pollSlackInbox, type SlackConfig } from "../extensions/sources/slack.ts";
 import type { SourceTaskActivationSink } from "../extensions/task-plane/types.ts";
 
-const binding: ResidentSlackBinding = {
-	organizationId: "org-a",
-	residentId: "resident-a",
+const binding: SlackInboxBinding = {
+	tenantId: "org-a",
+	bindingId: "resident-a",
 	workspaceId: "TEXAMPLE",
 	appId: "AEXAMPLE",
 	signingSecret: "synthetic-signing-secret",
@@ -50,12 +50,12 @@ function fixture() {
 	const database = new DatabaseSync(":memory:");
 	database.exec(readFileSync(new URL("../deploy/slack-inbox/0001.sql", import.meta.url), "utf8"));
 	const env: SlackInboxEnv = {
-		SLACK_RESIDENT_BINDINGS: JSON.stringify([
+		SLACK_INBOX_BINDINGS: JSON.stringify([
 			binding,
 			{
 				...binding,
-				organizationId: "org-b",
-				residentId: "resident-b",
+				tenantId: "org-b",
+				bindingId: "resident-b",
 				appId: "AOTHER",
 				signingSecret: "other-signing",
 				deliveryToken: "synthetic-delivery-b",
@@ -98,15 +98,15 @@ it("verifies signatures and deduplicates retries while isolating resident delive
 		assert.equal((await handleSlackInbox(signed(event, "1"), env)).status, 401);
 		assert.equal((await handleSlackInbox(signed(event), env)).status, 200);
 		assert.equal((await handleSlackInbox(signed(event), env)).status, 200);
-		assert.equal(database.prepare("SELECT count(*) AS n FROM resident_slack_events").get()?.n, 1);
+		assert.equal(database.prepare("SELECT count(*) AS n FROM slack_inbox_events").get()?.n, 1);
 		assert.equal((await get("wrong-token")).status, 401);
 		assert.deepEqual(await (await get("synthetic-delivery-b")).json(), {
-			residentId: "resident-b",
+			bindingId: "resident-b",
 			workspaceId: binding.workspaceId,
 			events: [],
 		});
 		assert.deepEqual(await (await get(binding.deliveryToken)).json(), {
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [{ eventId: event.event_id, body: event }],
 		});
@@ -126,13 +126,13 @@ it("verifies signatures and deduplicates retries while isolating resident delive
 		);
 		await ack(binding.deliveryToken);
 		assert.deepEqual(await (await get(binding.deliveryToken)).json(), {
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [],
 		});
 		await handleSlackInbox(signed(event), env);
 		assert.deepEqual(await (await get(binding.deliveryToken)).json(), {
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [],
 		});
@@ -146,14 +146,14 @@ it("ignores bot loops and disallowed channels, expires delivery, and fails ackno
 		for (const change of [{ bot_id: "BBOT" }, { channel: "COTHER" }, { subtype: "bot_message" }])
 			await handleSlackInbox(signed({ ...event, event: { ...event.event, ...change } }), env);
 		assert.deepEqual(await (await get(binding.deliveryToken)).json(), {
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [],
 		});
 		await handleSlackInbox(signed(event), env);
-		database.prepare("UPDATE resident_slack_events SET createdAt=?").run(Date.now() - 86_400_001);
+		database.prepare("UPDATE slack_inbox_events SET createdAt=?").run(Date.now() - 86_400_001);
 		assert.deepEqual(await (await get(binding.deliveryToken)).json(), {
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [],
 		});
@@ -183,7 +183,7 @@ it("runtime acknowledges only after durable task acceptance, and retries failed 
 		channelIds: new Set(["CTEST"]),
 		inboxUrl: "https://inbox.example/events",
 		inboxToken: binding.deliveryToken,
-		residentId: binding.residentId,
+		bindingId: binding.bindingId,
 		workspaceId: binding.workspaceId,
 	};
 	let accepts = 0,
@@ -215,7 +215,7 @@ it("runtime acknowledges only after durable task acceptance, and retries failed 
 			return new Response("unavailable", { status: 503 });
 		}
 		return Response.json({
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [{ eventId: event.event_id, body: event }],
 		});
@@ -256,7 +256,7 @@ it("rejects cross-app signatures and malformed requests, and erases acknowledged
 			).status,
 			200,
 		);
-		const stored = String(database.prepare("SELECT body FROM resident_slack_events").get()?.body);
+		const stored = String(database.prepare("SELECT body FROM slack_inbox_events").get()?.body);
 		assert.doesNotMatch(stored, /deprecated-secret|authorizations/);
 		await handleSlackInbox(
 			new Request("https://inbox.example/events/ack", {
@@ -266,12 +266,12 @@ it("rejects cross-app signatures and malformed requests, and erases acknowledged
 			}),
 			env,
 		);
-		assert.equal(database.prepare("SELECT body FROM resident_slack_events").get()?.body, "{}");
+		assert.equal(database.prepare("SELECT body FROM slack_inbox_events").get()?.body, "{}");
 		assert.equal(
 			(
 				await handleSlackInbox(new Request("https://inbox.example/health"), {
 					...env,
-					SLACK_RESIDENT_BINDINGS: "broken",
+					SLACK_INBOX_BINDINGS: "broken",
 				})
 			).status,
 			503,
@@ -291,20 +291,20 @@ it("selects the shared inbox without a Socket Mode token and fails incomplete co
 		"SLACK_APP_TOKEN",
 		"SLACK_BOT_TOKEN",
 		"SLACK_CHANNEL_IDS",
-		"OUTFITTER_SLACK_EVENTS_URL",
-		"OUTFITTER_SLACK_EVENTS_TOKEN",
-		"OUTFITTER_RESIDENT_ID",
+		"SLACK_EVENTS_URL",
+		"SLACK_EVENTS_TOKEN",
+		"SLACK_BINDING_ID",
 	];
 	const saved = new Map(keys.map((key) => [key, process.env[key]]));
 	try {
 		delete process.env.SLACK_APP_TOKEN;
 		process.env.SLACK_BOT_TOKEN = "xoxb-synthetic";
 		process.env.SLACK_CHANNEL_IDS = "CTEST";
-		process.env.OUTFITTER_SLACK_EVENTS_URL = "https://inbox.example/events";
-		delete process.env.OUTFITTER_SLACK_EVENTS_TOKEN;
+		process.env.SLACK_EVENTS_URL = "https://inbox.example/events";
+		delete process.env.SLACK_EVENTS_TOKEN;
 		assert.throws(() => slackConfigFromEnv(), /configured together/);
-		process.env.OUTFITTER_SLACK_EVENTS_TOKEN = binding.deliveryToken;
-		process.env.OUTFITTER_RESIDENT_ID = binding.residentId;
+		process.env.SLACK_EVENTS_TOKEN = binding.deliveryToken;
+		process.env.SLACK_BINDING_ID = binding.bindingId;
 		const cfg = slackConfigFromEnv();
 		assert.ok(cfg);
 		assert.equal(cfg.appToken, "");
@@ -328,7 +328,7 @@ it("selects the shared inbox without a Socket Mode token and fails incomplete co
 				inbox: async () => {
 					resolvePolled();
 					return Response.json({
-						residentId: binding.residentId,
+						bindingId: binding.bindingId,
 						workspaceId: binding.workspaceId,
 						events: [],
 					});
@@ -364,9 +364,9 @@ it("records permanent intake rejection and continues with newer mentions", async
 		appToken: "",
 		botToken: "synthetic-bot",
 		channelIds: new Set(["CTEST"]),
-		inboxUrl: "https://inbox.example/events",
+		inboxUrl: "https://inbox.example/custom/incoming",
 		inboxToken: binding.deliveryToken,
-		residentId: binding.residentId,
+		bindingId: binding.bindingId,
 		workspaceId: binding.workspaceId,
 	};
 	let attempts = 0,
@@ -391,12 +391,12 @@ it("records permanent intake rejection and continues with newer mentions", async
 		},
 	};
 	const transport: typeof fetch = async (input) => {
-		if (new URL(String(input)).pathname === "/events/ack") {
+		if (new URL(String(input)).pathname === "/custom/incoming/ack") {
 			acks++;
 			return new Response("ok");
 		}
 		return Response.json({
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 			events: [
 				{ eventId: "EvBAD", body: { ...event, event_id: "EvBAD" } },
@@ -448,7 +448,7 @@ it("delivers a signed webhook through the durable inbox into a real task store a
 			channelIds: new Set(["CTEST"]),
 			inboxUrl: "https://inbox.example/events",
 			inboxToken: binding.deliveryToken,
-			residentId: binding.residentId,
+			bindingId: binding.bindingId,
 			workspaceId: binding.workspaceId,
 		};
 		const transport: typeof fetch = (input, init) =>
@@ -481,12 +481,12 @@ it("rebinding a resident to another workspace/app cannot read or acknowledge its
 	const { database, env, get } = fixture();
 	try {
 		await handleSlackInbox(signed(event), env);
-		const configured = JSON.parse(env.SLACK_RESIDENT_BINDINGS) as ResidentSlackBinding[];
+		const configured = JSON.parse(env.SLACK_INBOX_BINDINGS) as SlackInboxBinding[];
 		const first = configured[0];
 		assert.ok(first);
 		first.workspaceId = "TNEW";
 		first.appId = "ANEW";
-		env.SLACK_RESIDENT_BINDINGS = JSON.stringify(configured);
+		env.SLACK_INBOX_BINDINGS = JSON.stringify(configured);
 		assert.equal(
 			((await (await get(binding.deliveryToken)).json()) as { events: unknown[] }).events.length,
 			0,
@@ -500,10 +500,10 @@ it("rebinding a resident to another workspace/app cannot read or acknowledge its
 			env,
 		);
 		assert.equal(
-			database.prepare("SELECT acknowledgedAt FROM resident_slack_events").get()?.acknowledgedAt,
+			database.prepare("SELECT acknowledgedAt FROM slack_inbox_events").get()?.acknowledgedAt,
 			null,
 		);
-		assert.notEqual(database.prepare("SELECT body FROM resident_slack_events").get()?.body, "{}");
+		assert.notEqual(database.prepare("SELECT body FROM slack_inbox_events").get()?.body, "{}");
 	} finally {
 		database.close();
 	}

@@ -126,13 +126,35 @@ export function createSourceRegistry(
 			},
 		},
 		slack: {
-			configured: () => Boolean(process.env.SLACK_APP_TOKEN || process.env.SLACK_BOT_TOKEN),
+			configured: () =>
+				Boolean(
+					process.env.SLACK_CONFIG_URL ||
+						process.env.SLACK_CONFIG_TOKEN ||
+						process.env.SLACK_APP_TOKEN ||
+						process.env.SLACK_BOT_TOKEN,
+				),
 			async load(_journal, taskSink) {
+				if (process.env.SLACK_CONFIG_URL || process.env.SLACK_CONFIG_TOKEN) {
+					const managed = await importOnce(
+						"./sources/managed-slack.ts",
+						() => import("./sources/managed-slack.ts"),
+					);
+					const options = managed.managedSlackFromEnv();
+					return options ? managed.managedSlackSource(options, taskSink) : undefined;
+				}
 				const m = await importOnce("./sources/slack.ts", () => import("./sources/slack.ts"));
 				const cfg = m.slackConfigFromEnv();
 				return cfg ? m.createSlackSource(cfg, undefined, undefined, taskSink) : undefined;
 			},
 			async loadActions(_journal, taskSink) {
+				if (process.env.SLACK_CONFIG_URL || process.env.SLACK_CONFIG_TOKEN) {
+					const managed = await importOnce(
+						"./sources/managed-slack.ts",
+						() => import("./sources/managed-slack.ts"),
+					);
+					const options = managed.managedSlackFromEnv();
+					return options ? managed.managedSlackActions(options, taskSink) : undefined;
+				}
 				const m = await importOnce("./sources/slack.ts", () => import("./sources/slack.ts"));
 				const cfg = m.slackActionsConfigFromEnv();
 				return cfg ? m.createSlackActions(cfg, undefined, taskSink) : undefined;

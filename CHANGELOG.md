@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add binding-scoped managed Slack configuration and a same-origin service proxy so bot credentials remain in platform storage. Reconcile connection changes without restarting other sources or resetting checkpoints.
+
 - **Operators:** Task sessions now inherit the resident's model and thinking level.
   Previously they fell back to Pi's built-in default and, without a valid credential
   for it, produced no turn and abandoned the wake.

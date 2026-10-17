@@ -1,10 +1,10 @@
-CREATE TABLE IF NOT EXISTS resident_slack_events (
-  organizationId TEXT NOT NULL,
-  residentId TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS slack_inbox_events (
+  tenantId TEXT NOT NULL,
+  bindingId TEXT NOT NULL,
   eventId TEXT NOT NULL,
   body TEXT NOT NULL,
   createdAt INTEGER NOT NULL,
   acknowledgedAt INTEGER,
-  PRIMARY KEY (organizationId, residentId, eventId)
+  PRIMARY KEY (tenantId, bindingId, eventId)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS resident_slack_pending ON resident_slack_events(organizationId,residentId,acknowledgedAt,createdAt);
+CREATE INDEX IF NOT EXISTS slack_inbox_pending ON slack_inbox_events(tenantId,bindingId,acknowledgedAt,createdAt);

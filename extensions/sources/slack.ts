@@ -46,7 +46,8 @@ export interface SlackConfig {
 	appToken: string;
 	inboxUrl?: string;
 	inboxToken?: string;
-	residentId?: string;
+	inboxRevision?: string;
+	bindingId?: string;
 	workspaceId?: string;
 	/** Bot token (`xoxb-…`) validated here and used by the responder's Web API calls. */
 	botToken: string;
@@ -85,18 +86,18 @@ interface SlackEnvelope {
 export function slackConfigFromEnv(): SlackConfig | undefined {
 	const appToken = process.env.SLACK_APP_TOKEN?.trim();
 	const botToken = process.env.SLACK_BOT_TOKEN?.trim();
-	const inboxUrl = process.env.OUTFITTER_SLACK_EVENTS_URL?.trim();
-	const inboxToken = process.env.OUTFITTER_SLACK_EVENTS_TOKEN?.trim();
+	const inboxUrl = process.env.SLACK_EVENTS_URL?.trim();
+	const inboxToken = process.env.SLACK_EVENTS_TOKEN?.trim();
 	if (Boolean(inboxUrl) !== Boolean(inboxToken))
 		throw new Error("Slack inbox URL and token must be configured together");
-	if (inboxUrl && !process.env.OUTFITTER_RESIDENT_ID?.trim())
-		throw new Error("Slack inbox requires a resident ID");
+	if (inboxUrl && !process.env.SLACK_BINDING_ID?.trim())
+		throw new Error("Slack inbox requires a binding ID");
 	if (!botToken || (!appToken && !(inboxUrl && inboxToken))) return undefined;
 	return {
 		appToken: appToken ?? "",
 		botToken,
 		...(inboxUrl && inboxToken
-			? { inboxUrl, inboxToken, residentId: process.env.OUTFITTER_RESIDENT_ID?.trim() ?? "" }
+			? { inboxUrl, inboxToken, bindingId: process.env.SLACK_BINDING_ID?.trim() ?? "" }
 			: {}),
 		channelIds: parseSlackChannelIds(process.env.SLACK_CHANNEL_IDS),
 	};
@@ -278,7 +279,7 @@ export function createSlackActions(
 	};
 }
 
-function decodeSlackLocator(locator: string): DecodedSlackLocator {
+export function decodeSlackLocator(locator: string): DecodedSlackLocator {
 	const [channel, version, encoded, extra] = locator.split(":");
 	if (
 		channel !== "slack" ||
@@ -498,7 +499,7 @@ function slackInboxEndpoint(cfg: SlackConfig): URL {
 		endpoint.password ||
 		endpoint.search ||
 		endpoint.hash ||
-		endpoint.pathname !== "/events" ||
+		endpoint.pathname.endsWith("/") ||
 		!cfg.inboxToken
 	)
 		throw new Error("Invalid Slack inbox configuration");
@@ -555,23 +556,26 @@ export async function pollSlackInbox(
 	if (!response.ok) throw new Error("Slack inbox unavailable");
 	const text = await readBody(response, 1_500_000);
 	const value = JSON.parse(text) as {
-		residentId?: string;
+		bindingId?: string;
 		workspaceId?: string;
+		revision?: string;
 		events?: Array<{ eventId: string; body: unknown }>;
 	};
 	if (
-		!cfg.residentId ||
-		value.residentId !== cfg.residentId ||
+		!cfg.bindingId ||
+		value.bindingId !== cfg.bindingId ||
 		!cfg.workspaceId ||
 		value.workspaceId !== cfg.workspaceId
 	)
 		throw new Error("Slack inbox binding mismatch");
+	if (cfg.inboxRevision && value.revision !== cfg.inboxRevision)
+		throw new Error("Slack inbox configuration changed");
 	if (!Array.isArray(value.events) || value.events.length > 20)
 		throw new Error("Invalid Slack inbox response");
 	for (const event of value.events) {
 		await acceptInboxEvent(event, cfg, taskSink);
 		const ack = new URL(endpoint);
-		ack.pathname = "/events/ack";
+		ack.pathname = `${endpoint.pathname}/ack`;
 		const result = await transport(ack, {
 			method: "POST",
 			headers,
