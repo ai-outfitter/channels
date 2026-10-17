@@ -64,7 +64,10 @@ export class DurableWakeQueue {
 				continue;
 			}
 			seenTaskIds.add(claim.taskId);
-			if (this.#journal.isWakeFailed(claim.activationId)) continue;
+			if (this.#journal.isWakeFailed(claim.activationId)) {
+				await this.#settleFailedWake(claim);
+				continue;
+			}
 			newestClaims.unshift(claim);
 		}
 		for (const claim of newestClaims) {
@@ -114,6 +117,7 @@ export class DurableWakeQueue {
 					error,
 					failedAt: new Date().toISOString(),
 				})
+				.then(() => this.#settleFailedWake(claim))
 				.catch((appendError) => {
 					this.#log({
 						event: "a2a_wake_overflow_evidence_failed",
@@ -310,6 +314,7 @@ export class DurableWakeQueue {
 							error: message,
 							failedAt: new Date().toISOString(),
 						});
+						await this.#settleFailedWake(wake.claim);
 						this.#log({
 							event: "a2a_wake_abandoned",
 							taskId: wake.claim.taskId,
@@ -493,6 +498,33 @@ export class DurableWakeQueue {
 		});
 	}
 
+	async #settleFailedWake(claim: ActivationClaim): Promise<void> {
+		const newest = this.#journal
+			.claims()
+			.findLast(
+				(candidate) =>
+					candidate.taskId === claim.taskId && this.#journal.isAccepted(candidate.activationId),
+			);
+		if (newest?.activationId !== claim.activationId) return;
+		const stored = await this.#tasks.lookup(claim.taskId);
+		if (!stored) return;
+		// A continuation may be journaled while lookup waits on the task store.
+		// Preserve even an unfinished newer claim; replay owns its projection.
+		const latestClaim = this.#journal
+			.claims()
+			.findLast((candidate) => candidate.taskId === claim.taskId);
+		if (latestClaim?.activationId !== claim.activationId) return;
+		if (
+			await this.#tasks.failRunnable(
+				claim.taskId,
+				"Task failed because wake delivery was permanently exhausted. See activation evidence for the delivery failure.",
+				stored.task,
+			)
+		) {
+			this.#log({ event: "a2a_task_delivery_exhausted", taskId: claim.taskId });
+		}
+	}
+
 	async #failDeliveryCap(claim: ActivationClaim, deliveries: number): Promise<void> {
 		const error = `wake delivery cap ${MAX_WAKE_DELIVERIES} reached without Task settlement`;
 		this.#retired.add(claim.activationId);
@@ -518,6 +550,7 @@ export class DurableWakeQueue {
 				error,
 				failedAt: new Date().toISOString(),
 			});
+			await this.#settleFailedWake(claim);
 		} catch (journalError) {
 			this.#log({
 				event: "a2a_wake_failure_evidence_failed",
