@@ -16,9 +16,11 @@ import channelEventsExtension, { locatorChannel, type SourceRegistration } from 
 import relayExtension from "./relay-extension.ts";
 import { errorMessage } from "./sources/util.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
+import { ResidentRuntime } from "./task-plane/resident-runtime.ts";
 import { type RunningChannelsRuntime, startChannelsRuntime } from "./task-plane/runtime.ts";
 import {
 	commandLineExtensionPaths,
+	commandLinePromptSources,
 	TaskSessionHost,
 	type TaskSessionHostOptions,
 	type TaskTurnRunner,
@@ -69,6 +71,7 @@ export default function channelsRuntimeExtension(
 	const selection = process.env.OUTFITTER_CHANNELS?.trim();
 	const taskPlaneEnabled = selection !== "off" && selection !== "none";
 	const startRuntime = dependencies.startRuntime ?? startChannelsRuntime;
+	const residentRuntime = new ResidentRuntime();
 	const log =
 		dependencies.log ??
 		((record: Readonly<Record<string, unknown>>): void => console.error(JSON.stringify(record)));
@@ -189,7 +192,9 @@ export default function channelsRuntimeExtension(
 			model: getModel,
 			thinkingLevel: getThinkingLevel,
 			customTools: taskTools,
+			residentBio: () => residentRuntime.bioForPrompt(),
 			additionalExtensionPaths: commandLineExtensionPaths(process.argv),
+			promptSources: commandLinePromptSources(process.argv),
 			excludedExtensionRoot: CHANNELS_PACKAGE_ROOT,
 			log,
 		};
@@ -203,6 +208,7 @@ export default function channelsRuntimeExtension(
 	): Promise<RunningChannelsRuntime> =>
 		startRuntime(pi, {
 			storePath: join(taskPlaneRoot, "tasks.json"),
+			residentRuntime,
 			originStorePath: join(taskPlaneRoot, "origins.json"),
 			agentInterface:
 				process.env.A2A_PUBLIC_URL?.trim() ||

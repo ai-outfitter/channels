@@ -26,6 +26,8 @@ export interface TaskSession {
 
 export interface TaskSessionFactoryInput {
 	readonly taskId: string;
+	readonly residentBio?: (() => string) | undefined;
+	readonly promptSources?: { systemPrompt?: string; appendSystemPrompt?: string[] } | undefined;
 	readonly cwd: string;
 	readonly agentDir: string;
 	readonly projectTrusted: boolean;
@@ -41,6 +43,8 @@ export type TaskSessionFactory = (input: TaskSessionFactoryInput) => Promise<Tas
 
 export interface TaskSessionHostOptions {
 	readonly cwd: string;
+	readonly residentBio?: (() => string) | undefined;
+	readonly promptSources?: { systemPrompt?: string; appendSystemPrompt?: string[] } | undefined;
 	readonly sessionDir: string;
 	readonly customTools: readonly ToolDefinition[];
 	readonly additionalExtensionPaths?: readonly string[];
@@ -149,6 +153,8 @@ export class TaskSessionHost implements TaskTurnRunner {
 		try {
 			session = await createSession({
 				taskId,
+				residentBio: this.#options.residentBio,
+				promptSources: this.#options.promptSources,
 				cwd: this.#options.cwd,
 				agentDir: this.#options.agentDir ?? getAgentDir(),
 				projectTrusted: this.#options.projectTrusted ?? false,
@@ -184,7 +190,22 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		cwd: input.cwd,
 		agentDir: input.agentDir,
 		settingsManager,
+		...input.promptSources,
 		additionalExtensionPaths: [...input.additionalExtensionPaths],
+		extensionFactories: input.residentBio
+			? [
+					(api) => {
+						api.on("before_agent_start", (event) => {
+							const bio = input.residentBio?.() ?? "";
+							return {
+								systemPrompt: bio
+									? `${event.systemPrompt}\n\nResident bio:\n${bio}`
+									: event.systemPrompt,
+							};
+						});
+					},
+				]
+			: [],
 		extensionsOverride: (loaded) => ({
 			...loaded,
 			extensions: loaded.extensions.filter(
@@ -269,4 +290,21 @@ export function commandLineExtensionPaths(argv: readonly string[]): string[] {
 		}
 	}
 	return [...paths];
+}
+
+/** Preserve resolved catalog prompt arguments when creating isolated task sessions. */
+export function commandLinePromptSources(argv: readonly string[]): {
+	systemPrompt?: string;
+	appendSystemPrompt?: string[];
+} {
+	const result: { systemPrompt?: string; appendSystemPrompt?: string[] } = {};
+	for (let index = 0; index < argv.length; index++) {
+		const match = argv[index]?.match(/^--(system-prompt|append-system-prompt)(?:=(.*))?$/);
+		if (!match) continue;
+		const value = match[2] ?? argv[++index];
+		if (!value || value.startsWith("--")) throw new Error(`Missing value for ${match[1]}`);
+		if (match[1] === "system-prompt") result.systemPrompt = value;
+		else result.appendSystemPrompt = [...(result.appendSystemPrompt ?? []), value];
+	}
+	return result;
 }
