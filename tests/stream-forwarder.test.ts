@@ -23,8 +23,8 @@ test("forwarder streams channel_respond argument deltas as text events", async (
 			version: 1,
 			id: "message-1",
 			conversationId: "conversation-1",
-			sender: "vega-web",
-			recipient: "link:vega",
+			sender: "atlas-web",
+			recipient: "link:atlas",
 			createdAt: new Date().toISOString(),
 			body: "hello",
 		},
@@ -32,13 +32,13 @@ test("forwarder streams channel_respond argument deltas as text events", async (
 	);
 	const streamed: Array<{ messageId: string; event: RelayStreamEvent }> = [];
 	const transport = {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		async stream(messageId: string, event: RelayStreamEvent) {
 			streamed.push({ messageId, event });
 		},
 	} as unknown as AgentTransport;
 	const forward = createAgentStreamForwarder(
-		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		{ endpointId: "link:atlas", principalId: "link:atlas", spoolPath: "" },
 		() => transport,
 		journal,
 		1,
@@ -91,13 +91,13 @@ test("forwarder stays silent for non-respond tools and ambiguous targets", async
 	const journal = new AgentSessionJournal();
 	const streamed: unknown[] = [];
 	const transport = {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		async stream(_messageId: string, event: RelayStreamEvent) {
 			streamed.push(event);
 		},
 	} as unknown as AgentTransport;
 	const forward = createAgentStreamForwarder(
-		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		{ endpointId: "link:atlas", principalId: "link:atlas", spoolPath: "" },
 		() => transport,
 		journal,
 		1,
@@ -120,8 +120,8 @@ test("forwarder stays silent for non-respond tools and ambiguous targets", async
 			version: 1,
 			id: "message-2",
 			conversationId: "conversation-1",
-			sender: "vega-web",
-			recipient: "link:vega",
+			sender: "atlas-web",
+			recipient: "link:atlas",
 			createdAt: new Date().toISOString(),
 			body: "hello",
 		},
@@ -150,24 +150,24 @@ test("forwarder emits content-free status events to open messages", async () => 
 				id,
 				conversationId: "conversation-1",
 				sender,
-				recipient: "link:vega",
+				recipient: "link:atlas",
 				createdAt: new Date().toISOString(),
 				body: "hello",
 			},
 			"delivered",
 		);
-	record("message-1", "vega-web");
-	record("message-2", "vega-web"); // newer message from the same sender wins
+	record("message-1", "atlas-web");
+	record("message-2", "atlas-web"); // newer message from the same sender wins
 	record("message-3", "link:drago");
 	const streamed: Array<{ messageId: string; event: RelayStreamEvent }> = [];
 	const transport = {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		async stream(messageId: string, event: RelayStreamEvent) {
 			streamed.push({ messageId, event });
 		},
 	} as unknown as AgentTransport;
 	const forward = createAgentStreamForwarder(
-		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		{ endpointId: "link:atlas", principalId: "link:atlas", spoolPath: "" },
 		() => transport,
 		journal,
 		1,
@@ -243,8 +243,8 @@ test("forwarder announces no status for the respond call itself", async () => {
 			version: 1,
 			id: "message-1",
 			conversationId: "conversation-1",
-			sender: "vega-web",
-			recipient: "link:vega",
+			sender: "atlas-web",
+			recipient: "link:atlas",
 			createdAt: new Date().toISOString(),
 			body: "hello",
 		},
@@ -252,13 +252,13 @@ test("forwarder announces no status for the respond call itself", async () => {
 	);
 	const streamed: RelayStreamEvent[] = [];
 	const transport = {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		async stream(_messageId: string, event: RelayStreamEvent) {
 			streamed.push(event);
 		},
 	} as unknown as AgentTransport;
 	const forward = createAgentStreamForwarder(
-		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		{ endpointId: "link:atlas", principalId: "link:atlas", spoolPath: "" },
 		() => transport,
 		journal,
 		1,
@@ -298,8 +298,8 @@ test("stop() drops the pending flush and latches the forwarder off", async () =>
 			version: 1,
 			id: "message-1",
 			conversationId: "conversation-1",
-			sender: "vega-web",
-			recipient: "link:vega",
+			sender: "atlas-web",
+			recipient: "link:atlas",
 			createdAt: new Date().toISOString(),
 			body: "hello",
 		},
@@ -307,14 +307,14 @@ test("stop() drops the pending flush and latches the forwarder off", async () =>
 	);
 	const streamed: RelayStreamEvent[] = [];
 	const transport = {
-		endpoint: { id: "link:vega", principal: "link:vega" },
+		endpoint: { id: "link:atlas", principal: "link:atlas" },
 		async stream(_messageId: string, event: RelayStreamEvent) {
 			streamed.push(event);
 		},
 	} as unknown as AgentTransport;
 	// A long flush window keeps the delta buffered until stop() runs.
 	const forward = createAgentStreamForwarder(
-		{ endpointId: "link:vega", principalId: "link:vega", spoolPath: "" },
+		{ endpointId: "link:atlas", principalId: "link:atlas", spoolPath: "" },
 		() => transport,
 		journal,
 		60_000,

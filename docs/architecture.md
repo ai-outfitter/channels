@@ -255,3 +255,8 @@ counts as handled.
 If a reply succeeds but the item remains unhandled, the adapter returns
 `replied: true, handled: false`. Callers must report that warning and must not
 retry the reply automatically.
+
+Slack can select a shared HTTP inbox using `OUTFITTER_SLACK_EVENTS_URL` and
+`OUTFITTER_SLACK_EVENTS_TOKEN` with `SLACK_BOT_TOKEN` and the pinned
+`OUTFITTER_RESIDENT_ID`. This transport takes precedence over a configured Socket
+Mode app token. Identity/configuration remains organization-owned deployment data.

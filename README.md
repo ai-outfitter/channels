@@ -491,3 +491,8 @@ extensions/
     zulip.ts          # Zulip event-queue source + action adapter
 docs/channel-events.md
 ```
+
+For resident fleets, [shared Slack webhook intake](deploy/slack-inbox/README.md)
+provides one durable inbox service for separately addressable bot identities,
+without a Socket Mode connection per pod. Channel history and accessible huddle
+transcript files are read through each bot's own Web API credential.

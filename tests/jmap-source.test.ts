@@ -907,7 +907,7 @@ test("a failure on both subscriptions throws so the supervisor reconnects", asyn
 // the field names are Stalwart's own, and `recurrenceId` is null — not absent —
 // for a non-recurring event.
 const CAPTURED_STALWART_ALERT =
-	'event: calendarAlert\ndata: {"@type":"CalendarAlert","accountId":"i","calendarEventId":"b","uid":"vega-cron-probe-001","recurrenceId":null,"alertId":"a1"}\n\n';
+	'event: calendarAlert\ndata: {"@type":"CalendarAlert","accountId":"i","calendarEventId":"b","uid":"atlas-cron-probe-001","recurrenceId":null,"alertId":"a1"}\n\n';
 
 test("the captured live-Stalwart alert frame wakes with its uid", async () => {
 	const originalFetch = globalThis.fetch;
@@ -938,8 +938,8 @@ test("the captured live-Stalwart alert frame wakes with its uid", async () => {
 	}
 	assert.deepEqual(events[0], {
 		channel: "jmap",
-		summary: "calendar alert: vega-cron-probe-001",
-		dedupeKey: "calendar-alert:vega-cron-probe-001",
+		summary: "calendar alert: atlas-cron-probe-001",
+		dedupeKey: "calendar-alert:atlas-cron-probe-001",
 	});
 });
 
