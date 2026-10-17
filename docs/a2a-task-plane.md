@@ -308,3 +308,14 @@ redelivered duplicate provider event returns the prior Task; a reply anchor
 from a principal that cannot access the Task creates a new Task instead; a
 later thread message creates a new Task; an unauthorized explicit `taskId` fails; and a `taskId`
 embedded in a provider message body neither selects nor continues a Task.
+
+### Runnable-task idle expiry
+
+The runtime fails SUBMITTED and WORKING tasks after 24 hours without a state
+change, new status message, history, or output. Timestamp-only status updates,
+reads, duplicate intake, and wake re-offers do not renew progress. INPUT_REQUIRED
+and AUTH_REQUIRED tasks remain paused. Maintenance runs before intake starts and
+every minute thereafter; expiry releases task sessions and notifies live A2A
+subscribers. A turn lasting 24 hours must record meaningful progress to continue.
+Failure evidence remains durable for the normal terminal-task retention window.
+Older version-1 stores use their saved update time until new progress is recorded.

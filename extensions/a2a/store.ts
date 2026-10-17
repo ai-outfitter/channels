@@ -37,6 +37,7 @@ export interface StoredTask {
 	readonly task: A2aTask;
 	readonly principal: string;
 	readonly updatedAt: string;
+	readonly lastProgressAt?: string;
 }
 
 interface TaskStoreData {
@@ -47,6 +48,7 @@ interface TaskStoreData {
 
 const MAX_DEDUPE_RECORDS = 10_000;
 export const DEDUPE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const TASK_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 export const TASK_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface ListTasksFilter {
@@ -70,6 +72,7 @@ export class A2aTaskStore {
 	#data: TaskStoreData = { version: 1, tasks: {}, dedupe: [] };
 	#initialized: Promise<void> | undefined;
 	#operations: Promise<unknown> = Promise.resolve();
+	readonly #expiryListeners = new Set<(task: A2aTask) => void>();
 
 	constructor(path: string) {
 		if (!path) throw new Error("a2a store path is required");
@@ -329,10 +332,76 @@ export class A2aTaskStore {
 		});
 	}
 
+	/** In-process notifications are scoped by the hosting server's subscribers. */
+	onExpired(listener: (task: A2aTask) => void): () => void {
+		this.#expiryListeners.add(listener);
+		return () => {
+			this.#expiryListeners.delete(listener);
+		};
+	}
+
+	/** Hosting-process maintenance; never exposed as an unscoped HTTP operation. */
+	async expireIdle(now = Date.now()): Promise<readonly string[]> {
+		return this.#run(async () => {
+			const expired = this.#expireIdle(now);
+			if (expired.length) {
+				await this.#persist();
+				for (const id of expired) this.#notifyExpired(id);
+			}
+			return expired;
+		});
+	}
+
+	#notifyExpired(id: string): void {
+		const task = this.#data.tasks[id]?.task;
+		if (!task) return;
+		for (const listener of this.#expiryListeners) {
+			try {
+				listener(task);
+			} catch {
+				/* Durable expiry wins over observer errors. */
+			}
+		}
+	}
+
+	#expireIdle(now: number): string[] {
+		const expired: string[] = [];
+		for (const stored of Object.values(this.#data.tasks)) {
+			if (!["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"].includes(stored.task.status.state))
+				continue;
+			const progressAt = Date.parse(stored.lastProgressAt ?? stored.updatedAt);
+			if (!Number.isFinite(progressAt) || now - progressAt < TASK_IDLE_TTL_MS) continue;
+			const timestamp = new Date(now).toISOString();
+			const task = {
+				...stored.task,
+				status: {
+					state: "TASK_STATE_FAILED" as const,
+					timestamp,
+					message: {
+						messageId: randomUUID(),
+						role: "ROLE_AGENT" as const,
+						parts: [{ text: "Task expired after 24 hours without meaningful progress." }],
+					},
+				},
+			};
+			this.#data.tasks[task.id] = { ...stored, task, updatedAt: timestamp };
+			expired.push(task.id);
+		}
+		return expired;
+	}
+
 	async #replace(stored: StoredTask, task: A2aTask): Promise<A2aTask> {
+		const progressed =
+			stored.task.status.state !== task.status.state ||
+			JSON.stringify(stored.task.status.message) !== JSON.stringify(task.status.message) ||
+			JSON.stringify(stored.task.history) !== JSON.stringify(task.history) ||
+			JSON.stringify(stored.task.artifacts) !== JSON.stringify(task.artifacts);
 		this.#data.tasks[task.id] = {
 			task,
 			principal: stored.principal,
+			lastProgressAt: progressed
+				? new Date().toISOString()
+				: (stored.lastProgressAt ?? stored.updatedAt),
 			updatedAt: new Date().toISOString(),
 		};
 		await this.#persist();

@@ -465,6 +465,7 @@ export class DurableWakeQueue {
 	): Promise<boolean> {
 		try {
 			await this.#tasks.updateStatus(stored.principal, stored.task.id, {
+				...stored.task.status,
 				state: "TASK_STATE_WORKING",
 			});
 		} catch {

@@ -240,6 +240,12 @@ export async function startA2aServer(
 		for (const subscriber of subscribers.get(taskId) ?? []) subscriber(event);
 	};
 
+	const stopExpiryNotifications = store.onExpired((task) =>
+		emit(task.id, {
+			statusUpdate: { taskId: task.id, contextId: task.contextId, status: task.status },
+		}),
+	);
+
 	const subscribe = (taskId: string, subscriber: Subscriber): (() => void) => {
 		const set = subscribers.get(taskId) ?? new Set();
 		set.add(subscriber);
@@ -643,6 +649,7 @@ export async function startA2aServer(
 		close: () =>
 			new Promise<void>((resolve, reject) => {
 				server.closeAllConnections();
+				stopExpiryNotifications();
 				server.close((error) => (error ? reject(error) : resolve()));
 			}),
 	};
