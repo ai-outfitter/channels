@@ -85,7 +85,7 @@ export async function readManagedSlack(
 		!Array.isArray(cfg.channelIds) ||
 		!cfg.channelIds.length ||
 		cfg.channelIds.length > 10_000 ||
-		cfg.channelIds.some((id) => typeof id !== "string" || !/^C[A-Z0-9]{8,20}$/.test(id)) ||
+		cfg.channelIds.some((id) => typeof id !== "string" || !/^[CG][A-Z0-9]{8,20}$/.test(id)) ||
 		!sameOriginEndpoint(cfg.inboxUrl, origin, false) ||
 		!sameOriginEndpoint(cfg.proxyUrl, origin, true)
 	)

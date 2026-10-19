@@ -163,12 +163,18 @@ test("a changed inbox revision cannot silently acknowledge a newly granted chann
 });
 
 test("managed Slack accepts discovered memberships beyond the old twenty-channel selection limit", async () => {
-	const channelIds = Array.from({ length: 1000 }, (_, i) => `C${String(i).padStart(10, "0")}`);
+	const channelIds = Array.from({ length: 1500 }, (_, i) => `C${String(i).padStart(10, "0")}`);
 	const result = await readManagedSlack({
 		...options,
 		transport: async () => Response.json({ ...config, channelIds }),
 	});
 	assert.deepEqual(result?.channelIds, channelIds);
+	const converted = { ...config, channelIds: ["G0123456789"] };
+	assert.deepEqual(
+		(await readManagedSlack({ ...options, transport: async () => Response.json(converted) }))
+			?.channelIds,
+		converted.channelIds,
+	);
 	await assert.rejects(
 		readManagedSlack({
 			...options,
