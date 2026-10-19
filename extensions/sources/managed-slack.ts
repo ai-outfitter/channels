@@ -75,7 +75,7 @@ export async function readManagedSlack(
 		await response.body?.cancel();
 		throw new Error("Managed Slack configuration unavailable");
 	}
-	const cfg = JSON.parse(await readBody(response, 16_384)) as ManagedConfig;
+	const cfg = JSON.parse(await readBody(response, 256 * 1024)) as ManagedConfig;
 	const origin = new URL(options.url).origin;
 	if (
 		cfg.bindingId !== options.bindingId ||
@@ -84,7 +84,7 @@ export async function readManagedSlack(
 		typeof cfg.revision !== "string" ||
 		!Array.isArray(cfg.channelIds) ||
 		!cfg.channelIds.length ||
-		cfg.channelIds.length > 20 ||
+		cfg.channelIds.length > 10_000 ||
 		cfg.channelIds.some((id) => typeof id !== "string" || !/^C[A-Z0-9]{8,20}$/.test(id)) ||
 		!sameOriginEndpoint(cfg.inboxUrl, origin, false) ||
 		!sameOriginEndpoint(cfg.proxyUrl, origin, true)
