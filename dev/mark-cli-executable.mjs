@@ -1,6 +1,10 @@
 import { chmod } from "node:fs/promises";
 
-const commands = ["outfitter-channel-send.js", "outfitter-channel-reconcile.js"];
+const commands = [
+	"outfitter-channel-send.js",
+	"outfitter-channel-reconcile.js",
+	"outfitter-transcribe.js",
+];
 
 await Promise.all(
 	commands.map((command) => chmod(new URL(`../dist/bin/${command}`, import.meta.url), 0o755)),
