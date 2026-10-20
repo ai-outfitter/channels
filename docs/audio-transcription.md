@@ -12,7 +12,21 @@ mention intake, task deduplication, approvals, and threaded replies still apply.
 Transcription is separate from the conversational model. Selecting a language
 model or merely setting `OPENAI_API_KEY` does not enable audio uploads.
 
-OpenAI (or a compatible transcription endpoint):
+Managed Outfitter residents use the existing inference relay (requires the audio-enabled gateway and relay):
+
+```sh
+export TRANSCRIPTION_API=openai
+export TRANSCRIPTION_BASE_URL=http://127.0.0.1:4141/v1
+export TRANSCRIPTION_MODEL=gpt-transcribe
+```
+
+No provider API key is needed in the agent. The relay attaches its rotating pod
+identity, and the gateway resolves the organization's authorized providers using
+the web app. Audio shares inference admission limits. The first managed version
+supports resolved `https://api.openai.com/v1` providers only, uses an explicit
+audio model rather than a chat alias, and does not fall back between providers.
+
+Standalone OpenAI (or a compatible transcription endpoint):
 
 ```sh
 export TRANSCRIPTION_API=openai
@@ -87,5 +101,5 @@ cancellation, explicit configuration, native transcripts, and download origin
 checks. The local Whisper.cpp HTTP adapter was exercised with a real 11-second
 Slack recording (m4a, converted by the server). This verifies local HTTP
 transcription, not transcript accuracy or an end-to-end deployed Slack reply.
-Hosted OpenAI requests are contract-tested; live hosted verification requires a
-configured API key. Private recordings and results are not repository fixtures.
+Hosted OpenAI requests are contract-tested; live managed transcription still
+requires deployment of the audio-enabled relay and gateway. Private recordings and results are not repository fixtures.
