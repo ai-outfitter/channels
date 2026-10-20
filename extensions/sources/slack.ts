@@ -14,6 +14,7 @@ import {
 	type ConversationsRepliesResponse,
 	WebClient,
 } from "@slack/web-api";
+import { type Transcriber, transcriberFromEnv } from "../audio/transcription.ts";
 import { readBody } from "../slack-inbox/body.ts";
 import { derivedId } from "../task-plane/serialize.ts";
 import {
@@ -22,6 +23,7 @@ import {
 	sourceIdentifier,
 } from "../task-plane/source-activation.ts";
 import type { SourceTaskActivationSink } from "../task-plane/types.ts";
+import { type AudioDownload, readSlackAudio, slackAudioDownload } from "./slack-audio.ts";
 import { compareSlackTimestamps, parseSlackChannelIds } from "./slack-config.ts";
 import { readSlackHuddles } from "./slack-huddles.ts";
 import type {
@@ -58,6 +60,8 @@ export interface SlackConfig {
 export interface SlackActionsConfig {
 	botToken: string;
 	doneEmoji: string;
+	transcriber?: Transcriber;
+	downloadAudio?: AudioDownload;
 }
 
 /** The official SDK's message shape, as returned by the context-fetch methods. */
@@ -111,7 +115,8 @@ export function slackActionsConfigFromEnv(): SlackActionsConfig | undefined {
 	if (!EMOJI_NAME.test(doneEmoji)) {
 		throw new Error("LINK_SLACK_DONE_EMOJI is not a valid Slack emoji name");
 	}
-	return { botToken, doneEmoji };
+	const transcriber = transcriberFromEnv();
+	return { botToken, doneEmoji, ...(transcriber ? { transcriber } : {}) };
 }
 
 /**
@@ -188,6 +193,12 @@ export function createSlackActions(
 				handled: hasOwnReaction(target, cfg.doneEmoji, ownUserId),
 				messages: [
 					...messages.map((message) => contextMessage(message, decoded.messageTs)),
+					...(await readSlackAudio(
+						messages,
+						decoded.messageTs,
+						cfg.downloadAudio ?? slackAudioDownload(cfg.botToken),
+						cfg.transcriber,
+					)),
 					...(await readSlackHuddles(
 						messages.flatMap((message) => message.files ?? []),
 						(id) => web.files.info({ file: id }),

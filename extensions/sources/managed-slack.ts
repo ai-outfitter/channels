@@ -1,3 +1,4 @@
+import { MAX_AUDIO_BYTES, readBytes, transcriberFromEnv } from "../audio/transcription.ts";
 /** Binding-scoped managed Slack: provider credentials never enter the runtime. */
 
 import { setTimeout as delay } from "node:timers/promises";
@@ -170,13 +171,45 @@ export function managedSlackActions(
 	options: ManagedSlackOptions,
 	sink: SourceTaskActivationSink,
 ): ChannelActions {
+	const transcriber = transcriberFromEnv();
 	const load = async (locator: string) => {
 		const cfg = await readManagedSlack(options);
 		if (!cfg?.channelIds.includes(decodeSlackLocator(locator).channelId))
 			throw new Error("Slack channel is not granted");
 		const { web } = adapters(options, cfg);
 		return createSlackActions(
-			{ botToken: options.token, doneEmoji: "white_check_mark" },
+			{
+				botToken: options.token,
+				doneEmoji: "white_check_mark",
+				...(transcriber ? { transcriber } : {}),
+				downloadAudio: async (file, message) => {
+					const current = await readManagedSlack(options);
+					const channel = decodeSlackLocator(locator).channelId;
+					if (
+						!current ||
+						current.revision !== cfg.revision ||
+						!current.channelIds.includes(channel)
+					)
+						throw new Error("Slack binding changed");
+					const response = await (options.transport ?? fetch)(`${current.proxyUrl}files.download`, {
+						method: "POST",
+						redirect: "error",
+						signal: AbortSignal.timeout(30_000),
+						headers: { Authorization: `Bearer ${options.token}` },
+						body: new URLSearchParams({
+							channel,
+							ts: message.ts ?? "",
+							file: file.id ?? "",
+							...(message.thread_ts ? { thread_ts: message.thread_ts } : {}),
+						}),
+					});
+					if (!response.ok) {
+						await response.body?.cancel();
+						throw new Error("Slack audio unavailable");
+					}
+					return readBytes(response, MAX_AUDIO_BYTES);
+				},
+			},
 			web,
 			sink,
 		);
