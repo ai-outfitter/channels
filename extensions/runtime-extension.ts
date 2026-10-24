@@ -26,6 +26,7 @@ import {
 	type TaskTurnRunner,
 } from "./task-plane/task-sessions.ts";
 import type { SourceTaskActivationSink } from "./task-plane/types.ts";
+import { FileVoiceJournal, MainPiConversation, voiceJournalName } from "./voice/conversation.ts";
 
 type TaskSessionOwner = TaskTurnRunner & { close(): Promise<void> };
 
@@ -41,7 +42,8 @@ const CHANNELS_PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
  * The package's sole Pi entrypoint. The relay remains a separate session plane;
- * every work-producing source is composed with the task plane. The entrypoint
+ * channel work-producing sources are composed with the task plane. The optional
+ * voice conversation adapter uses the existing main session. The entrypoint
  * is intentionally stateless so Jiti reloads with moduleCache:false
  * create an independent runtime rather than consulting a module-global owner.
  */
@@ -49,6 +51,70 @@ export default function channelsRuntimeExtension(
 	pi: ExtensionAPI,
 	dependencies: ChannelsRuntimeExtensionDependencies = {},
 ): void {
+	let conversation: MainPiConversation | undefined;
+	// Bind only the current persistent main session; switching closes intake, never aborts Pi.
+	pi.on("session_start", (_event, context) => {
+		conversation?.close();
+		conversation = undefined;
+		const principals = (process.env.A2A_VOICE_PRINCIPALS ?? "")
+			.split(",")
+			.map((value) => value.trim())
+			.filter(Boolean);
+		if (!principals.length) return;
+		if (!context.sessionManager.getSessionFile())
+			throw new Error("main voice conversation requires persistent Pi session");
+		const root =
+			process.env.CHANNELS_TASK_STORE_PATH?.trim() ||
+			join(
+				process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"),
+				"outfitter",
+				"channels",
+				"task-plane",
+			);
+		conversation = new MainPiConversation(
+			new FileVoiceJournal(
+				join(
+					root,
+					"voice-conversations",
+					`${voiceJournalName(context.sessionManager.getSessionId())}.jsonl`,
+				),
+				(record) => pi.appendEntry("channels:voice-conversation", record),
+			),
+			{
+				idle: () => context.isIdle() && !context.hasPendingMessages(),
+				send: (text) => pi.sendUserMessage(text, { deliverAs: "followUp" }),
+			},
+			principals,
+		);
+	});
+	pi.on("before_agent_start", (event) => conversation?.beforeStart(event.prompt));
+	pi.on("message_start", (event) => {
+		if (event.message.role !== "user") conversation?.messageRole(event.message.role);
+		if (event.message.role === "user")
+			conversation?.userMessage(
+				typeof event.message.content === "string"
+					? event.message.content
+					: event.message.content
+							.filter((part) => part.type === "text")
+							.map((part) => part.text)
+							.join(""),
+			);
+	});
+	pi.on("message_update", (event) => {
+		if (event.assistantMessageEvent.type === "text_delta")
+			conversation?.text(event.assistantMessageEvent.delta);
+	});
+	pi.on("message_end", (event) => {
+		if (event.message.role === "assistant") conversation?.flushText();
+	});
+	pi.on("tool_execution_start", () => conversation?.status("tool-running"));
+	pi.on("tool_execution_end", () => conversation?.status("tool-finished"));
+	pi.on("agent_end", (event) => {
+		const last = event.messages.findLast((message) => message.role === "assistant");
+		conversation?.end(!last || last.stopReason === "error" || last.stopReason === "aborted");
+	});
+	pi.on("agent_settled", () => conversation?.settled());
+	pi.on("session_shutdown", () => conversation?.close());
 	let runtime: RunningChannelsRuntime | undefined;
 	let starting: Promise<void> | undefined;
 	let lifecycleRequest = 0;
@@ -81,6 +147,7 @@ export default function channelsRuntimeExtension(
 			a2aServer = server;
 		},
 		(taskId) => (runtime?.wakeQueue ?? startingWakeQueue)?.cancelTask(taskId),
+		() => conversation,
 	);
 	const taskAccess = (): A2aToolAccess | undefined => {
 		if (a2aServer) return a2aServer;
