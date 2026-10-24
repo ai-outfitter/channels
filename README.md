@@ -6,6 +6,11 @@ Zulip, then runs one durable Pi session per Task only when a source detects matc
 Sources may use push connections, local daemons, or lightweight polling.
 Multiple channels share one durable Task wake queue.
 
+The optional [resident voice conversation API](docs/resident-voice-conversation.md)
+sends authenticated voice turns to the existing main Pi session instead. It
+requires a caller-bound lease and an explicitly authorized service principal;
+release and hangup never cancel resident work.
+
 The wake is a trusted, body-free Task reference. Wake prompts contain no message
 content. For exact items, `channel_read` returns
 fetched content inside explicit untrusted-content markers.

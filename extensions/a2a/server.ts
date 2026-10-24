@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { type MainPiConversation, VoiceError } from "../voice/conversation.ts";
 import { A2aTaskStore, trimTask } from "./store.ts";
 import {
 	A2A_EXTENSIONS_HEADER,
@@ -231,6 +232,7 @@ export async function startA2aServer(
 	executor: A2aExecutor,
 	sharedStore?: A2aTaskStore,
 	onTaskCanceled: (taskId: string) => void | Promise<void> = () => {},
+	conversation?: () => MainPiConversation | undefined,
 ): Promise<RunningA2aServer> {
 	const store = sharedStore ?? new A2aTaskStore(config.storePath);
 	await store.initialize();
@@ -488,6 +490,31 @@ export async function startA2aServer(
 		if (request.method === "GET" && path === AGENT_CARD_PATH) {
 			response.writeHead(200, { "content-type": "application/json" });
 			response.end(JSON.stringify(card));
+			return;
+		}
+		if (path.startsWith("/voice/")) {
+			const principal = authenticate(request, config.credentials);
+			try {
+				if (request.method !== "POST") throw new VoiceError(405, "POST required");
+				const adapter = conversation?.();
+				if (!adapter) throw new VoiceError(503, "main conversation unavailable");
+				const body = await readJsonBody(request);
+				if (!body || typeof body !== "object" || Array.isArray(body))
+					throw new VoiceError(400, "JSON object required");
+				const result = adapter.handle(path, principal, body as Record<string, unknown>);
+				response.writeHead(200, {
+					"content-type": "application/json",
+					"cache-control": "no-store",
+				});
+				response.end(JSON.stringify(result));
+			} catch (error) {
+				if (!(error instanceof VoiceError)) throw error;
+				response.writeHead(error.status, {
+					"content-type": "application/json",
+					"cache-control": "no-store",
+				});
+				response.end(JSON.stringify({ error: error.message }));
+			}
 			return;
 		}
 		requireSupportedVersion(request);

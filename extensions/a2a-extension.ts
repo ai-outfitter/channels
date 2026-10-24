@@ -19,6 +19,7 @@ import { outputArtifact, type WorkflowOutputDeclarations } from "./a2a/workflow-
 import type { TaskPlane } from "./task-plane/plane.ts";
 import type { RuntimeListener } from "./task-plane/runtime.ts";
 import { contentDigest } from "./task-plane/source-activation.ts";
+import type { MainPiConversation } from "./voice/conversation.ts";
 
 export interface A2aExtensionDependencies {
 	readonly enabled?: () => boolean;
@@ -28,6 +29,7 @@ export interface A2aExtensionDependencies {
 		executor: A2aExecutor,
 		sharedStore?: TaskPlane["taskStore"],
 		onTaskCanceled?: (taskId: string) => void | Promise<void>,
+		conversation?: () => MainPiConversation | undefined,
 	) => Promise<RunningA2aServer>;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
@@ -42,6 +44,7 @@ export function createA2aRuntimeListener(
 	dependencies: A2aExtensionDependencies = {},
 	onRunning: (server: RunningA2aServer | undefined) => void = () => {},
 	onTaskCanceled: (taskId: string) => void | Promise<void> = () => {},
+	conversation?: () => MainPiConversation | undefined,
 ): RuntimeListener | undefined {
 	const enabled = dependencies.enabled ?? enabledFromEnv;
 	if (!enabled()) return undefined;
@@ -78,7 +81,13 @@ export function createA2aRuntimeListener(
 						: await sink.accept(activation);
 				return { kind: "task", taskId: accepted.taskId };
 			};
-			const server = await start(await loadConfig(), executor, taskPlane.taskStore, onTaskCanceled);
+			const server = await start(
+				await loadConfig(),
+				executor,
+				taskPlane.taskStore,
+				onTaskCanceled,
+				conversation,
+			);
 			onRunning(server);
 			log({ event: "a2a_server_started", url: server.url });
 			return async () => {

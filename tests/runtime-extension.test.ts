@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1274,6 +1274,140 @@ test("stops channel sources before closing the task plane", async () => {
 			await fire(handlers, "session_start");
 			await fire(handlers, "session_shutdown");
 			assert.deepEqual(order, ["source", "plane"]);
+		},
+	);
+});
+
+test("voice HTTP adapter uses persistent main Pi hooks, isolates text, serializes and never aborts", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-main-voice-"));
+	const credentials = join(root, "credentials.json");
+	await writeFile(
+		credentials,
+		JSON.stringify({
+			credentials: [
+				{ token: "voice-token", principal: "voice" },
+				{ token: "forge-token", principal: "forge" },
+			],
+		}),
+	);
+	await withEnv(
+		{
+			OUTFITTER_CHANNELS: "off",
+			A2A_SERVER: "1",
+			A2A_VOICE_PRINCIPALS: "voice",
+			A2A_CREDENTIALS_PATH: credentials,
+			A2A_HOST: "127.0.0.1",
+			A2A_PORT: "0",
+			CHANNELS_TASK_STORE_PATH: root,
+			OUTFITTER_AGENT_RELAY: undefined,
+		},
+		async () => {
+			const { pi, handlers } = fakePi();
+			const sent: string[] = [];
+			let idle = true;
+			let url = "";
+			const audit: unknown[] = [];
+			Object.assign(pi, {
+				sendUserMessage: (text: string, options: unknown) => {
+					assert.deepEqual(options, { deliverAs: "followUp" });
+					sent.push(text);
+					idle = false;
+				},
+				appendEntry: (_type: string, data: unknown) => audit.push(data),
+			});
+			const sessionManager = SessionManager.create(root, join(root, "sessions"));
+			const context = {
+				isProjectTrusted: () => true,
+				sessionManager,
+				isIdle: () => idle,
+				hasPendingMessages: () => false,
+				abort: () => assert.fail("must never abort main Pi"),
+			} as unknown as ExtensionContext;
+			channelsRuntimeExtension(pi, {
+				log: (record) => {
+					if (record.event === "a2a_server_started") url = String(record.url);
+				},
+				createTaskSessionHost: () => ({
+					run: async () => assert.fail("voice must not create task sessions"),
+					release: async () => {},
+					close: async () => {},
+				}),
+			});
+			assert.deepEqual(await fire(handlers, "session_start", {}, context), []);
+			assert.ok(url);
+			const scope = { callId: "call", organizationId: "org", userId: "user" };
+			const post = async (path: string, body: Record<string, unknown>, token = "voice-token") =>
+				fetch(url + path, {
+					method: "POST",
+					headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+					body: JSON.stringify({ ...scope, ...body }),
+				});
+			try {
+				assert.equal(
+					(await post("/voice/lease", { expiresAt: Date.now() + 60000 }, "bad")).status,
+					401,
+				);
+				assert.equal(
+					(await post("/voice/lease", { expiresAt: Date.now() + 60000 }, "forge-token")).status,
+					403,
+				);
+				assert.equal((await post("/voice/lease", { expiresAt: Date.now() + 60000 })).status, 200);
+				const text = " exact ai-outfitter/webapp ";
+				assert.equal((await post("/voice/turns", { turnId: "first", text })).status, 200);
+				await waitFor(() => sent.length === 1);
+				assert.deepEqual(sent, [text]);
+				await post("/voice/turns", { turnId: "second", text: "follow up" });
+				await fire(handlers, "before_agent_start", { prompt: text });
+				await fire(handlers, "message_start", {
+					message: { role: "user", content: [{ type: "text", text }] },
+				});
+				await fire(handlers, "message_update", {
+					assistantMessageEvent: { type: "thinking_delta", delta: "secret thinking" },
+				});
+				await fire(handlers, "message_update", {
+					assistantMessageEvent: { type: "text_delta", delta: "resident text" },
+				});
+				await fire(handlers, "tool_execution_start", { args: { secret: "tool input" } });
+				await fire(handlers, "tool_execution_end", { result: { secret: "tool output" } });
+				await fire(handlers, "agent_end", {
+					messages: [{ role: "assistant", stopReason: "stop" }],
+				});
+				let page = await (await post("/voice/turns/poll", { turnId: "first", afterSeq: 0 })).json();
+				assert.ok(
+					!JSON.stringify(page).includes("terminal"),
+					"agent_end is not final before auto-retry settles",
+				);
+				idle = true;
+				await fire(handlers, "agent_settled", {});
+				await waitFor(() => sent.length === 2);
+				page = await (await post("/voice/turns/poll", { turnId: "first", afterSeq: 0 })).json();
+				assert.ok(JSON.stringify(page).includes("resident text"));
+				assert.ok(JSON.stringify(page).includes("completed"));
+				assert.ok(!JSON.stringify(page).includes("secret"));
+				assert.ok(audit.length > 3);
+				assert.equal(
+					(await post("/voice/turns/poll", { turnId: "first", afterSeq: 0, userId: "other" }))
+						.status,
+					404,
+				);
+				await fire(handlers, "before_agent_start", { prompt: "follow up" });
+				await fire(handlers, "message_start", {
+					message: { role: "user", content: [{ type: "text", text: "follow up" }] },
+				});
+				// A foreign queued main-session input invalidates correlation before its response can leak.
+				await fire(handlers, "message_start", {
+					message: { role: "user", content: [{ type: "text", text: "private foreign prompt" }] },
+				});
+				await fire(handlers, "message_update", {
+					assistantMessageEvent: { type: "text_delta", delta: "private foreign answer" },
+				});
+				page = await (await post("/voice/turns/poll", { turnId: "second", afterSeq: 0 })).json();
+				assert.ok(JSON.stringify(page).includes("uncertain"));
+				assert.ok(!JSON.stringify(page).includes("private foreign"));
+				assert.equal((await post("/voice/lease/release", {})).status, 200);
+			} finally {
+				await fire(handlers, "session_shutdown", {}, context);
+			}
 		},
 	);
 });
