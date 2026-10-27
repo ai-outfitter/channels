@@ -14,6 +14,7 @@ import {
 import { type A2aToolAccess, createA2aRuntimeListener, registerA2aTools } from "./a2a-extension.ts";
 import channelEventsExtension, { locatorChannel, type SourceRegistration } from "./index.ts";
 import relayExtension from "./relay-extension.ts";
+import { registerResidentActionTools } from "./resident-actions.ts";
 import { errorMessage } from "./sources/util.ts";
 import type { TaskPlane } from "./task-plane/plane.ts";
 import { ResidentRuntime } from "./task-plane/resident-runtime.ts";
@@ -123,6 +124,22 @@ export default function channelsRuntimeExtension(
 			() => workflowOutputs,
 		);
 	}
+	if (taskPlaneEnabled || listener)
+		registerResidentActionTools(taskToolPi, async (taskId) => {
+			const queue = runtime?.wakeQueue ?? startingWakeQueue;
+			if (queue?.sourceForTask(taskId) !== "a2a" || !(await queue.hasAuthority(taskId)))
+				return false;
+			const task = await taskAccess()?.readTask(taskId);
+			return Boolean(
+				task &&
+					![
+						"TASK_STATE_COMPLETED",
+						"TASK_STATE_FAILED",
+						"TASK_STATE_CANCELED",
+						"TASK_STATE_REJECTED",
+					].includes(task.status.state),
+			);
+		});
 	const closeTaskPlane = (): Promise<void> => {
 		if (closing) return closing;
 		const loaded = runtime;
@@ -382,5 +399,11 @@ function scopeTaskTool(
 }
 
 function isTaskTool(name: string): boolean {
-	return name.startsWith("a2a_") || name === "channel_read" || name === "channel_respond";
+	return (
+		name === "list_app_actions" ||
+		name === "call_app_action" ||
+		name.startsWith("a2a_") ||
+		name === "channel_read" ||
+		name === "channel_respond"
+	);
 }

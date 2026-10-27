@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Opt-in resident app action tools share the active A2A task authority and loopback identity relay; credentials stay outside model arguments and terminal or foreign tasks fail closed.
+
 - Add binding-scoped managed Slack configuration and a same-origin service proxy so bot credentials remain in platform storage. Reconcile connection changes without restarting other sources or resetting checkpoints.
 
 - **Operators:** Task sessions now inherit the resident's model and thinking level.

@@ -932,7 +932,12 @@ test("A2A remains enabled with channels off, registers tools only when enabled, 
 
 test("Task tools use startup authority and source access while replay opens a Task session", async () => {
 	await withEnv(
-		{ OUTFITTER_CHANNELS: "test", A2A_SERVER: "1", OUTFITTER_AGENT_RELAY: undefined },
+		{
+			OUTFITTER_CHANNELS: "test",
+			A2A_SERVER: "1",
+			OUTFITTER_AGENT_RELAY: undefined,
+			OUTFITTER_RESIDENT_ACTIONS_URL: "http://127.0.0.1:4141/v1/resident-actions",
+		},
 		async () => {
 			const { pi, handlers, tools } = fakePi();
 			const loaded = running();
@@ -1008,9 +1013,27 @@ test("Task tools use startup authority and source access while replay opens a Ta
 				"a2a_read_task",
 				"a2a_record_output",
 				"a2a_require_input",
+				"call_app_action",
 				"channel_read",
 				"channel_respond",
+				"list_app_actions",
 			]);
+			const residentList = sessionTools.find((tool) => tool.name === "list_app_actions");
+			assert.ok(residentList, "action tools are captured in the isolated task session");
+			await assert.rejects(
+				residentList.execute(
+					"call",
+					{
+						taskId: "foreign",
+						attemptId: "11111111-1111-4111-8111-111111111111",
+						targetId: "vega",
+					},
+					undefined,
+					undefined,
+					{} as never,
+				),
+				/active turn/,
+			);
 			assert.ok(tools.has("channel_publish"), "top-level resident keeps publication tools");
 			assert.ok(tools.has("agent_list"), "top-level resident keeps agent discovery tools");
 			assert.ok(tools.has("agent_send"), "top-level resident keeps outbound agent tools");
@@ -1033,6 +1056,17 @@ test("Task tools use startup authority and source access while replay opens a Ta
 					{} as never,
 				),
 				/not authorized/,
+			);
+			Object.assign(task.status, { state: "TASK_STATE_COMPLETED" });
+			await assert.rejects(
+				residentList.execute(
+					"call",
+					{ taskId: task.id, attemptId: "11111111-1111-4111-8111-111111111111", targetId: "vega" },
+					undefined,
+					undefined,
+					{} as never,
+				),
+				/active turn/,
 			);
 			await fire(handlers, "session_shutdown");
 		},

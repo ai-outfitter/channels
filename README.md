@@ -501,3 +501,26 @@ transcript files are read through each bot's own Web API credential.
 
 See [audio transcription](docs/audio-transcription.md) for local Whisper.cpp and
 hosted OpenAI-compatible backends, Slack audio fallback, and credential setup.
+
+## Governed organization app actions
+
+A profile may set
+`OUTFITTER_RESIDENT_ACTIONS_URL=http://127.0.0.1:4141/v1/resident-actions` to enable
+`list_app_actions` and `call_app_action`. These are registered by the ordinary
+Channels runtime and included in each isolated A2A task session. The URL must be
+the exact loopback identity relay path; the client sends no credentials. The
+relay supplies its rotated projected ServiceAccount token to the gateway.
+
+The active task must be authorized by the wake queue, belong to A2A, and remain
+nonterminal. Tools recheck authority before returning results. Use `taskId` from
+the wake/read-task result and `attemptId`/`targetId` from the task's `execution`
+context. Discover business/governance context and active work before submission;
+retain the action's documented request ID when retrying writes.
+
+This requires the platform resident-action callback, updated gateway and relay,
+an operator-configured target namespace mapping, and an approved installation
+with `workflow.host` and `actions.invoke`. The server derives member, role and
+organization authority from the approved task/run, rather than tool arguments.
+Existing profiles remain unchanged when the environment variable is absent.
+Pin the updated Channels package and approve the resulting profile/binding;
+passing package tests alone does not activate a deployed resident.
