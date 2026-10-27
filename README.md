@@ -502,25 +502,40 @@ transcript files are read through each bot's own Web API credential.
 See [audio transcription](docs/audio-transcription.md) for local Whisper.cpp and
 hosted OpenAI-compatible backends, Slack audio fallback, and credential setup.
 
-## Governed organization app actions
+## Task-scoped MCP servers
 
-A profile may set
-`OUTFITTER_RESIDENT_ACTIONS_URL=http://127.0.0.1:4141/v1/resident-actions` to enable
-`list_app_actions` and `call_app_action`. These are registered by the ordinary
-Channels runtime and included in each isolated A2A task session. The URL must be
-the exact loopback identity relay path; the client sends no credentials. The
-relay supplies its rotated projected ServiceAccount token to the gateway.
+Isolated A2A Task sessions load Pi's own MCP client, like the CLI: the
+built-in MCP, codemode and tool-search extensions, honoring the resident's
+`mcp.json` and built-in extension settings. Set
+`CHANNELS_TASK_MCP_URL=http://127.0.0.1:4141/mcp` to also register one
+streamable HTTP server named `task` in each A2A Task session, with
+`exposure: "direct"` (tools appear as `mcp__task__<tool>`). The trusted Task
+host adds an `A2A-Task-Id` header from the Task it owns; the model never
+supplies it, and Channels registers no server-specific tools. The URL must be
+a loopback `http` relay without credentials, query or fragment; the relay
+adds the workload credential. The server, not this header, decides authority:
+it must match the header to its own recorded dispatch for the verified
+caller on every request. Channel-source tasks get no task server.
 
-The active task must be authorized by the wake queue, belong to A2A, and remain
-nonterminal. Tools recheck authority before returning results. Use `taskId` from
-the wake/read-task result and `attemptId`/`targetId` from the task's `execution`
-context. Discover business/governance context and active work before submission;
-retain the action's documented request ID when retrying writes.
+This integration supports **exactly Pi 1.4.0**, enforced by the peer dependency
+and runtime compatibility check. SDK sessions need explicit native MCP factories;
+Channels uses Pi's `createMcpExtension` and per-session `registerMcpServer`, with
+its ordinary native config and transport delegates. Pi 1.4.0 does not export those
+delegates publicly, so the narrow adapter resolves their tested package layout.
+An unsupported version/layout fails closed rather than switching to a custom
+client. Upgrade the pin only with the concurrent native-session compatibility
+suite; no protocol or tool catalog is implemented by Channels.
 
-This requires the platform resident-action callback, updated gateway and relay,
-an operator-configured target namespace mapping, and an approved installation
-with `workflow.host` and `actions.invoke`. The server derives member, role and
-organization authority from the approved task/run, rather than tool arguments.
-Existing profiles remain unchanged when the environment variable is absent.
-Pin the updated Channels package and approve the resulting profile/binding;
-passing package tests alone does not activate a deployed resident.
+The selected session `agentDir` determines `mcp.json`, OAuth storage and logs;
+other declared servers retain Pi's config, auth, transport and tool policies.
+The task server's reserved namespace cannot be overridden by global or trusted
+project `mcp.json` entries, including equivalent hyphen/underscore names.
+The protected native MCP factory is not replaceable by another built-in.
+
+Every task-server HTTP request checks current A2A source, active queue ownership
+and the actual durable Task's nonterminal state. Responses are bounded to 2 MiB,
+cancellable, and checked again before their body reaches Pi. Idle, canceled,
+terminal and reopened stale tasks cannot reuse a cached connection. Task-server
+traffic never forwards cached human OAuth or configured Authorization; only the
+credential relay supplies workload credentials. Other declared MCP servers keep
+their own normal authentication.

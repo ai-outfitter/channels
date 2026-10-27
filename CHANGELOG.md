@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Opt-in resident app action tools share the active A2A task authority and loopback identity relay; credentials stay outside model arguments and terminal or foreign tasks fail closed.
+- Isolated Task sessions load Pi's native MCP client (built-in MCP, codemode and tool search). `CHANNELS_TASK_MCP_URL` registers a loopback task server per A2A Task with a host-supplied `A2A-Task-Id` header; the server derives authority. Pins exactly Pi 1.4.0 for its native config/transport helper boundary. Task requests and bounded results recheck active queue ownership and durable terminal state; selected agent-directory config and credentials stay isolated, reserved task server names cannot be shadowed, and human OAuth is never forwarded to the workload relay.
 
 - Add binding-scoped managed Slack configuration and a same-origin service proxy so bot credentials remain in platform storage. Reconcile connection changes without restarting other sources or resetting checkpoints.
 
