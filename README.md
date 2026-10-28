@@ -504,6 +504,11 @@ hosted OpenAI-compatible backends, Slack audio fallback, and credential setup.
 
 ## Task-scoped MCP servers
 
+This supplies tools after an A2A task arrives; task submission and the existing
+durable wake queue remain separate. App activation, schedules and review requests
+must submit tasks through the server's shared delivery path. Loading MCP servers
+does not itself discover or schedule app work.
+
 Isolated A2A Task sessions load Pi's own MCP client, like the CLI: the
 built-in MCP, codemode and tool-search extensions, honoring the resident's
 `mcp.json` and built-in extension settings. Set
