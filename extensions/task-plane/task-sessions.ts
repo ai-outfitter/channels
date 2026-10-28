@@ -5,12 +5,21 @@ import {
 	type CreateAgentSessionOptions,
 	createAgentSession,
 	DefaultResourceLoader,
+	type ExtensionAPI,
 	getAgentDir,
 	SessionManager,
 	SettingsManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { derivedId } from "./serialize.ts";
+import { type TaskMcpServer, taskSessionMcpExtensions } from "./task-mcp.ts";
+
+export {
+	TASK_MCP_HEADER,
+	type TaskMcpServer,
+	taskMcpServer,
+	taskSessionMcpExtensions,
+} from "./task-mcp.ts";
 
 export interface TaskTurnRunner {
 	run(taskId: string, prompt: string): Promise<void>;
@@ -26,6 +35,7 @@ export interface TaskSession {
 
 export interface TaskSessionFactoryInput {
 	readonly taskId: string;
+	readonly taskMcp?: TaskMcpServer | undefined;
 	readonly residentBio?: (() => string) | undefined;
 	readonly promptSources?: { systemPrompt?: string; appendSystemPrompt?: string[] } | undefined;
 	readonly cwd: string;
@@ -54,6 +64,7 @@ export interface TaskSessionHostOptions {
 	readonly model?: () => CreateAgentSessionOptions["model"];
 	readonly thinkingLevel?: () => CreateAgentSessionOptions["thinkingLevel"];
 	readonly createSession?: TaskSessionFactory;
+	readonly taskMcp?: TaskMcpServer | undefined;
 	readonly log?: (record: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -153,6 +164,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 		try {
 			session = await createSession({
 				taskId,
+				taskMcp: this.#options.taskMcp,
 				residentBio: this.#options.residentBio,
 				promptSources: this.#options.promptSources,
 				cwd: this.#options.cwd,
@@ -182,7 +194,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 	}
 }
 
-async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<TaskSession> {
+export async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<TaskSession> {
 	const settingsManager = SettingsManager.create(input.cwd, input.agentDir, {
 		projectTrusted: input.projectTrusted,
 	});
@@ -192,24 +204,30 @@ async function createPiTaskSession(input: TaskSessionFactoryInput): Promise<Task
 		settingsManager,
 		...input.promptSources,
 		additionalExtensionPaths: [...input.additionalExtensionPaths],
-		extensionFactories: input.residentBio
-			? [
-					(api) => {
-						api.on("before_agent_start", (event) => {
-							const bio = input.residentBio?.() ?? "";
-							return {
-								systemPrompt: bio
-									? `${event.systemPrompt}\n\nResident bio:\n${bio}`
-									: event.systemPrompt,
-							};
-						});
-					},
-				]
-			: [],
+		extensionFactories: [
+			...taskSessionMcpExtensions(input.taskId, input.taskMcp, input.agentDir),
+			...(input.residentBio
+				? [
+						(api: ExtensionAPI) => {
+							api.on("before_agent_start", (event) => {
+								const bio = input.residentBio?.() ?? "";
+								return {
+									systemPrompt: bio
+										? `${event.systemPrompt}\n\nResident bio:\n${bio}`
+										: event.systemPrompt,
+								};
+							});
+						},
+					]
+				: []),
+		],
 		extensionsOverride: (loaded) => ({
 			...loaded,
+			// Built-in and inline extensions (Pi's MCP client, the Task server) have no path.
 			extensions: loaded.extensions.filter(
-				(extension) => !isPathInside(extension.resolvedPath, input.excludedExtensionRoot),
+				(extension) =>
+					/^(builtin:|<inline:)/.test(extension.resolvedPath) ||
+					!isPathInside(extension.resolvedPath, input.excludedExtensionRoot),
 			),
 		}),
 	});

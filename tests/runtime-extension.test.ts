@@ -67,12 +67,16 @@ async function fire(
 
 test("Task session factory inherits the resident's current model and thinking level", async () => {
 	const root = await mkdtemp(join(tmpdir(), "channels-task-session-model-"));
+	let active = true,
+		terminal = false,
+		source = "a2a";
 	await withEnv(
 		{
 			OUTFITTER_CHANNELS: "test",
 			A2A_SERVER: undefined,
 			OUTFITTER_AGENT_RELAY: undefined,
 			CHANNELS_TASK_STORE_PATH: root,
+			CHANNELS_TASK_MCP_URL: "http://127.0.0.1:4141/mcp",
 		},
 		async () => {
 			const { pi, handlers } = fakePi();
@@ -118,7 +122,13 @@ test("Task session factory inherits the resident's current model and thinking le
 					}),
 				startRuntime: async (_pi, dependencies) => {
 					taskTurnRunner = dependencies.taskTurnRunner;
-					return running();
+					const live = running();
+					Object.assign(live.wakeQueue, {
+						hasAuthority: async () => active,
+						sourceForTask: () => source,
+					});
+					Object.assign(live.sourceSink, { taskIsTerminal: async () => terminal });
+					return live;
 				},
 			});
 
@@ -130,7 +140,21 @@ test("Task session factory inherits the resident's current model and thinking le
 			assert.equal(inputs.length, 1);
 			assert.equal(inputs[0]?.model, currentModel);
 			assert.equal(inputs[0]?.thinkingLevel, "high");
+			// The trusted host passes the task MCP relay; the factory adds the Task identity.
+			assert.equal(inputs[0]?.taskMcp?.url, "http://127.0.0.1:4141/mcp");
+			assert.equal(typeof inputs[0]?.taskMcp?.applies, "function");
+			assert.equal(await inputs[0]?.taskMcp?.hasAuthority?.("task"), true);
+			active = false;
+			assert.equal(await inputs[0]?.taskMcp?.hasAuthority?.("task"), false);
+			active = true;
+			terminal = true;
+			assert.equal(await inputs[0]?.taskMcp?.hasAuthority?.("task"), false);
+			terminal = false;
+			source = "slack";
+			assert.equal(await inputs[0]?.taskMcp?.hasAuthority?.("task"), false);
+			source = "a2a";
 			await fire(handlers, "session_shutdown");
+			assert.equal(await inputs[0]?.taskMcp?.hasAuthority?.("task"), false);
 		},
 	);
 });
