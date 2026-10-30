@@ -307,8 +307,10 @@ test("config prefers FORGEJO_API_URL and strips a trailing slash", () => {
 	process.env.FORGEJO_TOKEN = "t";
 	process.env.FORGEJO_URL = "https://public.example/";
 	process.env.FORGEJO_API_URL = "http://in-cluster:3001/";
+	process.env.FORGEJO_IGNORED_ISSUE_AUTHORS = "Outfitter-Keystone,other-bot";
 	const cfg = forgejoConfigFromEnv();
 	assert.equal(cfg?.url, "http://in-cluster:3001");
+	assert.deepEqual([...(cfg?.ignoredIssueAuthors ?? [])], ["outfitter-keystone", "other-bot"]);
 
 	process.env.FORGEJO_API_URL = "";
 	assert.equal(forgejoConfigFromEnv()?.url, "https://public.example");
@@ -316,7 +318,12 @@ test("config prefers FORGEJO_API_URL and strips a trailing slash", () => {
 	process.env.FORGEJO_TOKEN = "";
 	assert.equal(forgejoConfigFromEnv(), undefined, "no token means no source");
 
-	for (const key of ["FORGEJO_TOKEN", "FORGEJO_URL", "FORGEJO_API_URL"]) {
+	for (const key of [
+		"FORGEJO_TOKEN",
+		"FORGEJO_URL",
+		"FORGEJO_API_URL",
+		"FORGEJO_IGNORED_ISSUE_AUTHORS",
+	]) {
 		if (saved[key] === undefined) delete process.env[key];
 		else process.env[key] = saved[key];
 	}
@@ -549,4 +556,34 @@ test("backoffDelayMs doubles per consecutive failure and caps", () => {
 	assert.equal(backoffDelayMs(1_000, 3), 8_000);
 	assert.equal(backoffDelayMs(1_000, 30, 60_000), 60_000, "caps at maxMs");
 	assert.equal(backoffDelayMs(120_000, 5, 60_000), 120_000, "never drops below the poll floor");
+});
+
+test("externally owned issue assignments do not wake residents; native PR reviews still do", async () => {
+	const stub = stubFetch({
+		[`${API}/notifications/new`]: { body: { new: 3 } },
+		[`${API}/notifications?`]: {
+			body: [thread(1, "Issue", 1), thread(2, "Pull", 2), thread(3, "Issue", 3)],
+		},
+		[`${API}/repos/o/r/issues/1`]: {
+			body: { user: { login: "Outfitter-Keystone" }, assignees: [{ login: "drago" }] },
+		},
+		[`${API}/repos/o/r/pulls/2`]: {
+			body: { user: { login: "outfitter-keystone" }, requested_reviewers: [{ login: "drago" }] },
+		},
+		[`${API}/repos/o/r/issues/3`]: {
+			body: { user: { login: "human" }, assignees: [{ login: "drago" }] },
+		},
+	});
+	const events: string[] = [];
+	const stop = await createForgejoSource({
+		...config,
+		ignoredIssueAuthors: new Set(["outfitter-keystone"]),
+	}).start((event) => events.push(event.summary));
+	try {
+		await settle();
+		assert.deepEqual(events.sort(), ["assigned_issue", "review_requested"]);
+	} finally {
+		await stop();
+		stub.restore();
+	}
 });

@@ -40,6 +40,8 @@ export interface ForgejoConfig {
 	pollMs: number;
 	/** Mark a matched thread read so the account's inbox does not grow forever. */
 	markRead: boolean;
+	/** Issue authors whose assignments belong to an external orchestrator. PR review requests remain enabled. */
+	ignoredIssueAuthors?: ReadonlySet<string>;
 }
 
 const DEFAULT_FILTERS = ["review_requested", "assigned_issue", "assigned_pr"];
@@ -77,7 +79,17 @@ export function forgejoConfigFromEnv(): ForgejoConfig | undefined {
 	const filters = new Set(raw.length > 0 ? raw : DEFAULT_FILTERS);
 	const pollMs = Number(process.env.FORGEJO_NOTIFY_POLL_MS) || DEFAULT_POLL_MS;
 	const markRead = process.env.FORGEJO_NOTIFY_MARK_READ === "1";
-	return { url, token, user: process.env.FORGEJO_USER, filters, pollMs, markRead };
+	return {
+		url,
+		token,
+		user: process.env.FORGEJO_USER,
+		filters,
+		pollMs,
+		markRead,
+		ignoredIssueAuthors: new Set(
+			parseList(process.env.FORGEJO_IGNORED_ISSUE_AUTHORS).map((name) => name.toLowerCase()),
+		),
+	};
 }
 
 interface Thread {
@@ -89,6 +101,7 @@ interface Thread {
 }
 
 interface Subject {
+	user?: { login?: string } | null;
 	assignees?: ({ login?: string } | null)[] | null;
 	requested_reviewers?: ({ login?: string } | null)[] | null;
 }
@@ -313,7 +326,7 @@ async function emitNew(
 			continue;
 		}
 		try {
-			const reason = await classify(thread, login, api, request);
+			const reason = await classify(thread, login, api, request, cfg.ignoredIssueAuthors);
 			if (reason && cfg.filters.has(reason)) {
 				const path = subjectPath(thread.subject?.url);
 				if (!path) throw new Error("classified Forgejo subject has no exact path");
@@ -390,6 +403,7 @@ async function classify(
 	login: string,
 	api: string,
 	request: Request_,
+	ignoredIssueAuthors?: ReadonlySet<string>,
 ): Promise<Reason | undefined> {
 	const type = thread.subject?.type; // "Pull" | "Issue" | "Commit" | "Repository"
 	if (type !== "Pull" && type !== "Issue") return undefined;
@@ -415,6 +429,9 @@ async function classify(
 		return undefined;
 	}
 	const subject = (await res.json()) as Subject;
+	if (type === "Issue" && ignoredIssueAuthors?.has(subject.user?.login?.toLowerCase() ?? "")) {
+		return undefined;
+	}
 
 	if (type === "Pull" && includesLogin(subject.requested_reviewers, login)) {
 		return "review_requested";
