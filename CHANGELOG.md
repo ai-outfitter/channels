@@ -72,6 +72,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.13.1](https://github.com/ai-outfitter/channels/compare/v1.13.0...v1.13.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* complete ordinary tasks with structured data artifacts ([#95](https://github.com/ai-outfitter/channels/issues/95)) ([9f1ed42](https://github.com/ai-outfitter/channels/commit/9f1ed42eb88d8448504160a407ff8da11d27fa63))
+
 ## [1.13.0](https://github.com/ai-outfitter/channels/compare/v1.12.2...v1.13.0) (2026-10-31)
 
 
