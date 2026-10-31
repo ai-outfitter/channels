@@ -285,7 +285,10 @@ export class DurableWakeQueue {
 								claim.intendedRoute === "created" &&
 								this.#journal.isAccepted(claim.activationId),
 						);
-					const context = initial ? taskSystemContext(initial.input.parts) : undefined;
+					const context =
+						initial?.input.trustedSystemContext === true
+							? taskSystemContext(initial.input.parts)
+							: undefined;
 					await this.#taskTurns.run(wake.claim.taskId, wake.prompt, context);
 				} catch (error) {
 					if (this.#stopped) return;

@@ -695,3 +695,27 @@ test("a2a_complete_task rejects invalid output sets without recording anything",
 		});
 	}
 });
+
+test("mixed context capabilities for the same A2A principal fail before listening", async () => {
+	const listener = createA2aRuntimeListener({
+		enabled: () => true,
+		loadConfig: async () => ({
+			host: "127.0.0.1",
+			port: 0,
+			storePath: "unused",
+			agentName: "test",
+			agentDescription: "test",
+			agentVersion: "test",
+			publicUrl: "http://127.0.0.1",
+			credentials: [
+				{ token: "trusted", principal: "same", trustedSystemContext: true },
+				{ token: "ordinary", principal: "same" },
+			],
+		}),
+	});
+	assert.ok(listener);
+	await assert.rejects(
+		listener.start({} as never, {} as never),
+		/conflicting system context capabilities/,
+	);
+});

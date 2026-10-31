@@ -28,6 +28,8 @@ import {
 export interface A2aCredential {
 	readonly token: string;
 	readonly principal: string;
+	/** Host-granted context composition capability, never a message field. */
+	readonly trustedSystemContext?: boolean;
 }
 
 export interface A2aServerConfig {

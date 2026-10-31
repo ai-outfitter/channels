@@ -50,10 +50,26 @@ export function createA2aRuntimeListener(
 	const log = dependencies.log ?? ((record) => console.error(JSON.stringify(record)));
 	return {
 		async start(taskPlane, sink) {
+			const config = await loadConfig();
+			for (const credential of config.credentials) {
+				if (
+					config.credentials.some(
+						(other) =>
+							other.principal === credential.principal &&
+							(other.trustedSystemContext === true) !== (credential.trustedSystemContext === true),
+					)
+				)
+					throw new Error("A2A principal has conflicting system context capabilities");
+			}
 			const executor: A2aExecutor = async (context) => {
 				const activatedExtensions = context.activatedExtensions ?? [];
 				const activation = {
 					principal: context.principal,
+					trustedSystemContext: config.credentials.some(
+						(credential) =>
+							credential.principal === context.principal &&
+							credential.trustedSystemContext === true,
+					),
 					source: "a2a",
 					providerEventId: context.message.messageId,
 					nativeLocator: { messageId: context.message.messageId },
@@ -78,7 +94,7 @@ export function createA2aRuntimeListener(
 						: await sink.accept(activation);
 				return { kind: "task", taskId: accepted.taskId };
 			};
-			const server = await start(await loadConfig(), executor, taskPlane.taskStore, onTaskCanceled);
+			const server = await start(config, executor, taskPlane.taskStore, onTaskCanceled);
 			onRunning(server);
 			log({ event: "a2a_server_started", url: server.url });
 			return async () => {
