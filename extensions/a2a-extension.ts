@@ -500,7 +500,25 @@ function renderTask(state: string, history: readonly A2aMessage[]): string {
 function renderParts(parts: readonly A2aPart[]): string {
 	return parts
 		.map((part) => {
-			if (part.text !== undefined) return indent(part.text);
+			if (part.text !== undefined) {
+				let text = part.text;
+				try {
+					const envelope = JSON.parse(text);
+					if (
+						envelope?.kind === "outfitter.resident-task/v1" &&
+						typeof envelope.systemContext === "string"
+					) {
+						// Task sessions already received these immutable facts in their system
+						// prompt. Keep the canonical envelope in details/store, not twice in
+						// the model's context window.
+						const { systemContext: _context, ...message } = envelope;
+						text = JSON.stringify(message);
+					}
+				} catch {
+					/* Ordinary text is preserved verbatim. */
+				}
+				return indent(text);
+			}
 			if (part.data !== undefined) return indent(JSON.stringify(part.data));
 			if (part.url !== undefined) return indent(`[file url: ${part.url}]`);
 			return indent("[binary part omitted]");
