@@ -72,6 +72,32 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.13.0](https://github.com/ai-outfitter/channels/compare/v1.12.2...v1.13.0) (2026-10-31)
+
+
+### Features
+
+* add service-agnostic managed Slack connections ([63f8365](https://github.com/ai-outfitter/channels/commit/63f83654444645bbef4c90e64352ecc1af6131a4))
+* apply organization resident bios and report browser probes ([0202d3b](https://github.com/ai-outfitter/channels/commit/0202d3bd6b1a1af1a1c074281e5398ec7d7f5a99))
+* apply organization resident bios and report browser probes ([d9a3886](https://github.com/ai-outfitter/channels/commit/d9a3886f10682af6fbb913dda2cfbea9d05002d3))
+* connect resident Slack through scoped platform proxy ([6a1c53e](https://github.com/ai-outfitter/channels/commit/6a1c53ec36c731454c28b2f4375c4ecd978cba75))
+* inject immutable resident graph context into task system prompts ([#94](https://github.com/ai-outfitter/channels/issues/94)) ([88487ef](https://github.com/ai-outfitter/channels/commit/88487ef8f16a9a526d281b1d39b2bb550cf2ad36))
+* read Slack audio with configurable transcription backends ([#90](https://github.com/ai-outfitter/channels/issues/90)) ([8755d0c](https://github.com/ai-outfitter/channels/commit/8755d0cb34a56ed4b0b8a51f15fcfe83d6390163))
+* route resident Slack mentions through a shared durable inbox ([82f8438](https://github.com/ai-outfitter/channels/commit/82f8438f75c7d9c6845adcd64270c51f14cc6c85))
+* route resident Slack mentions through a shared durable inbox ([284b9da](https://github.com/ai-outfitter/channels/commit/284b9da2c733a611eb503568694da4d2e646774d))
+
+
+### Bug Fixes
+
+* bind profile acknowledgements to resident content and preserve catalog prompts ([37786f2](https://github.com/ai-outfitter/channels/commit/37786f28f72010e119be703dc6b34c6a97caf725))
+* expire runnable tasks after 24 hours without progress ([ee89215](https://github.com/ai-outfitter/channels/commit/ee892154bdcf7651e974c853c6c020d3e81c3d8a))
+* expire runnable tasks after 24 hours without progress ([d200e82](https://github.com/ai-outfitter/channels/commit/d200e82c29480aa1560df4ebf5559e0822bbf404))
+* preserve continuations racing failed wake recovery ([e14bd65](https://github.com/ai-outfitter/channels/commit/e14bd65aa269fcd254c9a2201eb0b37fa69590b2))
+* scope queued Slack events to their workspace and app ([f447e62](https://github.com/ai-outfitter/channels/commit/f447e62a20109045cc4ce062ce304a92e6906142))
+* settle tasks whose wake delivery permanently fails ([172a07a](https://github.com/ai-outfitter/channels/commit/172a07ad3eb39afcd0ae7d99dd61df726057c847))
+* settle tasks whose wake delivery permanently fails ([44786f7](https://github.com/ai-outfitter/channels/commit/44786f7b304cec654627fbe3941e0a3c14ca9876))
+* **slack:** support automatically discovered channel memberships ([#89](https://github.com/ai-outfitter/channels/issues/89)) ([e67c8aa](https://github.com/ai-outfitter/channels/commit/e67c8aa6bce0c173dc79f6ccaade28fab70e487a))
+
 ## [1.12.2](https://github.com/ai-outfitter/channels/compare/v1.12.1...v1.12.2) (2026-10-12)
 
 
