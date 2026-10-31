@@ -1,7 +1,7 @@
 {
 	"name": "@ai-outfitter/channels",
-	"version": "1.12.2",
-	"description": "Pi extension that pushes channel events (email/Slack/Signal/\u2026) into an agent session, waking it only when real work arrives.",
+	"version": "1.13.0",
+	"description": "Pi extension that pushes channel events (email/Slack/Signal/…) into an agent session, waking it only when real work arrives.",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
