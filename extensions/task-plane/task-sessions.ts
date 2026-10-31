@@ -12,6 +12,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { derivedId } from "./serialize.ts";
+import { systemContextExtension } from "./system-context.ts";
 import { type TaskMcpServer, taskSessionMcpExtensions } from "./task-mcp.ts";
 
 export {
@@ -22,7 +23,7 @@ export {
 } from "./task-mcp.ts";
 
 export interface TaskTurnRunner {
-	run(taskId: string, prompt: string): Promise<void>;
+	run(taskId: string, prompt: string, systemContext?: string): Promise<void>;
 	release(taskId: string): Promise<void>;
 }
 
@@ -35,6 +36,7 @@ export interface TaskSession {
 
 export interface TaskSessionFactoryInput {
 	readonly taskId: string;
+	readonly systemContext?: string | undefined;
 	readonly taskMcp?: TaskMcpServer | undefined;
 	readonly residentBio?: (() => string) | undefined;
 	readonly promptSources?: { systemPrompt?: string; appendSystemPrompt?: string[] } | undefined;
@@ -92,9 +94,9 @@ export class TaskSessionHost implements TaskTurnRunner {
 		this.#sessionPaths = sessionPaths;
 	}
 
-	async run(taskId: string, prompt: string): Promise<void> {
+	async run(taskId: string, prompt: string, systemContext?: string): Promise<void> {
 		if (this.#closed) throw new Error("task session host is closed");
-		const session = await this.#session(taskId);
+		const session = await this.#session(taskId, systemContext);
 		await session.prompt(prompt);
 	}
 
@@ -130,10 +132,10 @@ export class TaskSessionHost implements TaskTurnRunner {
 		return this.#closePromise;
 	}
 
-	#session(taskId: string): Promise<TaskSession> {
+	#session(taskId: string, systemContext?: string): Promise<TaskSession> {
 		let pending = this.#sessions.get(taskId);
 		if (pending) return pending;
-		pending = this.#create(taskId).catch((error) => {
+		pending = this.#create(taskId, systemContext).catch((error) => {
 			this.#sessions.delete(taskId);
 			throw error;
 		});
@@ -141,7 +143,7 @@ export class TaskSessionHost implements TaskTurnRunner {
 		return pending;
 	}
 
-	async #create(taskId: string): Promise<TaskSession> {
+	async #create(taskId: string, systemContext?: string): Promise<TaskSession> {
 		const sessionId = derivedId("task", taskId);
 		const sessionPaths = await this.#sessionPaths;
 		const existingPaths = [
@@ -160,10 +162,12 @@ export class TaskSessionHost implements TaskTurnRunner {
 		const sessionManager = existingPath
 			? SessionManager.open(existingPath, this.#options.sessionDir, this.#options.cwd)
 			: SessionManager.create(this.#options.cwd, this.#options.sessionDir, { id: sessionId });
+		systemContext = savedSystemContext(sessionManager, systemContext);
 		let session: TaskSession;
 		try {
 			session = await createSession({
 				taskId,
+				systemContext,
 				taskMcp: this.#options.taskMcp,
 				residentBio: this.#options.residentBio,
 				promptSources: this.#options.promptSources,
@@ -206,6 +210,7 @@ export async function createPiTaskSession(input: TaskSessionFactoryInput): Promi
 		additionalExtensionPaths: [...input.additionalExtensionPaths],
 		extensionFactories: [
 			...taskSessionMcpExtensions(input.taskId, input.taskMcp, input.agentDir),
+			...(input.systemContext ? [systemContextExtension(input.systemContext)] : []),
 			...(input.residentBio
 				? [
 						(api: ExtensionAPI) => {
@@ -325,4 +330,19 @@ export function commandLinePromptSources(argv: readonly string[]): {
 		else result.appendSystemPrompt = [...(result.appendSystemPrompt ?? []), value];
 	}
 	return result;
+}
+
+/** Keep the original context even when reopening a task after restart. */
+function savedSystemContext(manager: SessionManager, markdown?: string): string | undefined {
+	const prior = manager
+		.getEntries()
+		.find((entry) => entry.type === "custom" && entry.customType === "channels.system-context");
+	if (prior?.type === "custom") {
+		const data = prior.data as { markdown: string | null };
+		if (markdown !== undefined && markdown !== data.markdown)
+			throw new Error("Accepted task system context changed");
+		return data.markdown ?? undefined;
+	}
+	manager.appendCustomEntry("channels.system-context", { markdown: markdown ?? null });
+	return markdown;
 }

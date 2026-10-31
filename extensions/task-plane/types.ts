@@ -2,6 +2,8 @@ import type { A2aPart } from "../a2a/types.ts";
 
 export interface NativeActivation {
 	readonly principal: string;
+	/** Set only by a trusted protocol binding from its authenticated credential. */
+	readonly trustedSystemContext?: boolean;
 	readonly source: string;
 	readonly providerEventId: string;
 	readonly nativeLocator: Readonly<Record<string, string>>;

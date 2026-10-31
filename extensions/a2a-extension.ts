@@ -50,10 +50,26 @@ export function createA2aRuntimeListener(
 	const log = dependencies.log ?? ((record) => console.error(JSON.stringify(record)));
 	return {
 		async start(taskPlane, sink) {
+			const config = await loadConfig();
+			for (const credential of config.credentials) {
+				if (
+					config.credentials.some(
+						(other) =>
+							other.principal === credential.principal &&
+							(other.trustedSystemContext === true) !== (credential.trustedSystemContext === true),
+					)
+				)
+					throw new Error("A2A principal has conflicting system context capabilities");
+			}
 			const executor: A2aExecutor = async (context) => {
 				const activatedExtensions = context.activatedExtensions ?? [];
 				const activation = {
 					principal: context.principal,
+					trustedSystemContext: config.credentials.some(
+						(credential) =>
+							credential.principal === context.principal &&
+							credential.trustedSystemContext === true,
+					),
 					source: "a2a",
 					providerEventId: context.message.messageId,
 					nativeLocator: { messageId: context.message.messageId },
@@ -78,7 +94,7 @@ export function createA2aRuntimeListener(
 						: await sink.accept(activation);
 				return { kind: "task", taskId: accepted.taskId };
 			};
-			const server = await start(await loadConfig(), executor, taskPlane.taskStore, onTaskCanceled);
+			const server = await start(config, executor, taskPlane.taskStore, onTaskCanceled);
 			onRunning(server);
 			log({ event: "a2a_server_started", url: server.url });
 			return async () => {
@@ -500,7 +516,25 @@ function renderTask(state: string, history: readonly A2aMessage[]): string {
 function renderParts(parts: readonly A2aPart[]): string {
 	return parts
 		.map((part) => {
-			if (part.text !== undefined) return indent(part.text);
+			if (part.text !== undefined) {
+				let text = part.text;
+				try {
+					const envelope = JSON.parse(text);
+					if (
+						envelope?.kind === "outfitter.resident-task/v1" &&
+						typeof envelope.systemContext === "string"
+					) {
+						// Task sessions already received these immutable facts in their system
+						// prompt. Keep the canonical envelope in details/store, not twice in
+						// the model's context window.
+						const { systemContext: _context, ...message } = envelope;
+						text = JSON.stringify(message);
+					}
+				} catch {
+					/* Ordinary text is preserved verbatim. */
+				}
+				return indent(text);
+			}
 			if (part.data !== undefined) return indent(JSON.stringify(part.data));
 			if (part.url !== undefined) return indent(`[file url: ${part.url}]`);
 			return indent("[binary part omitted]");

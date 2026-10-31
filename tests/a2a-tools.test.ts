@@ -16,6 +16,58 @@ import {
 } from "../extensions/a2a/workflow-outputs.ts";
 import { createA2aRuntimeListener, registerA2aTools } from "../extensions/a2a-extension.ts";
 
+test("task reads keep graph facts in canonical evidence without duplicating the system prompt", async () => {
+	const tools = new Map<string, { execute(id: string, params: never): Promise<unknown> }>();
+	const envelope = {
+		kind: "outfitter.resident-task/v1",
+		instructions: "Draft the plan",
+		systemContext: "EXACT GRAPH FACTS",
+	};
+	const plain = JSON.stringify({ systemContext: "Ordinary caller data" });
+	const task = {
+		id: "graph-task",
+		status: { state: "TASK_STATE_WORKING" as const },
+		history: [
+			{
+				messageId: "original",
+				role: "ROLE_USER" as const,
+				parts: [{ text: JSON.stringify(envelope) }, { text: plain }],
+			},
+		],
+	};
+	registerA2aTools(
+		{
+			registerTool(tool: { name: string; execute(id: string, params: never): Promise<unknown> }) {
+				tools.set(tool.name, tool);
+			},
+		} as never,
+		() =>
+			({
+				async readTask() {
+					return task;
+				},
+			}) as never,
+		async () => true,
+		() => false,
+	);
+	const read = tools.get("a2a_read_task");
+	assert.ok(read);
+	const result = (await read.execute("call", { taskId: "graph-task" } as never)) as {
+		content: Array<{ text: string }>;
+		details: unknown;
+	};
+	const text = result.content.at(0)?.text;
+	assert.ok(text);
+	assert.match(text, /Draft the plan/);
+	assert.doesNotMatch(text, /EXACT GRAPH FACTS/);
+	assert.match(text, /Ordinary caller data/);
+	assert.deepEqual(result.details, task);
+	assert.deepEqual(
+		task.history.flatMap((message) => message.parts).map((part) => part.text),
+		[JSON.stringify(envelope), plain],
+	);
+});
+
 test("task-plane tools enforce active authority and reject input-required without continuation", async () => {
 	const tools = new Map<
 		string,
@@ -642,4 +694,28 @@ test("a2a_complete_task rejects invalid output sets without recording anything",
 			assert.deepEqual(recorded, []);
 		});
 	}
+});
+
+test("mixed context capabilities for the same A2A principal fail before listening", async () => {
+	const listener = createA2aRuntimeListener({
+		enabled: () => true,
+		loadConfig: async () => ({
+			host: "127.0.0.1",
+			port: 0,
+			storePath: "unused",
+			agentName: "test",
+			agentDescription: "test",
+			agentVersion: "test",
+			publicUrl: "http://127.0.0.1",
+			credentials: [
+				{ token: "trusted", principal: "same", trustedSystemContext: true },
+				{ token: "ordinary", principal: "same" },
+			],
+		}),
+	});
+	assert.ok(listener);
+	await assert.rejects(
+		listener.start({} as never, {} as never),
+		/conflicting system context capabilities/,
+	);
 });
