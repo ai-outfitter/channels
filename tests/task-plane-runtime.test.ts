@@ -3141,3 +3141,57 @@ it("preserves a newer continuation granted during failed-wake reconciliation", a
 	assert.equal(journal.isWoken(old.activationId), false);
 	await queue.stop();
 });
+
+it("delivers only the initial accepted A2A task context to the task session", async () => {
+	const root = await mkdtemp(join(tmpdir(), "channels-initial-context-"));
+	const { plane, tasks, journal } = await fixture(root);
+	const original = "# Organization\nStored charter and roadmap purpose.\n";
+	const accepted = await plane.accept(
+		activation("context-first", {
+			source: "a2a",
+			parts: [
+				{ text: JSON.stringify({ kind: "outfitter.resident-task/v1", systemContext: original }) },
+			],
+		}),
+	);
+	await tasks.updateStatus("source:user", accepted.taskId, {
+		state: "TASK_STATE_INPUT_REQUIRED",
+		message: { messageId: "question", role: "ROLE_AGENT", parts: [{ text: "Continue?" }] },
+	});
+	await plane.continue({
+		...activation("context-followup", {
+			source: "a2a",
+			parts: [
+				{
+					text: JSON.stringify({
+						kind: "outfitter.resident-task/v1",
+						systemContext: "Changed by followup",
+					}),
+				},
+			],
+		}),
+		taskId: accepted.taskId,
+	});
+	const seen: Array<string | undefined> = [];
+	const queue = new DurableWakeQueue(
+		{ sendUserMessage: async () => {} },
+		tasks,
+		journal,
+		() => {},
+		async () => {},
+		{
+			async run(taskId, _prompt, systemContext) {
+				seen.push(systemContext);
+				await tasks.updateStatus("source:user", taskId, { state: "TASK_STATE_COMPLETED" });
+			},
+			async release() {},
+		},
+	);
+	try {
+		await queue.replay();
+		await waitFor(() => seen.length === 1);
+		assert.equal(seen[0], original);
+	} finally {
+		await queue.stop();
+	}
+});

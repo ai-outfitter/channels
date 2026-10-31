@@ -3,6 +3,7 @@ import type { A2aTaskStore } from "../a2a/store.ts";
 import { INTERRUPTED_TASK_STATES, isTerminal } from "../a2a/types.ts";
 import { errorMessage } from "../sources/util.ts";
 import type { ActivationClaim, ActivationJournal } from "./journal.ts";
+import { taskSystemContext } from "./system-context.ts";
 import type { TaskTurnRunner } from "./task-sessions.ts";
 
 interface PendingWake {
@@ -274,7 +275,18 @@ export class DurableWakeQueue {
 			if (this.#taskTurns) {
 				this.#retainedTaskIds.add(wake.claim.taskId);
 				try {
-					await this.#taskTurns.run(wake.claim.taskId, wake.prompt);
+					const taskId = wake.claim.taskId;
+					const initial = this.#journal
+						.claims()
+						.find(
+							(claim) =>
+								claim.taskId === taskId &&
+								claim.input.source === "a2a" &&
+								claim.intendedRoute === "created" &&
+								this.#journal.isAccepted(claim.activationId),
+						);
+					const context = initial ? taskSystemContext(initial.input.parts) : undefined;
+					await this.#taskTurns.run(wake.claim.taskId, wake.prompt, context);
 				} catch (error) {
 					if (this.#stopped) return;
 					await this.#handleTaskTurnFailure(wake, error);
