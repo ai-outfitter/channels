@@ -616,11 +616,18 @@ test("a2a_complete_task rejects invalid output sets without recording anything",
 			error: /output "issue" is not declared by the workflow/,
 		},
 		{
-			name: "missing declarations",
-			declarations: undefined,
+			name: "explicit empty workflow declarations",
+			declarations: new Map(),
 			outcome: "completed",
 			outputs: [{ output: "pull-request", value: { number: 69 } }],
-			error: /no workflow output declarations are configured; set A2A_WORKFLOW_MANIFEST/,
+			error: /not declared by the workflow/,
+		},
+		{
+			name: "reserved generic response name",
+			declarations: undefined,
+			outcome: "completed",
+			outputs: [{ output: "response", value: { body: "spoof" } }],
+			error: /reserved/,
 		},
 		{
 			name: "duplicate output",
@@ -718,4 +725,51 @@ test("mixed context capabilities for the same A2A principal fail before listenin
 		listener.start({} as never, {} as never),
 		/conflicting system context capabilities/,
 	);
+});
+
+test("ordinary task completion returns structured data without requiring a workflow", async () => {
+	const tools = new Map<string, { execute(id: string, params: never): Promise<unknown> }>();
+	const artifacts: Array<Record<string, unknown>> = [];
+	const states: string[] = [];
+	const task = { id: "generic", status: { state: "TASK_STATE_WORKING" as const } };
+	registerA2aTools(
+		{
+			registerTool(t: { name: string; execute(id: string, params: never): Promise<unknown> }) {
+				tools.set(t.name, t);
+			},
+		} as never,
+		() =>
+			({
+				async controllerForTask() {
+					return {
+						task,
+						async artifact(a: Record<string, unknown>) {
+							artifacts.push(a);
+							return task;
+						},
+						async status(s: string) {
+							states.push(s);
+							return task;
+						},
+					};
+				},
+			}) as never,
+		async () => true,
+	);
+	const complete = tools.get("a2a_complete_task");
+	assert.ok(complete);
+	await complete.execute("call", {
+		taskId: "generic",
+		response: '{"document":{"status":"draft"}}',
+		outcome: "completed",
+		outputs: [{ output: "document", value: { status: "draft" } }],
+	} as never);
+	assert.equal(artifacts.length, 2);
+	assert.deepEqual(artifacts[0], {
+		artifactId: "result-document-generic",
+		name: "document",
+		parts: [{ data: { status: "draft" } }],
+	});
+	assert.equal(artifacts[1]?.name, "response");
+	assert.deepEqual(states, ["TASK_STATE_COMPLETED"]);
 });
