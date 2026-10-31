@@ -156,7 +156,7 @@ export function registerA2aTools(
 		name: "a2a_complete_task",
 		label: "Settle A2A task",
 		description:
-			"Finish one A2A task: record declared workflow outputs and the response as artifacts and mark the task completed, or mark it rejected.",
+			"Finish one A2A task: record the response and optional structured artifacts, or reject it. Only explicitly configured workflow outputs receive workflow metadata.",
 		promptSnippet:
 			"Settle every a2a task you were woken for with a2a_complete_task, including its declared outputs when completed.",
 		promptGuidelines: ["Call a2a_read_task first, then settle the same task id exactly once."],
@@ -184,12 +184,22 @@ export function registerA2aTools(
 			if (!controller) throw new Error(`a2a task "${params.taskId}" was not found`);
 			if (params.outcome === "completed") {
 				assertUniqueOutputNames(params.outputs ?? []);
-				const outputArtifacts = (params.outputs ?? []).map((entry) =>
-					outputArtifact(params.taskId, declarations(), {
-						output: entry.output,
-						value: entry.value as Record<string, unknown>,
-					}),
-				);
+				const declared = declarations();
+				const outputArtifacts = (params.outputs ?? []).map((entry) => {
+					if (declared !== undefined)
+						return outputArtifact(params.taskId, declared, {
+							output: entry.output,
+							value: entry.value as Record<string, unknown>,
+						});
+					if (entry.output === "response")
+						throw new Error('generic output name "response" is reserved');
+					// Ordinary data carries no typed workflow routing or acceptance evidence.
+					return {
+						artifactId: `result-${entry.output}-${params.taskId}`,
+						name: entry.output,
+						parts: [{ data: entry.value }],
+					};
+				});
 				for (const artifact of outputArtifacts) await controller.artifact(artifact);
 				await controller.artifact({
 					artifactId: `response-${params.taskId}`,
