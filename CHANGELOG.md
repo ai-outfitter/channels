@@ -72,6 +72,13 @@
   `./extensions/runtime-extension.ts`. Remove assumptions that the former
   extension entrypoints load independently.
 
+## [1.13.2](https://github.com/ai-outfitter/channels/compare/v1.13.1...v1.13.2) (2026-11-02)
+
+
+### Bug Fixes
+
+* **slack:** activate managed residents for direct messages ([#97](https://github.com/ai-outfitter/channels/issues/97)) ([274da69](https://github.com/ai-outfitter/channels/commit/274da69338513cddd17ccc8f59975164319f3ce2))
+
 ## [1.13.1](https://github.com/ai-outfitter/channels/compare/v1.13.0...v1.13.1) (2026-10-31)
 
 
