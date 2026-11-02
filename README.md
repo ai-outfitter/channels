@@ -344,8 +344,8 @@ edits and group DMs do not activate work.
 
 The platform checks recent inbound conversation evidence and bot access for
 each DM read/reply. Configure the resident's Slack app with `message.im` and
-bot scopes `im:read` and `im:history`, then authorize it again. Deploy the updated
-platform and Channels runtime together; an older runtime ignores DM events.
+bot scopes `im:read` and `im:history`, then authorize it again. Roll out the updated Channels runtime before enabling the platform capability;
+an older runtime ignores and acknowledges DM events.
 Replies keep the existing thread addressing, delivery deduplication and handled
 reaction.
 
