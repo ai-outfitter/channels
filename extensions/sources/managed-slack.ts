@@ -18,6 +18,7 @@ interface ManagedConfig {
 	workspaceId: string;
 	revision: string;
 	channelIds: string[];
+	directMessages?: boolean;
 	inboxUrl: string;
 	proxyUrl: string;
 }
@@ -84,7 +85,8 @@ export async function readManagedSlack(
 		!/^T[A-Z0-9]{8,20}$/.test(cfg.workspaceId) ||
 		typeof cfg.revision !== "string" ||
 		!Array.isArray(cfg.channelIds) ||
-		!cfg.channelIds.length ||
+		(!cfg.channelIds.length && cfg.directMessages === false) ||
+		(cfg.directMessages !== undefined && typeof cfg.directMessages !== "boolean") ||
 		cfg.channelIds.length > 10_000 ||
 		cfg.channelIds.some((id) => typeof id !== "string" || !/^[CG][A-Z0-9]{8,20}$/.test(id)) ||
 		!sameOriginEndpoint(cfg.inboxUrl, origin, false) ||
@@ -107,6 +109,7 @@ function adapters(options: ManagedSlackOptions, cfg: ManagedConfig) {
 		bindingId: cfg.bindingId,
 		workspaceId: cfg.workspaceId,
 		channelIds: new Set(cfg.channelIds),
+		directMessages: cfg.directMessages !== false,
 	};
 	return { web, config };
 }
@@ -174,8 +177,8 @@ export function managedSlackActions(
 	const transcriber = transcriberFromEnv();
 	const load = async (locator: string) => {
 		const cfg = await readManagedSlack(options);
-		if (!cfg?.channelIds.includes(decodeSlackLocator(locator).channelId))
-			throw new Error("Slack channel is not granted");
+		const channel = decodeSlackLocator(locator).channelId;
+		if (!cfg || !granted(cfg, channel)) throw new Error("Slack channel is not granted");
 		const { web } = adapters(options, cfg);
 		return createSlackActions(
 			{
@@ -185,11 +188,7 @@ export function managedSlackActions(
 				downloadAudio: async (file, message) => {
 					const current = await readManagedSlack(options);
 					const channel = decodeSlackLocator(locator).channelId;
-					if (
-						!current ||
-						current.revision !== cfg.revision ||
-						!current.channelIds.includes(channel)
-					)
+					if (!current || current.revision !== cfg.revision || !granted(current, channel))
 						throw new Error("Slack binding changed");
 					const response = await (options.transport ?? fetch)(`${current.proxyUrl}files.download`, {
 						method: "POST",
@@ -218,4 +217,11 @@ export function managedSlackActions(
 		read: async (locator) => (await load(locator)).read(locator),
 		respond: async (locator, response) => (await load(locator)).respond(locator, response),
 	};
+}
+
+function granted(config: ManagedConfig, channel: string): boolean {
+	return (
+		config.channelIds.includes(channel) ||
+		(config.directMessages !== false && /^D[A-Z0-9]{8,20}$/.test(channel))
+	);
 }

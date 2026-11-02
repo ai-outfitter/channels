@@ -184,3 +184,99 @@ test("managed Slack accepts discovered memberships beyond the old twenty-channel
 		/binding mismatch/,
 	);
 });
+
+test("managed Slack defaults DMs on for existing and new residents and honors explicit opt-out", async () => {
+	const dmOnly = { ...config, channelIds: [], directMessages: true };
+	assert.deepEqual(
+		await readManagedSlack({ ...options, transport: async () => Response.json(dmOnly) }),
+		dmOnly,
+	);
+	const existing = { ...dmOnly, directMessages: undefined };
+	const { directMessages: _, ...legacy } = existing;
+	assert.deepEqual(
+		await readManagedSlack({ ...options, transport: async () => Response.json(legacy) }),
+		legacy,
+	);
+	for (const directMessages of [false, "true"]) {
+		await assert.rejects(
+			readManagedSlack({
+				...options,
+				transport: async () => Response.json({ ...dmOnly, directMessages }),
+			}),
+			/binding mismatch/,
+		);
+	}
+	const { mentionEvent, pollSlackInbox } = await import("../extensions/sources/slack.ts");
+	const dm = {
+		type: "message",
+		channel_type: "im",
+		channel: "D0123456789",
+		user: "U0123456789",
+		ts: "1000.000001",
+		text: "Hello privately",
+	};
+	const event = mentionEvent(dm, new Set(config.channelIds), true);
+	assert.ok(event?.locator?.key);
+	assert.equal(event.summary, "new direct message");
+	assert.ok(!JSON.stringify(event).includes(dm.text));
+	assert.ok(mentionEvent(dm, new Set(config.channelIds)));
+	assert.equal(mentionEvent(dm, new Set(config.channelIds), false), undefined);
+	for (const overrides of [
+		{ bot_id: "B0123456789" },
+		{ subtype: "bot_message" },
+		{ subtype: "message_changed" },
+		{ channel_type: "mpim" },
+		{ channel: "C0123456789" },
+		{ user: undefined },
+	])
+		assert.equal(mentionEvent({ ...dm, ...overrides }, new Set(), true), undefined);
+	assert.ok(mentionEvent({ ...dm, subtype: "file_share" }, new Set(), true));
+	let activations = 0;
+	let acks = 0;
+	const transport: typeof fetch = async (_input, init) => {
+		if (init?.method === "POST") {
+			acks++;
+			return Response.json({ ok: true });
+		}
+		return Response.json({
+			...dmOnly,
+			events: [
+				{
+					eventId: "dm-event",
+					body: {
+						type: "event_callback",
+						event_id: "dm-event",
+						team_id: config.workspaceId,
+						event: dm,
+					},
+				},
+			],
+		});
+	};
+	await pollSlackInbox(
+		{
+			appToken: "",
+			botToken: options.token,
+			inboxUrl: config.inboxUrl,
+			inboxToken: options.token,
+			bindingId: options.bindingId,
+			workspaceId: config.workspaceId,
+			inboxRevision: config.revision,
+			channelIds: new Set(),
+		},
+		{
+			continue: async () => {
+				throw new Error("Unexpected continuation");
+			},
+			accept: async (input) => {
+				activations++;
+				assert.equal(input.nativeLocator.channel, dm.channel);
+				return {} as never;
+			},
+		},
+		new AbortController().signal,
+		transport,
+	);
+	assert.equal(activations, 1);
+	assert.equal(acks, 1);
+});
