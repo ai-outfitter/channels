@@ -335,6 +335,20 @@ thread addressing, and the handled reaction.
   `SLACK_CHANNEL_IDS` or set it to `joined` for the default. Set it to one or
   more channel IDs to narrow the bot below its Slack membership boundary.
 
+#### Managed resident direct messages
+
+The managed Slack binding can return `directMessages: true` alongside
+`channelIds` (which may be empty). This enables human one-to-one `message.im`
+events without a mention. Public channels still wake on mentions. Bot messages,
+edits and group DMs do not activate work.
+
+The platform checks recent inbound conversation evidence and bot access for
+each DM read/reply. Configure the resident's Slack app with `message.im` and
+bot scopes `im:read` and `im:history`, then authorize it again. Deploy the updated
+platform and Channels runtime together; an older runtime ignores DM events.
+Replies keep the existing thread addressing, delivery deduplication and handled
+reaction.
+
 #### Test against a real Slack workspace locally
 
 Socket Mode connects outbound, so local testing needs no public URL or tunnel.

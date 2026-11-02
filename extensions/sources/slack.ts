@@ -2,8 +2,8 @@
  * Slack push channel source (Socket Mode).
  *
  * The official Socket Mode client owns connection setup, acknowledgements,
- * reconnects, and shutdown. This source accepts only `app_mention` events and
- * emits validated structural locators; it never copies mention text into the
+ * reconnects, and shutdown. This source accepts `app_mention` events and enabled
+ * direct messages, emitting structural locators; it never copies message text into the
  * trusted wake. The Slack responder fetches context and replies with the bot
  * token through the Web API.
  */
@@ -55,6 +55,8 @@ export interface SlackConfig {
 	botToken: string;
 	/** Explicit channel allowlist; empty = every channel the bot has joined. */
 	channelIds: Set<string>;
+	/** Accept human one-to-one DMs in addition to channel mentions. */
+	directMessages?: boolean;
 }
 
 export interface SlackActionsConfig {
@@ -121,19 +123,21 @@ export function slackActionsConfigFromEnv(): SlackActionsConfig | undefined {
 
 /**
  * Convert an untrusted Socket Mode event into a trusted body-free locator.
- * Invalid ids, bot messages, subtypes, and channels outside an explicit
- * allowlist are ignored. With the default joined policy, Slack delivers
- * mentions from conversations the installed bot has joined.
+ * Enabled human DMs bypass the public-channel allowlist. Bot messages, edits
+ * and invalid locators are ignored. Channel mentions keep the joined/allowlist
+ * policy; DM file shares use the same context and reply adapters.
  */
 export function mentionEvent(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
+	directMessages = false,
 ): ChannelEvent | undefined {
 	if (!isRecord(raw)) return undefined;
-	if (raw.type !== "app_mention" || raw.subtype || raw.bot_id) return undefined;
+	const directMessage = directMessages && isHumanDirectMessage(raw);
+	if (!validSlackWork(raw, directMessage)) return undefined;
 	if (typeof raw.channel !== "string" || !CHANNEL_ID.test(raw.channel)) return undefined;
 	if (typeof raw.ts !== "string" || !MESSAGE_TS.test(raw.ts)) return undefined;
-	if (channelIds.size > 0 && !channelIds.has(raw.channel)) return undefined;
+	if (!directMessage && channelIds.size > 0 && !channelIds.has(raw.channel)) return undefined;
 	if (
 		raw.thread_ts !== undefined &&
 		(typeof raw.thread_ts !== "string" || !MESSAGE_TS.test(raw.thread_ts))
@@ -143,7 +147,7 @@ export function mentionEvent(
 
 	return {
 		channel: "slack",
-		summary: "new mention",
+		summary: directMessage ? "new direct message" : "new mention",
 		locator: {
 			key: encodeSlackLocator({
 				channel: raw.channel,
@@ -152,6 +156,22 @@ export function mentionEvent(
 			}),
 		},
 	};
+}
+
+function isHumanDirectMessage(raw: Record<string, unknown>): boolean {
+	return (
+		raw.type === "message" &&
+		raw.channel_type === "im" &&
+		typeof raw.channel === "string" &&
+		/^D[A-Z0-9]{8,20}$/.test(raw.channel) &&
+		typeof raw.user === "string" &&
+		/^[UW][A-Z0-9]{8,20}$/.test(raw.user)
+	);
+}
+function validSlackWork(raw: Record<string, unknown>, directMessage: boolean): boolean {
+	if (raw.bot_id) return false;
+	if (raw.subtype && !(directMessage && raw.subtype === "file_share")) return false;
+	return raw.type === "app_mention" || directMessage;
 }
 
 interface DecodedSlackLocator {
@@ -541,6 +561,7 @@ async function acceptInboxEvent(
 			},
 			cfg.channelIds,
 			taskSink,
+			cfg.directMessages,
 		);
 	} catch (error) {
 		const permanent = permanentIntakeFailure(error);
@@ -628,9 +649,11 @@ async function runSlackAttempt(
 		log(`socket mode error: ${errorMessage(error)}`);
 	});
 	socket.on("slack_event", (payload) => {
-		void handleSlackEnvelope(payload, cfg.channelIds, taskSink).catch((error) => {
-			log(`Slack activation failed: ${errorMessage(error)}`);
-		});
+		void handleSlackEnvelope(payload, cfg.channelIds, taskSink, cfg.directMessages).catch(
+			(error) => {
+				log(`Slack activation failed: ${errorMessage(error)}`);
+			},
+		);
 	});
 	try {
 		await socket.start();
@@ -655,6 +678,7 @@ async function handleSlackEnvelope(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
 	taskSink: SourceTaskActivationSink,
+	directMessages = false,
 ): Promise<void> {
 	if (!isRecord(raw)) return;
 	const envelope = raw as SlackEnvelope;
@@ -674,7 +698,7 @@ async function handleSlackEnvelope(
 		await acknowledge();
 		return;
 	}
-	const event = mentionEvent(envelope.body.event, channelIds);
+	const event = mentionEvent(envelope.body.event, channelIds, directMessages);
 	if (!event) {
 		await recordNonWorkSlackEnvelope(taskSink, envelope.body, "non-work-event");
 		await acknowledge();
