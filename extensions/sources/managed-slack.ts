@@ -85,7 +85,7 @@ export async function readManagedSlack(
 		!/^T[A-Z0-9]{8,20}$/.test(cfg.workspaceId) ||
 		typeof cfg.revision !== "string" ||
 		!Array.isArray(cfg.channelIds) ||
-		(!cfg.channelIds.length && cfg.directMessages !== true) ||
+		(!cfg.channelIds.length && cfg.directMessages === false) ||
 		(cfg.directMessages !== undefined && typeof cfg.directMessages !== "boolean") ||
 		cfg.channelIds.length > 10_000 ||
 		cfg.channelIds.some((id) => typeof id !== "string" || !/^[CG][A-Z0-9]{8,20}$/.test(id)) ||
@@ -109,7 +109,7 @@ function adapters(options: ManagedSlackOptions, cfg: ManagedConfig) {
 		bindingId: cfg.bindingId,
 		workspaceId: cfg.workspaceId,
 		channelIds: new Set(cfg.channelIds),
-		directMessages: cfg.directMessages === true,
+		directMessages: cfg.directMessages !== false,
 	};
 	return { web, config };
 }
@@ -222,6 +222,6 @@ export function managedSlackActions(
 function granted(config: ManagedConfig, channel: string): boolean {
 	return (
 		config.channelIds.includes(channel) ||
-		(config.directMessages === true && /^D[A-Z0-9]{8,20}$/.test(channel))
+		(config.directMessages !== false && /^D[A-Z0-9]{8,20}$/.test(channel))
 	);
 }

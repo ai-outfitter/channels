@@ -337,9 +337,10 @@ thread addressing, and the handled reaction.
 
 #### Managed resident direct messages
 
-The managed Slack binding can return `directMessages: true` alongside
-`channelIds` (which may be empty). This enables human one-to-one `message.im`
-events without a mention. Public channels still wake on mentions. Bot messages,
+Human one-to-one `message.im` events activate automatically without a mention
+for new and existing bindings, including older configurations that omit
+`directMessages`. The optional `directMessages: false` explicitly disables DMs.
+A DM-enabled binding may have an empty public-channel list. Public channels still wake on mentions. Bot messages,
 edits and group DMs do not activate work.
 
 The platform checks recent inbound conversation evidence and bot access for

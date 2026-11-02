@@ -55,7 +55,7 @@ export interface SlackConfig {
 	botToken: string;
 	/** Explicit channel allowlist; empty = every channel the bot has joined. */
 	channelIds: Set<string>;
-	/** Accept human one-to-one DMs in addition to channel mentions. */
+	/** Accept human one-to-one DMs by default; false explicitly disables them. */
 	directMessages?: boolean;
 }
 
@@ -130,7 +130,7 @@ export function slackActionsConfigFromEnv(): SlackActionsConfig | undefined {
 export function mentionEvent(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
-	directMessages = false,
+	directMessages = true,
 ): ChannelEvent | undefined {
 	if (!isRecord(raw)) return undefined;
 	const directMessage = directMessages && isHumanDirectMessage(raw);
@@ -678,7 +678,7 @@ async function handleSlackEnvelope(
 	raw: unknown,
 	channelIds: ReadonlySet<string>,
 	taskSink: SourceTaskActivationSink,
-	directMessages = false,
+	directMessages = true,
 ): Promise<void> {
 	if (!isRecord(raw)) return;
 	const envelope = raw as SlackEnvelope;

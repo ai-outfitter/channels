@@ -185,11 +185,17 @@ test("managed Slack accepts discovered memberships beyond the old twenty-channel
 	);
 });
 
-test("managed Slack supports a DM-only resident and keeps DM access explicit", async () => {
+test("managed Slack defaults DMs on for existing and new residents and honors explicit opt-out", async () => {
 	const dmOnly = { ...config, channelIds: [], directMessages: true };
 	assert.deepEqual(
 		await readManagedSlack({ ...options, transport: async () => Response.json(dmOnly) }),
 		dmOnly,
+	);
+	const existing = { ...dmOnly, directMessages: undefined };
+	const { directMessages: _, ...legacy } = existing;
+	assert.deepEqual(
+		await readManagedSlack({ ...options, transport: async () => Response.json(legacy) }),
+		legacy,
 	);
 	for (const directMessages of [false, "true"]) {
 		await assert.rejects(
@@ -213,7 +219,8 @@ test("managed Slack supports a DM-only resident and keeps DM access explicit", a
 	assert.ok(event?.locator?.key);
 	assert.equal(event.summary, "new direct message");
 	assert.ok(!JSON.stringify(event).includes(dm.text));
-	assert.equal(mentionEvent(dm, new Set(config.channelIds)), undefined);
+	assert.ok(mentionEvent(dm, new Set(config.channelIds)));
+	assert.equal(mentionEvent(dm, new Set(config.channelIds), false), undefined);
 	for (const overrides of [
 		{ bot_id: "B0123456789" },
 		{ subtype: "bot_message" },
@@ -256,7 +263,6 @@ test("managed Slack supports a DM-only resident and keeps DM access explicit", a
 			workspaceId: config.workspaceId,
 			inboxRevision: config.revision,
 			channelIds: new Set(),
-			directMessages: true,
 		},
 		{
 			continue: async () => {
